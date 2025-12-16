@@ -21,6 +21,7 @@ add_executable(storage_tests
     storage/tuple_test.cpp
     storage/table_heap_test.cpp
     storage/b_plus_tree_page_test.cpp
+    storage/b_plus_tree_test.cpp
 )
 
 target_link_libraries(storage_tests
