@@ -33,6 +33,7 @@ add_library(entropy_storage STATIC
     storage/buffer_pool.cpp
     storage/lru_replacer.cpp
     storage/tuple.cpp
+    storage/table_page.cpp
     storage/table_heap.cpp
     storage/b_plus_tree.cpp
     storage/hash_index.cpp
