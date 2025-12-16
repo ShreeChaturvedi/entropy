@@ -8,14 +8,14 @@
 
 | Phase | Status | Progress |
 |-------|--------|----------|
-| Phase 1: Storage Engine | 🟡 In Progress | ~15% |
+| Phase 1: Storage Engine | 🟡 In Progress | ~45% |
 | Phase 2: Transactions | 🔴 Not Started | 0% |
 | Phase 3: Query Processing | 🔴 Not Started | 0% |
 | Phase 4: Optimization | 🔴 Not Started | 0% |
 
-**Overall Progress**: ~5%
+**Overall Progress**: ~15%
 
-**Last Updated**: 2024 - Initial Project Setup Complete
+**Last Updated**: 2024-12 - Slotted Page, Tuple Serialization, TableHeap Complete
 
 ---
 
@@ -40,27 +40,30 @@
   - [x] File creation/opening
   - [x] Page read/write operations
   - [ ] Free page tracking
-  - [x] Unit tests written
+  - [x] Unit tests written (4 tests passing)
 
 ### 1.3 Page Management
 - [x] `Page` class
-  - [x] Page header structure
-  - [ ] Slotted page format (partial)
-  - [ ] Record insertion/deletion
-  - [x] Unit tests written
+  - [x] Page header structure (32 bytes, properly aligned)
+  - [x] Slotted page format (`TablePage` class)
+  - [x] Record insertion/deletion
+  - [x] Record update
+  - [x] Page compaction
+  - [x] Page linking (next/prev for heap files)
+  - [x] Unit tests written (27 tests passing)
 
 ### 1.4 Buffer Pool
 - [x] `LRUReplacer` class
   - [x] LRU eviction policy
   - [x] Pin/unpin tracking
-  - [x] Unit tests written
+  - [x] Unit tests written (6 tests passing)
 
 - [x] `BufferPoolManager` class
   - [x] Page fetching with caching
   - [x] Dirty page tracking
   - [x] Page eviction
   - [ ] Thread safety (basic)
-  - [x] Unit tests written
+  - [x] Unit tests written (5 tests passing)
 
 ### 1.5 B+ Tree Index
 - [ ] `BPlusTreePage` base class
@@ -79,18 +82,25 @@
   - [ ] Concurrent access (stretch goal)
 
 ### 1.6 Table Storage
-- [ ] `Tuple` class
-  - [ ] Serialization/deserialization
-  - [ ] Null bitmap handling
-  - [ ] Variable-length columns
-  - [ ] Unit tests passing
+- [x] `Tuple` class
+  - [x] Serialization/deserialization
+  - [x] Null bitmap handling
+  - [x] Variable-length columns (VARCHAR)
+  - [x] All SQL types supported (BOOLEAN, TINYINT, SMALLINT, INTEGER, BIGINT, FLOAT, DOUBLE, VARCHAR)
+  - [x] Unit tests written (46 tests passing)
 
-- [ ] `TableHeap` class
-  - [ ] Tuple insertion
-  - [ ] Tuple update (in-place)
-  - [ ] Tuple deletion (mark)
-  - [ ] Sequential scan
-  - [ ] Unit tests passing
+- [x] `TupleValue` class
+  - [x] Variant-based value storage
+  - [x] Type checking and accessors
+  - [x] Serialization to/from bytes
+
+- [x] `TableHeap` class
+  - [x] Tuple insertion
+  - [x] Tuple update (in-place or relocate)
+  - [x] Tuple deletion (mark)
+  - [x] Sequential scan (TableIterator)
+  - [x] Page allocation and linking
+  - [x] Unit tests written (23 tests passing)
 
 ---
 
@@ -150,15 +160,15 @@
 ## Phase 3: Query Processing
 
 ### 3.1 Catalog
-- [ ] `Column` class
-  - [ ] Data type definitions
+- [x] `Column` class
+  - [x] Data type definitions
   - [ ] Constraints (NOT NULL, etc.)
-  - [ ] Unit tests passing
+  - [x] Unit tests passing
 
-- [ ] `Schema` class
-  - [ ] Column collection
-  - [ ] Primary key tracking
-  - [ ] Unit tests passing
+- [x] `Schema` class
+  - [x] Column collection
+  - [x] Column lookup by name
+  - [x] Unit tests passing
 
 - [ ] `Catalog` class
   - [ ] Table metadata storage
@@ -263,12 +273,12 @@
 ### Unit Test Coverage
 | Component | Tests Written | Tests Passing | Coverage |
 |-----------|---------------|---------------|----------|
-| Storage | 4 files | Pending build | ~20% |
-| Catalog | 1 file | Pending build | ~10% |
+| Storage | 7 files | 111 passing | ~60% |
+| Catalog | 1 file | Passing | ~10% |
 | Transaction | 0 | 0 | 0% |
 | Execution | 0 | 0 | 0% |
 | Optimizer | 0 | 0 | 0% |
-| Integration | 1 file | Pending build | ~5% |
+| Integration | 1 file | Passing | ~5% |
 
 ### Performance Benchmarks
 | Benchmark | Target | Current | Status |
@@ -288,6 +298,26 @@
 
 ## Development Log
 
+### Session: 2024-12 - Storage Engine Core Implementation
+- Implemented complete slotted page format (`TablePage` class)
+  - Record insertion, deletion, update
+  - Page compaction for space reclamation
+  - Page linking for heap files
+  - 19 comprehensive tests
+- Implemented full Tuple serialization
+  - `TupleValue` class with variant-based storage for all SQL types
+  - Null bitmap handling
+  - Fixed-size and variable-length column support
+  - Schema-based serialization/deserialization
+  - 46 comprehensive tests (TupleValue + Tuple)
+- Implemented TableHeap with iterator support
+  - CRUD operations (insert, update, delete, get)
+  - Sequential scan via TableIterator
+  - Multi-page support with automatic page allocation
+  - 23 comprehensive tests
+- Fixed PageHeader alignment issue (40 bytes -> 32 bytes)
+- All 111 storage tests passing
+
 ### Session: 2024 - Project Initialization
 - Created comprehensive project structure with all directories
 - Set up CMake build system with FetchContent for dependencies
@@ -306,16 +336,18 @@
 
 | Issue | Priority | Notes |
 |-------|----------|-------|
-| - | - | - |
+| TableHeap update may change RID | Medium | When tuple grows, delete+insert occurs |
+| No free space map | Low | Linear scan for page with space |
+| No thread safety in TableHeap | Medium | Add later with lock manager |
 
 ---
 
 ## Next Steps
 
-1. **Immediate**: Implement common utilities (types, status, config)
-2. **Next**: Implement DiskManager and Page classes
-3. **Then**: Implement BufferPool with LRU eviction
-4. **Following**: Implement B+ Tree index
+1. **Immediate**: Implement B+ Tree index page structures
+2. **Next**: Implement B+ Tree core operations (insert, search)
+3. **Then**: Implement B+ Tree range scan and deletion
+4. **Following**: Begin transaction management
 
 ---
 

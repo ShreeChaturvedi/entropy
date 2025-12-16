@@ -5,6 +5,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cstring>
+
 #include "storage/disk_manager.hpp"
 #include "test_utils.hpp"
 

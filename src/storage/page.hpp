@@ -28,17 +28,19 @@ enum class PageType : uint8_t {
 
 /**
  * @brief Page header structure (32 bytes)
+ *
+ * Fields are ordered to avoid alignment padding:
+ * - 8-byte fields first, then 4-byte, 2-byte, 1-byte
  */
 struct PageHeader {
-    page_id_t page_id = INVALID_PAGE_ID;    // 4 bytes
-    PageType page_type = PageType::INVALID; // 1 byte
-    uint8_t reserved1 = 0;                  // 1 byte
-    uint16_t record_count = 0;              // 2 bytes
-    uint16_t free_space_offset = 0;         // 2 bytes
-    uint16_t free_space_end = 0;            // 2 bytes
-    lsn_t lsn = INVALID_LSN;                // 8 bytes
-    uint32_t checksum = 0;                  // 4 bytes
-    uint8_t reserved2[8] = {};              // 8 bytes padding
+    lsn_t lsn = INVALID_LSN;                // 8 bytes (offset 0)
+    page_id_t page_id = INVALID_PAGE_ID;    // 4 bytes (offset 8)
+    uint32_t checksum = 0;                  // 4 bytes (offset 12)
+    uint16_t record_count = 0;              // 2 bytes (offset 16)
+    uint16_t free_space_offset = 0;         // 2 bytes (offset 18)
+    uint16_t free_space_end = 0;            // 2 bytes (offset 20)
+    PageType page_type = PageType::INVALID; // 1 byte  (offset 22)
+    uint8_t reserved[9] = {};               // 9 bytes (offset 23-31)
 };
 
 static_assert(sizeof(PageHeader) == 32, "PageHeader must be 32 bytes");

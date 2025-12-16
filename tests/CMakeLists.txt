@@ -17,11 +17,15 @@ add_executable(storage_tests
     storage/disk_manager_test.cpp
     storage/buffer_pool_test.cpp
     storage/lru_replacer_test.cpp
+    storage/table_page_test.cpp
+    storage/tuple_test.cpp
+    storage/table_heap_test.cpp
 )
 
 target_link_libraries(storage_tests
     PRIVATE
         entropy_storage
+        entropy_catalog
         test_utils
         GTest::gtest
         GTest::gtest_main
