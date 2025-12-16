@@ -8,14 +8,14 @@
 
 | Phase | Status | Progress |
 |-------|--------|----------|
-| Phase 1: Storage Engine | 🟡 In Progress | ~45% |
+| Phase 1: Storage Engine | 🟡 In Progress | ~55% |
 | Phase 2: Transactions | 🔴 Not Started | 0% |
 | Phase 3: Query Processing | 🔴 Not Started | 0% |
 | Phase 4: Optimization | 🔴 Not Started | 0% |
 
-**Overall Progress**: ~15%
+**Overall Progress**: ~18%
 
-**Last Updated**: 2024-12 - Slotted Page, Tuple Serialization, TableHeap Complete
+**Last Updated**: 2024-12 - B+ Tree Page Structures Complete (135 tests passing)
 
 ---
 
@@ -66,18 +66,20 @@
   - [x] Unit tests written (5 tests passing)
 
 ### 1.5 B+ Tree Index
-- [ ] `BPlusTreePage` base class
-  - [ ] Internal node structure
-  - [ ] Leaf node structure
-  - [ ] Unit tests passing
+- [x] `BPlusTreePage` base class
+  - [x] Internal node structure (`BPTreeInternalPage`)
+  - [x] Leaf node structure (`BPTreeLeafPage`)
+  - [x] Binary search for key lookup
+  - [x] Insert/remove operations with shifting
+  - [x] Sibling pointers for range scans
+  - [x] Split support (move_half_to)
+  - [x] Unit tests written (24 tests passing)
 
 - [ ] `BPlusTree` class
-  - [ ] Key insertion
-  - [ ] Key deletion
+  - [ ] Key insertion with splits
+  - [ ] Key deletion with merging
   - [ ] Point lookup
   - [ ] Range scan (iterator)
-  - [ ] Node splitting
-  - [ ] Node merging
   - [ ] Unit tests passing
   - [ ] Concurrent access (stretch goal)
 
@@ -273,7 +275,7 @@
 ### Unit Test Coverage
 | Component | Tests Written | Tests Passing | Coverage |
 |-----------|---------------|---------------|----------|
-| Storage | 7 files | 111 passing | ~60% |
+| Storage | 8 files | 135 passing | ~65% |
 | Catalog | 1 file | Passing | ~10% |
 | Transaction | 0 | 0 | 0% |
 | Execution | 0 | 0 | 0% |
