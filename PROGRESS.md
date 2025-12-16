@@ -8,14 +8,14 @@
 
 | Phase | Status | Progress |
 |-------|--------|----------|
-| Phase 1: Storage Engine | 🟡 In Progress | ~55% |
+| Phase 1: Storage Engine | 🟡 In Progress | ~75% |
 | Phase 2: Transactions | 🔴 Not Started | 0% |
 | Phase 3: Query Processing | 🔴 Not Started | 0% |
 | Phase 4: Optimization | 🔴 Not Started | 0% |
 
-**Overall Progress**: ~18%
+**Overall Progress**: ~22%
 
-**Last Updated**: 2024-12 - B+ Tree Page Structures Complete (135 tests passing)
+**Last Updated**: 2024-12 - B+ Tree Core Operations Complete (161 tests passing)
 
 ---
 
@@ -75,13 +75,14 @@
   - [x] Split support (move_half_to)
   - [x] Unit tests written (24 tests passing)
 
-- [ ] `BPlusTree` class
-  - [ ] Key insertion with splits
-  - [ ] Key deletion with merging
-  - [ ] Point lookup
-  - [ ] Range scan (iterator)
-  - [ ] Unit tests passing
+- [x] `BPlusTree` class
+  - [x] Key insertion with splits
+  - [x] Key deletion (simplified, no merging)
+  - [x] Point lookup
+  - [x] Range scan (iterator with lower_bound)
+  - [x] Unit tests written (26 tests passing)
   - [ ] Concurrent access (stretch goal)
+  - [ ] Full rebalancing on delete (future)
 
 ### 1.6 Table Storage
 - [x] `Tuple` class
@@ -275,7 +276,7 @@
 ### Unit Test Coverage
 | Component | Tests Written | Tests Passing | Coverage |
 |-----------|---------------|---------------|----------|
-| Storage | 8 files | 135 passing | ~65% |
+| Storage | 9 files | 161 passing | ~80% |
 | Catalog | 1 file | Passing | ~10% |
 | Transaction | 0 | 0 | 0% |
 | Execution | 0 | 0 | 0% |
@@ -299,6 +300,23 @@
 ---
 
 ## Development Log
+
+### Session: 2024-12 - B+ Tree Core Operations
+- Implemented complete B+ Tree index with all core operations
+  - Insert with automatic leaf and internal node splitting
+  - Point lookup (find) with O(log n) tree traversal
+  - Range scan using BPlusTreeIterator with lower_bound support
+  - Simplified delete (marks removed, no rebalancing)
+  - is_empty() checks actual key count in root
+- Added 26 comprehensive B+ Tree tests covering:
+  - Basic operations (insert, find, remove)
+  - Duplicate handling
+  - Range scans with various boundaries
+  - Iterator traversal and lower_bound
+  - Large insertions triggering splits
+  - Random and reverse order insertions
+  - Delete-all and reinsert scenarios
+- All 161 storage tests passing
 
 ### Session: 2024-12 - Storage Engine Core Implementation
 - Implemented complete slotted page format (`TablePage` class)
@@ -346,10 +364,10 @@
 
 ## Next Steps
 
-1. **Immediate**: Implement B+ Tree index page structures
-2. **Next**: Implement B+ Tree core operations (insert, search)
-3. **Then**: Implement B+ Tree range scan and deletion
-4. **Following**: Begin transaction management
+1. **Immediate**: Begin transaction management (WAL, log records)
+2. **Next**: Implement lock manager for concurrency
+3. **Then**: Add MVCC for isolation
+4. **Following**: Build recovery manager (REDO/UNDO)
 
 ---
 
