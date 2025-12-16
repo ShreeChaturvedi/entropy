@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 
+#include "transaction/lock_manager.hpp"
 #include "transaction/log_record.hpp"
 #include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
@@ -613,6 +614,448 @@ TEST_F(TransactionManagerTest, FullTransactionWorkflow) {
     EXPECT_EQ(begin_count, 1);
     EXPECT_EQ(insert_count, 2);
     EXPECT_EQ(commit_count, 1);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lock Manager Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+class LockManagerTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        lock_mgr_ = std::make_unique<LockManager>(true, 100);  // 100ms timeout
+    }
+
+    std::unique_ptr<LockManager> lock_mgr_;
+};
+
+TEST_F(LockManagerTest, AcquireTableLockShared) {
+    Transaction txn(1);
+
+    auto status = lock_mgr_->lock_table(&txn, 1, LockMode::SHARED);
+    EXPECT_TRUE(status.ok());
+
+    status = lock_mgr_->unlock_table(&txn, 1);
+    EXPECT_TRUE(status.ok());
+}
+
+TEST_F(LockManagerTest, AcquireTableLockExclusive) {
+    Transaction txn(1);
+
+    auto status = lock_mgr_->lock_table(&txn, 1, LockMode::EXCLUSIVE);
+    EXPECT_TRUE(status.ok());
+
+    status = lock_mgr_->unlock_table(&txn, 1);
+    EXPECT_TRUE(status.ok());
+}
+
+TEST_F(LockManagerTest, AcquireRowLockShared) {
+    Transaction txn(1);
+    RID rid(10, 5);
+
+    auto status = lock_mgr_->lock_row(&txn, 1, rid, LockMode::SHARED);
+    EXPECT_TRUE(status.ok());
+
+    status = lock_mgr_->unlock_row(&txn, 1, rid);
+    EXPECT_TRUE(status.ok());
+}
+
+TEST_F(LockManagerTest, AcquireRowLockExclusive) {
+    Transaction txn(1);
+    RID rid(10, 5);
+
+    auto status = lock_mgr_->lock_row(&txn, 1, rid, LockMode::EXCLUSIVE);
+    EXPECT_TRUE(status.ok());
+
+    status = lock_mgr_->unlock_row(&txn, 1, rid);
+    EXPECT_TRUE(status.ok());
+}
+
+TEST_F(LockManagerTest, MultipleSharedLocks) {
+    Transaction txn1(1);
+    Transaction txn2(2);
+    Transaction txn3(3);
+
+    // All should be able to acquire shared locks
+    EXPECT_TRUE(lock_mgr_->lock_table(&txn1, 1, LockMode::SHARED).ok());
+    EXPECT_TRUE(lock_mgr_->lock_table(&txn2, 1, LockMode::SHARED).ok());
+    EXPECT_TRUE(lock_mgr_->lock_table(&txn3, 1, LockMode::SHARED).ok());
+
+    // Cleanup
+    lock_mgr_->release_all_locks(&txn1);
+    lock_mgr_->release_all_locks(&txn2);
+    lock_mgr_->release_all_locks(&txn3);
+}
+
+TEST_F(LockManagerTest, ExclusiveBlocksShared) {
+    Transaction txn1(1);
+    Transaction txn2(2);
+
+    // txn1 gets exclusive lock
+    EXPECT_TRUE(lock_mgr_->lock_table(&txn1, 1, LockMode::EXCLUSIVE).ok());
+
+    // txn2 should timeout trying to get shared lock
+    auto status = lock_mgr_->lock_table(&txn2, 1, LockMode::SHARED);
+    EXPECT_TRUE(status.code() == StatusCode::kTimeout);
+
+    lock_mgr_->release_all_locks(&txn1);
+}
+
+TEST_F(LockManagerTest, SharedBlocksExclusive) {
+    Transaction txn1(1);
+    Transaction txn2(2);
+
+    // txn1 gets shared lock
+    EXPECT_TRUE(lock_mgr_->lock_table(&txn1, 1, LockMode::SHARED).ok());
+
+    // txn2 should timeout trying to get exclusive lock
+    auto status = lock_mgr_->lock_table(&txn2, 1, LockMode::EXCLUSIVE);
+    EXPECT_TRUE(status.code() == StatusCode::kTimeout);
+
+    lock_mgr_->release_all_locks(&txn1);
+}
+
+TEST_F(LockManagerTest, ExclusiveBlocksExclusive) {
+    Transaction txn1(1);
+    Transaction txn2(2);
+
+    // txn1 gets exclusive lock
+    EXPECT_TRUE(lock_mgr_->lock_table(&txn1, 1, LockMode::EXCLUSIVE).ok());
+
+    // txn2 should timeout trying to get exclusive lock
+    auto status = lock_mgr_->lock_table(&txn2, 1, LockMode::EXCLUSIVE);
+    EXPECT_TRUE(status.code() == StatusCode::kTimeout);
+
+    lock_mgr_->release_all_locks(&txn1);
+}
+
+TEST_F(LockManagerTest, LockUpgradeImmediate) {
+    Transaction txn(1);
+
+    // Get shared lock
+    EXPECT_TRUE(lock_mgr_->lock_table(&txn, 1, LockMode::SHARED).ok());
+
+    // Upgrade to exclusive (should succeed immediately)
+    EXPECT_TRUE(lock_mgr_->upgrade_lock(&txn, 1).ok());
+
+    lock_mgr_->release_all_locks(&txn);
+}
+
+TEST_F(LockManagerTest, LockUpgradeWhenAlone) {
+    Transaction txn(1);
+
+    // Get shared lock
+    EXPECT_TRUE(lock_mgr_->lock_row(&txn, 1, RID(1, 0), LockMode::SHARED).ok());
+
+    // Upgrade should work
+    EXPECT_TRUE(lock_mgr_->upgrade_lock(&txn, 1, RID(1, 0)).ok());
+
+    lock_mgr_->release_all_locks(&txn);
+}
+
+TEST_F(LockManagerTest, AlreadyHoldLock) {
+    Transaction txn(1);
+
+    // Get shared lock twice - should be idempotent
+    EXPECT_TRUE(lock_mgr_->lock_table(&txn, 1, LockMode::SHARED).ok());
+    EXPECT_TRUE(lock_mgr_->lock_table(&txn, 1, LockMode::SHARED).ok());
+
+    // Only need to unlock once
+    EXPECT_TRUE(lock_mgr_->unlock_table(&txn, 1).ok());
+    EXPECT_EQ(lock_mgr_->lock_table_size(), 0);
+}
+
+TEST_F(LockManagerTest, ReleaseAllLocks) {
+    Transaction txn(1);
+
+    // Acquire multiple locks
+    EXPECT_TRUE(lock_mgr_->lock_table(&txn, 1, LockMode::SHARED).ok());
+    EXPECT_TRUE(lock_mgr_->lock_table(&txn, 2, LockMode::EXCLUSIVE).ok());
+    EXPECT_TRUE(lock_mgr_->lock_row(&txn, 1, RID(1, 0), LockMode::SHARED).ok());
+
+    EXPECT_EQ(lock_mgr_->lock_table_size(), 3);
+
+    // Release all at once
+    lock_mgr_->release_all_locks(&txn);
+
+    EXPECT_EQ(lock_mgr_->lock_table_size(), 0);
+}
+
+TEST_F(LockManagerTest, UnlockNotHeld) {
+    Transaction txn(1);
+
+    auto status = lock_mgr_->unlock_table(&txn, 999);
+    EXPECT_TRUE(status.is_not_found());
+}
+
+TEST_F(LockManagerTest, LockNullTransaction) {
+    auto status = lock_mgr_->lock_table(nullptr, 1, LockMode::SHARED);
+    EXPECT_EQ(status.code(), StatusCode::kInvalidArgument);
+}
+
+TEST_F(LockManagerTest, TwoPhaseLocking) {
+    Transaction txn(1);
+
+    // Growing phase
+    EXPECT_EQ(txn.state(), TransactionState::GROWING);
+    EXPECT_TRUE(lock_mgr_->lock_table(&txn, 1, LockMode::SHARED).ok());
+    EXPECT_TRUE(lock_mgr_->lock_table(&txn, 2, LockMode::SHARED).ok());
+
+    // First unlock transitions to shrinking
+    EXPECT_TRUE(lock_mgr_->unlock_table(&txn, 1).ok());
+    EXPECT_EQ(txn.state(), TransactionState::SHRINKING);
+
+    // Cannot acquire new locks in shrinking phase
+    auto status = lock_mgr_->lock_table(&txn, 3, LockMode::SHARED);
+    EXPECT_EQ(status.code(), StatusCode::kAborted);
+
+    lock_mgr_->release_all_locks(&txn);
+}
+
+TEST_F(LockManagerTest, AbortedTransactionCannotLock) {
+    Transaction txn(1);
+    txn.set_state(TransactionState::ABORTED);
+
+    auto status = lock_mgr_->lock_table(&txn, 1, LockMode::SHARED);
+    EXPECT_EQ(status.code(), StatusCode::kAborted);
+}
+
+TEST_F(LockManagerTest, LockDifferentResources) {
+    Transaction txn1(1);
+    Transaction txn2(2);
+
+    // Different tables - no conflict
+    EXPECT_TRUE(lock_mgr_->lock_table(&txn1, 1, LockMode::EXCLUSIVE).ok());
+    EXPECT_TRUE(lock_mgr_->lock_table(&txn2, 2, LockMode::EXCLUSIVE).ok());
+
+    lock_mgr_->release_all_locks(&txn1);
+    lock_mgr_->release_all_locks(&txn2);
+}
+
+TEST_F(LockManagerTest, LockDifferentRowsSameTable) {
+    Transaction txn1(1);
+    Transaction txn2(2);
+
+    // Different rows in same table - no conflict
+    EXPECT_TRUE(lock_mgr_->lock_row(&txn1, 1, RID(1, 0), LockMode::EXCLUSIVE).ok());
+    EXPECT_TRUE(lock_mgr_->lock_row(&txn2, 1, RID(1, 1), LockMode::EXCLUSIVE).ok());
+
+    lock_mgr_->release_all_locks(&txn1);
+    lock_mgr_->release_all_locks(&txn2);
+}
+
+TEST_F(LockManagerTest, LockModeToString) {
+    EXPECT_STREQ(lock_mode_to_string(LockMode::SHARED), "SHARED");
+    EXPECT_STREQ(lock_mode_to_string(LockMode::EXCLUSIVE), "EXCLUSIVE");
+}
+
+TEST_F(LockManagerTest, LockModeCompatibility) {
+    EXPECT_TRUE(are_lock_modes_compatible(LockMode::SHARED, LockMode::SHARED));
+    EXPECT_FALSE(are_lock_modes_compatible(LockMode::SHARED, LockMode::EXCLUSIVE));
+    EXPECT_FALSE(are_lock_modes_compatible(LockMode::EXCLUSIVE, LockMode::SHARED));
+    EXPECT_FALSE(are_lock_modes_compatible(LockMode::EXCLUSIVE, LockMode::EXCLUSIVE));
+}
+
+TEST_F(LockManagerTest, DeadlockCount) {
+    EXPECT_EQ(lock_mgr_->deadlock_count(), 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Concurrent Lock Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST_F(LockManagerTest, ConcurrentSharedLocks) {
+    std::vector<std::unique_ptr<Transaction>> txns;
+    std::vector<std::thread> threads;
+    std::atomic<int> success_count{0};
+
+    constexpr int NUM_THREADS = 10;
+
+    // Create transactions
+    for (int i = 0; i < NUM_THREADS; ++i) {
+        txns.push_back(std::make_unique<Transaction>(i + 1));
+    }
+
+    // All try to get shared locks concurrently
+    for (int i = 0; i < NUM_THREADS; ++i) {
+        threads.emplace_back([this, &txns, i, &success_count]() {
+            if (lock_mgr_->lock_table(txns[i].get(), 1, LockMode::SHARED).ok()) {
+                success_count++;
+            }
+        });
+    }
+
+    // Wait for all threads
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    // All should have succeeded
+    EXPECT_EQ(success_count.load(), NUM_THREADS);
+
+    // Cleanup
+    for (auto& txn : txns) {
+        lock_mgr_->release_all_locks(txn.get());
+    }
+}
+
+TEST_F(LockManagerTest, LockWaitAndRelease) {
+    // Use longer timeout for this test
+    lock_mgr_ = std::make_unique<LockManager>(true, 1000);
+
+    Transaction txn1(1);
+    Transaction txn2(2);
+
+    std::atomic<bool> lock_acquired{false};
+
+    // txn1 gets exclusive lock
+    EXPECT_TRUE(lock_mgr_->lock_table(&txn1, 1, LockMode::EXCLUSIVE).ok());
+
+    // Start thread that will wait for lock
+    std::thread waiter([this, &txn2, &lock_acquired]() {
+        if (lock_mgr_->lock_table(&txn2, 1, LockMode::SHARED).ok()) {
+            lock_acquired = true;
+        }
+    });
+
+    // Give waiter time to start waiting
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Release lock - waiter should get it
+    lock_mgr_->release_all_locks(&txn1);
+
+    waiter.join();
+
+    EXPECT_TRUE(lock_acquired.load());
+
+    lock_mgr_->release_all_locks(&txn2);
+}
+
+TEST_F(LockManagerTest, BasicDeadlockDetection) {
+    // This test creates a potential deadlock scenario
+    // T1 holds A, waits for B
+    // T2 holds B, waits for A
+    // Deadlock detection should abort one
+
+    lock_mgr_ = std::make_unique<LockManager>(true, 500);
+
+    Transaction txn1(1);
+    Transaction txn2(2);
+
+    std::atomic<int> aborted_count{0};
+
+    // T1 gets lock on table 1
+    EXPECT_TRUE(lock_mgr_->lock_table(&txn1, 1, LockMode::EXCLUSIVE).ok());
+
+    // T2 gets lock on table 2
+    EXPECT_TRUE(lock_mgr_->lock_table(&txn2, 2, LockMode::EXCLUSIVE).ok());
+
+    std::thread t1([this, &txn1, &aborted_count]() {
+        // T1 tries to get lock on table 2 (held by T2)
+        auto status = lock_mgr_->lock_table(&txn1, 2, LockMode::EXCLUSIVE);
+        if (status.code() == StatusCode::kAborted) {
+            aborted_count++;
+        }
+    });
+
+    std::thread t2([this, &txn2, &aborted_count]() {
+        // T2 tries to get lock on table 1 (held by T1)
+        auto status = lock_mgr_->lock_table(&txn2, 1, LockMode::EXCLUSIVE);
+        if (status.code() == StatusCode::kAborted) {
+            aborted_count++;
+        }
+    });
+
+    t1.join();
+    t2.join();
+
+    // At least one should be aborted due to deadlock or timeout
+    EXPECT_GE(aborted_count.load() + lock_mgr_->deadlock_count(), 1);
+
+    lock_mgr_->release_all_locks(&txn1);
+    lock_mgr_->release_all_locks(&txn2);
+}
+
+TEST_F(LockManagerTest, UpgradeBlockedByOthers) {
+    // Test that lock upgrade waits when other transactions hold shared locks
+    lock_mgr_ = std::make_unique<LockManager>(true, 200);
+
+    Transaction txn1(1);
+    Transaction txn2(2);
+
+    // Both get shared locks
+    EXPECT_TRUE(lock_mgr_->lock_table(&txn1, 1, LockMode::SHARED).ok());
+    EXPECT_TRUE(lock_mgr_->lock_table(&txn2, 1, LockMode::SHARED).ok());
+
+    std::atomic<bool> upgrade_started{false};
+    std::atomic<bool> upgrade_completed{false};
+
+    // txn1 tries to upgrade
+    std::thread upgrader([this, &txn1, &upgrade_started, &upgrade_completed]() {
+        upgrade_started = true;
+        auto status = lock_mgr_->upgrade_lock(&txn1, 1);
+        if (status.ok()) {
+            upgrade_completed = true;
+        }
+    });
+
+    // Wait for upgrade to start
+    while (!upgrade_started) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Upgrade should be blocked
+    EXPECT_FALSE(upgrade_completed.load());
+
+    // Release txn2's lock
+    EXPECT_TRUE(lock_mgr_->unlock_table(&txn2, 1).ok());
+
+    upgrader.join();
+
+    // Upgrade should have completed
+    EXPECT_TRUE(upgrade_completed.load());
+
+    lock_mgr_->release_all_locks(&txn1);
+}
+
+TEST_F(LockManagerTest, MultipleLockReleaseGrantsWaiting) {
+    lock_mgr_ = std::make_unique<LockManager>(true, 1000);
+
+    Transaction txn1(1);
+    Transaction txn2(2);
+    Transaction txn3(3);
+
+    std::atomic<int> waiting_granted{0};
+
+    // txn1 gets exclusive lock
+    EXPECT_TRUE(lock_mgr_->lock_table(&txn1, 1, LockMode::EXCLUSIVE).ok());
+
+    // Start multiple waiting threads
+    std::thread waiter1([this, &txn2, &waiting_granted]() {
+        if (lock_mgr_->lock_table(&txn2, 1, LockMode::SHARED).ok()) {
+            waiting_granted++;
+        }
+    });
+
+    std::thread waiter2([this, &txn3, &waiting_granted]() {
+        if (lock_mgr_->lock_table(&txn3, 1, LockMode::SHARED).ok()) {
+            waiting_granted++;
+        }
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Release exclusive - both shared waiters should get lock
+    lock_mgr_->release_all_locks(&txn1);
+
+    waiter1.join();
+    waiter2.join();
+
+    EXPECT_EQ(waiting_granted.load(), 2);
+
+    lock_mgr_->release_all_locks(&txn2);
+    lock_mgr_->release_all_locks(&txn3);
 }
 
 }  // namespace

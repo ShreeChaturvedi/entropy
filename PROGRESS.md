@@ -8,14 +8,14 @@
 
 | Phase | Status | Progress |
 |-------|--------|----------|
-| Phase 1: Storage Engine | 🟡 In Progress | ~75% |
-| Phase 2: Transactions | 🔴 Not Started | 0% |
+| Phase 1: Storage Engine | 🟢 Complete | ~90% |
+| Phase 2: Transactions | 🟡 In Progress | ~60% |
 | Phase 3: Query Processing | 🔴 Not Started | 0% |
 | Phase 4: Optimization | 🔴 Not Started | 0% |
 
-**Overall Progress**: ~22%
+**Overall Progress**: ~38%
 
-**Last Updated**: 2024-12 - B+ Tree Core Operations Complete (161 tests passing)
+**Last Updated**: 2024-12 - Lock Manager Complete (231 tests passing)
 
 ---
 
@@ -110,35 +110,45 @@
 ## Phase 2: Transaction & Concurrency
 
 ### 2.1 Transaction Manager
-- [ ] `Transaction` class
-  - [ ] Transaction ID generation
-  - [ ] Transaction state machine
-  - [ ] Write set tracking
-  - [ ] Unit tests passing
+- [x] `Transaction` class
+  - [x] Transaction ID generation
+  - [x] Transaction state machine (2PL: GROWING → SHRINKING → COMMITTED/ABORTED)
+  - [x] Write set tracking for undo
+  - [x] Lock tracking for 2PL
+  - [x] MVCC timestamps (start_ts, commit_ts)
+  - [x] Unit tests passing (8 tests)
 
-- [ ] `TransactionManager` class
-  - [ ] Begin/Commit/Abort
-  - [ ] Active transaction tracking
-  - [ ] Unit tests passing
+- [x] `TransactionManager` class
+  - [x] Begin/Commit/Abort operations
+  - [x] Active transaction tracking
+  - [x] WAL integration (log insert/delete/update)
+  - [x] Force-on-commit WAL flushing
+  - [x] Unit tests passing (11 tests)
 
 ### 2.2 Write-Ahead Logging
-- [ ] `LogRecord` class
-  - [ ] Record serialization
-  - [ ] Multiple record types (BEGIN, COMMIT, INSERT, etc.)
-  - [ ] Unit tests passing
+- [x] `LogRecord` class
+  - [x] 32-byte fixed header with serialization
+  - [x] Multiple record types (BEGIN, COMMIT, ABORT, INSERT, DELETE, UPDATE, CHECKPOINT)
+  - [x] Full serialize/deserialize support
+  - [x] Unit tests passing (14 tests)
 
-- [ ] `WALManager` class
-  - [ ] Log appending
-  - [ ] Log flushing (fsync)
+- [x] `WALManager` class
+  - [x] Log appending with buffered writes
+  - [x] Log flushing (fsync)
+  - [x] Flush-to-LSN for commit
+  - [x] Log recovery/reading
   - [ ] Group commit optimization
-  - [ ] Unit tests passing
+  - [x] Unit tests passing (6 tests)
 
 ### 2.3 Lock Manager
-- [ ] `LockManager` class
-  - [ ] Shared/Exclusive locks
-  - [ ] Lock table structure
-  - [ ] Deadlock detection (basic)
-  - [ ] Unit tests passing
+- [x] `LockManager` class
+  - [x] Shared/Exclusive locks
+  - [x] Lock table structure with request queues
+  - [x] Lock wait with timeout
+  - [x] Lock upgrade (S → X)
+  - [x] Deadlock detection (wait-for graph)
+  - [x] 2PL protocol enforcement
+  - [x] Unit tests passing (26 tests)
 
 ### 2.4 MVCC
 - [ ] `VersionChain` structure
@@ -277,8 +287,8 @@
 | Component | Tests Written | Tests Passing | Coverage |
 |-----------|---------------|---------------|----------|
 | Storage | 9 files | 161 passing | ~80% |
-| Catalog | 1 file | Passing | ~10% |
-| Transaction | 0 | 0 | 0% |
+| Catalog | 1 file | 5 passing | ~10% |
+| Transaction | 1 file | 65 passing | ~60% |
 | Execution | 0 | 0 | 0% |
 | Optimizer | 0 | 0 | 0% |
 | Integration | 1 file | Passing | ~5% |
@@ -300,6 +310,27 @@
 ---
 
 ## Development Log
+
+### Session: 2024-12 - Lock Manager Implementation
+- Implemented complete Lock Manager for 2PL concurrency control:
+  - Shared (S) and Exclusive (X) lock modes with compatibility matrix
+  - Lock request queues for each resource (table or row)
+  - Lock wait with configurable timeout
+  - Lock upgrade (shared → exclusive) with proper handling
+  - Deadlock detection using wait-for graph with DFS cycle detection
+  - 2PL protocol enforcement (GROWING → SHRINKING phase transition)
+  - Thread-safe implementation with condition variables
+  - Release all locks helper for transaction cleanup
+- Added 26 comprehensive Lock Manager tests covering:
+  - Basic table and row lock acquisition
+  - Lock compatibility (S-S, S-X, X-X blocking)
+  - Lock upgrade scenarios
+  - 2PL violation detection
+  - Concurrent shared locks
+  - Lock wait and release
+  - Basic deadlock detection
+  - Multiple waiters granted on release
+- All 231 tests passing (161 storage + 65 transaction + 5 catalog)
 
 ### Session: 2024-12 - B+ Tree Core Operations
 - Implemented complete B+ Tree index with all core operations
@@ -364,10 +395,10 @@
 
 ## Next Steps
 
-1. **Immediate**: Begin transaction management (WAL, log records)
-2. **Next**: Implement lock manager for concurrency
-3. **Then**: Add MVCC for isolation
-4. **Following**: Build recovery manager (REDO/UNDO)
+1. **Immediate**: Add MVCC for snapshot isolation
+2. **Next**: Build recovery manager (REDO/UNDO)
+3. **Then**: Begin catalog system for table metadata
+4. **Following**: Start query processing (parser, binder)
 
 ---
 
