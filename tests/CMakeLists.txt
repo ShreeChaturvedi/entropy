@@ -54,6 +54,24 @@ target_link_libraries(catalog_tests
 gtest_discover_tests(catalog_tests)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Transaction Tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+add_executable(transaction_tests
+    transaction/transaction_test.cpp
+)
+
+target_link_libraries(transaction_tests
+    PRIVATE
+        entropy_transaction
+        test_utils
+        GTest::gtest
+        GTest::gtest_main
+)
+
+gtest_discover_tests(transaction_tests)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Integration Tests
 # ─────────────────────────────────────────────────────────────────────────────
 
