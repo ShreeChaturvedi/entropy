@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "common/types.hpp"
+#include "parser/expression.hpp"
 
 namespace entropy {
 
