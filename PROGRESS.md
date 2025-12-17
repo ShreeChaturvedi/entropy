@@ -15,7 +15,7 @@
 
 **Overall Progress**: ~65%
 
-**Last Updated**: 2024-12-17 - ORDER BY/LIMIT Complete (326 tests passing)
+**Last Updated**: 2024-12-17 - Hash Join Complete (328 tests passing)
 
 ---
 
@@ -179,7 +179,7 @@
 - [x] JOINs (Nested Loop Join - INNER/LEFT/RIGHT/CROSS)
 - [x] Aggregations (COUNT, SUM, AVG, MIN, MAX with GROUP BY)
 - [x] ORDER BY / LIMIT
-- [ ] Hash Join (optimization)
+- [x] Hash Join (O(n+m) for equi-joins)
 - [ ] IndexScan executor
 
 ---
@@ -213,9 +213,9 @@
 | Transaction | 1 file | 84 |
 | Catalog | 1 file | 8 |
 | Parser/Binder | 1 file | 35 |
-| Execution | 1 file | 22 |
+| Execution | 1 file | 24 |
 | Integration | 1 file | 16 |
-| **Total** | | **326** |
+| **Total** | | **328** |
 
 ---
 
