@@ -83,6 +83,7 @@ add_library(entropy_transaction STATIC
     transaction/log_record.cpp
     transaction/wal.cpp
     transaction/recovery.cpp
+    transaction/mvcc.cpp
 )
 
 target_include_directories(entropy_transaction

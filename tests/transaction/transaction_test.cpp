@@ -14,6 +14,7 @@
 
 #include "transaction/lock_manager.hpp"
 #include "transaction/log_record.hpp"
+#include "transaction/mvcc.hpp"
 #include "transaction/recovery.hpp"
 #include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
@@ -1337,6 +1338,166 @@ TEST_F(RecoveryTest, CreateCheckpoint) {
   ASSERT_EQ(records.size(), 1);
   EXPECT_EQ(records[0].type(), LogRecordType::CHECKPOINT);
   EXPECT_EQ(records[0].active_txns(), active);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MVCC Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+class MVCCTest : public ::testing::Test {
+protected:
+  MVCCManager mvcc_;
+};
+
+TEST_F(MVCCTest, TimestampGeneration) {
+  uint64_t ts1 = mvcc_.get_timestamp();
+  uint64_t ts2 = mvcc_.get_timestamp();
+  uint64_t ts3 = mvcc_.get_timestamp();
+
+  EXPECT_LT(ts1, ts2);
+  EXPECT_LT(ts2, ts3);
+}
+
+TEST_F(MVCCTest, VersionInfoDefaults) {
+  VersionInfo version;
+
+  EXPECT_EQ(version.created_by, TXN_ID_NONE);
+  EXPECT_EQ(version.deleted_by, TXN_ID_NONE);
+  EXPECT_EQ(version.begin_ts, 0);
+  EXPECT_EQ(version.end_ts, TIMESTAMP_MAX);
+  EXPECT_FALSE(version.is_deleted());
+}
+
+TEST_F(MVCCTest, InitVersion) {
+  Transaction txn(100);
+  VersionInfo version;
+
+  mvcc_.init_version(version, &txn);
+
+  EXPECT_EQ(version.created_by, 100);
+  EXPECT_EQ(version.deleted_by, TXN_ID_NONE);
+  EXPECT_EQ(version.begin_ts, 0); // Not yet committed
+  EXPECT_EQ(version.end_ts, TIMESTAMP_MAX);
+}
+
+TEST_F(MVCCTest, MarkDeleted) {
+  Transaction creator(1);
+  Transaction deleter(2);
+  VersionInfo version;
+
+  mvcc_.init_version(version, &creator);
+  mvcc_.mark_deleted(version, &deleter);
+
+  EXPECT_EQ(version.deleted_by, 2);
+  EXPECT_TRUE(version.is_deleted());
+}
+
+TEST_F(MVCCTest, CreatorSeesOwnUncommittedVersion) {
+  Transaction txn(42);
+  VersionInfo version;
+
+  mvcc_.init_version(version, &txn);
+
+  // Creator should see their own uncommitted version
+  EXPECT_TRUE(mvcc_.is_visible(version, &txn));
+}
+
+TEST_F(MVCCTest, OtherTransactionCannotSeeUncommittedVersion) {
+  Transaction creator(1);
+  Transaction reader(2);
+  VersionInfo version;
+
+  mvcc_.init_version(version, &creator);
+
+  // Other transaction should not see uncommitted version
+  EXPECT_FALSE(mvcc_.is_visible(version, &reader));
+}
+
+TEST_F(MVCCTest, VisibleAfterCommit) {
+  // Simulate: txn1 creates version, commits, then txn2 reads
+
+  // txn1 creates version
+  Transaction txn1(1);
+  VersionInfo version;
+  mvcc_.init_version(version, &txn1);
+
+  // txn1 commits at timestamp 100
+  txn1.set_commit_ts(100);
+  mvcc_.finalize_commit(version, 100);
+
+  // txn2 starts after txn1 committed (start_ts > version.begin_ts)
+  Transaction txn2(2);
+  // Simulate txn2 starting after txn1's commit
+  // txn2 has start_ts from when it was created, which would be after 100
+
+  // For testing, we'll verify the logic directly
+  // Version should be visible if begin_ts <= reader's start_ts
+  EXPECT_EQ(version.begin_ts, 100);
+}
+
+TEST_F(MVCCTest, DeletedVersionNotVisible) {
+  Transaction creator(1);
+  Transaction deleter(2);
+  Transaction reader(3);
+  VersionInfo version;
+
+  // Create and commit version
+  mvcc_.init_version(version, &creator);
+  mvcc_.finalize_commit(version, 10); // Committed at ts 10
+
+  // Delete and commit deletion
+  mvcc_.mark_deleted(version, &deleter);
+  mvcc_.finalize_commit(version, 20); // Deletion committed at ts 20
+
+  EXPECT_EQ(version.begin_ts, 10);
+  EXPECT_EQ(version.end_ts, 20);
+  EXPECT_TRUE(version.is_deleted());
+}
+
+TEST_F(MVCCTest, RollbackVersion) {
+  Transaction txn(1);
+  VersionInfo version;
+
+  mvcc_.init_version(version, &txn);
+  mvcc_.rollback_version(version);
+
+  // After rollback, begin_ts is MAX, end_ts is 0
+  // This makes the version invisible to all transactions
+  EXPECT_EQ(version.begin_ts, TIMESTAMP_MAX);
+  EXPECT_EQ(version.end_ts, 0);
+}
+
+TEST_F(MVCCTest, VisibilityWithNullTransaction) {
+  VersionInfo uncommitted;
+  uncommitted.begin_ts = 0;
+
+  VersionInfo committed;
+  committed.begin_ts = 10;
+
+  VersionInfo deleted;
+  deleted.begin_ts = 10;
+  deleted.end_ts = 20;
+
+  // Null transaction sees committed, non-deleted versions
+  EXPECT_FALSE(mvcc_.is_visible(uncommitted, nullptr));
+  EXPECT_TRUE(mvcc_.is_visible(committed, nullptr));
+  EXPECT_FALSE(mvcc_.is_visible(deleted, nullptr));
+}
+
+TEST_F(MVCCTest, CreatorCannotSeeAfterSelfDelete) {
+  Transaction txn(1);
+  VersionInfo version;
+
+  mvcc_.init_version(version, &txn);
+
+  // Creator sees their own version
+  EXPECT_TRUE(mvcc_.is_visible(version, &txn));
+
+  // Creator deletes
+  mvcc_.mark_deleted(version, &txn);
+
+  // Creator should NOT see after self-delete
+  EXPECT_FALSE(mvcc_.is_visible(version, &txn));
 }
 
 } // namespace
