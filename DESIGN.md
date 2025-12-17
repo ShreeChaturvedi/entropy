@@ -42,7 +42,7 @@
 | Build System | CMake 3.20+ | Cross-platform, industry standard |
 | Testing | Google Test | Well-supported, familiar to reviewers |
 | Benchmarking | Google Benchmark | Pairs with GTest, micro-benchmark support |
-| SQL Parser | libpg_query or hsql | Avoid reinventing grammar parsing |
+| SQL Parser | **Custom** | Hand-written recursive descent parser; no external dependencies |
 | Compression | LZ4 (optional) | Fast compression for pages |
 | Logging | spdlog | Header-only, fast, modern |
 
@@ -284,72 +284,76 @@ entropy/
 
 ## Implemented Components
 
-> **Update this section as components are completed**
+> **Status Legend**: ✅ Complete | 🟡 Partial | ⭕ Not Started
 
 ### Storage Layer
 | Component | Status | Header | Implementation | Tests |
 |-----------|--------|--------|----------------|-------|
-| Page | Not Started | - | - | - |
-| DiskManager | Not Started | - | - | - |
-| BufferPool | Not Started | - | - | - |
-| LRUReplacer | Not Started | - | - | - |
-| B+Tree | Not Started | - | - | - |
-| HashIndex | Not Started | - | - | - |
-| TableHeap | Not Started | - | - | - |
-| Tuple | Not Started | - | - | - |
+| Page | ✅ Complete | `page.hpp` | `page.cpp` | 27 passing |
+| DiskManager | ✅ Complete | `disk_manager.hpp` | `disk_manager.cpp` | 4 passing |
+| BufferPool | ✅ Complete | `buffer_pool.hpp` | `buffer_pool.cpp` | 5 passing |
+| LRUReplacer | ✅ Complete | `lru_replacer.hpp` | `lru_replacer.cpp` | 6 passing |
+| B+Tree | ✅ Complete | `b_plus_tree.hpp` | `b_plus_tree.cpp` | 50 passing |
+| HashIndex | ⭕ Not Started | stub | stub | - |
+| TableHeap | ✅ Complete | `table_heap.hpp` | `table_heap.cpp` | 23 passing |
+| Tuple | ✅ Complete | `tuple.hpp` | `tuple.cpp` | 46 passing |
 
 ### Catalog Layer
 | Component | Status | Header | Implementation | Tests |
 |-----------|--------|--------|----------------|-------|
-| Catalog | Not Started | - | - | - |
-| Schema | Not Started | - | - | - |
-| Column | Not Started | - | - | - |
+| Catalog | ✅ Complete | `catalog.hpp` | `catalog.cpp` | 8 passing |
+| Schema | ✅ Complete | `schema.hpp` | `schema.cpp` | included |
+| Column | ✅ Complete | `column.hpp` | `column.cpp` | included |
 
 ### Transaction Layer
 | Component | Status | Header | Implementation | Tests |
 |-----------|--------|--------|----------------|-------|
-| Transaction | Not Started | - | - | - |
-| TransactionManager | Not Started | - | - | - |
-| LockManager | Not Started | - | - | - |
-| MVCC | Not Started | - | - | - |
-| WAL | Not Started | - | - | - |
-| LogRecord | Not Started | - | - | - |
-| Recovery | Not Started | - | - | - |
-
-### Execution Layer
-| Component | Status | Header | Implementation | Tests |
-|-----------|--------|--------|----------------|-------|
-| Executor | Not Started | - | - | - |
-| SeqScanExecutor | Not Started | - | - | - |
-| IndexScanExecutor | Not Started | - | - | - |
-| InsertExecutor | Not Started | - | - | - |
-| UpdateExecutor | Not Started | - | - | - |
-| DeleteExecutor | Not Started | - | - | - |
-| NestedLoopJoin | Not Started | - | - | - |
-| HashJoin | Not Started | - | - | - |
-| Aggregation | Not Started | - | - | - |
-
-### Optimizer Layer
-| Component | Status | Header | Implementation | Tests |
-|-----------|--------|--------|----------------|-------|
-| Optimizer | Not Started | - | - | - |
-| CostModel | Not Started | - | - | - |
-| Statistics | Not Started | - | - | - |
-| IndexSelector | Not Started | - | - | - |
+| Transaction | ✅ Complete | `transaction.hpp` | `transaction.cpp` | 8 passing |
+| TransactionManager | ✅ Complete | `transaction_manager.hpp` | `transaction_manager.cpp` | 11 passing |
+| LockManager | ✅ Complete | `lock_manager.hpp` | `lock_manager.cpp` | 26 passing |
+| MVCC | ✅ Complete | `mvcc.hpp` | `mvcc.cpp` | 11 passing |
+| WAL | ✅ Complete | `wal.hpp` | `wal.cpp` | 6 passing |
+| LogRecord | ✅ Complete | `log_record.hpp` | `log_record.cpp` | 14 passing |
+| Recovery | ✅ Complete | `recovery.hpp` | `recovery.cpp` | 8 passing |
 
 ### Parser Layer
 | Component | Status | Header | Implementation | Tests |
 |-----------|--------|--------|----------------|-------|
-| Parser | Not Started | - | - | - |
-| AST | Not Started | - | - | - |
-| Binder | Not Started | - | - | - |
+| Lexer/Tokenizer | ✅ Complete | `token.hpp` | `token.cpp` | 8 passing |
+| Parser | ✅ Complete | `parser.hpp` | `parser.cpp` | 13 passing |
+| Statement AST | ✅ Complete | `statement.hpp` | - | - |
+| Expression | ✅ Complete | `expression.hpp` | `expression.cpp` | 6 passing |
+| Binder | ✅ Complete | `binder.hpp` | `binder.cpp` | 8 passing |
+
+### Execution Layer
+| Component | Status | Header | Implementation | Tests |
+|-----------|--------|--------|----------------|-------|
+| Executor Base | ✅ Complete | `executor.hpp` | `executor.cpp` | - |
+| SeqScanExecutor | ✅ Complete | `seq_scan_executor.hpp` | `seq_scan_executor.cpp` | 3 passing |
+| InsertExecutor | ✅ Complete | `insert_executor.hpp` | `insert_executor.cpp` | 2 passing |
+| UpdateExecutor | ✅ Complete | `update_executor.hpp` | `update_executor.cpp` | 1 passing |
+| DeleteExecutor | ✅ Complete | `delete_executor.hpp` | `delete_executor.cpp` | 1 passing |
+| FilterExecutor | ✅ Complete | `filter.hpp` | `filter.cpp` | 1 passing |
+| ProjectionExecutor | ✅ Complete | `projection.hpp` | `projection.cpp` | 1 passing |
+| NestedLoopJoin | ⭕ Not Started | stub | stub | - |
+| HashJoin | ⭕ Not Started | stub | stub | - |
+| Aggregation | ⭕ Not Started | stub | stub | - |
+| IndexScanExecutor | ⭕ Not Started | stub | stub | - |
+
+### Optimizer Layer
+| Component | Status | Header | Implementation | Tests |
+|-----------|--------|--------|----------------|-------|
+| Optimizer | ⭕ Not Started | stub | stub | - |
+| CostModel | ⭕ Not Started | stub | stub | - |
+| Statistics | ⭕ Not Started | stub | stub | - |
+| IndexSelector | ⭕ Not Started | stub | stub | - |
 
 ### API Layer
 | Component | Status | Header | Implementation | Tests |
 |-----------|--------|--------|----------------|-------|
-| Database | Not Started | - | - | - |
-| Result | Not Started | - | - | - |
-| Shell | Not Started | - | - | - |
+| Database | ✅ Complete | `database.hpp` | `database.cpp` | 16 passing |
+| Result | ✅ Complete | `result.hpp` | `result.cpp` | included |
+| Shell | 🟡 Partial | - | `shell.cpp` | - |
 
 ---
 
@@ -477,10 +481,12 @@ Leaf Node:
 
 | Date | Decision | Rationale | Alternatives Considered |
 |------|----------|-----------|------------------------|
-| 2024-XX-XX | Use slotted page format | Industry standard, supports variable-length records | Fixed-length only |
-| 2024-XX-XX | MVCC over strict 2PL | Better read performance, snapshot isolation | Strict 2PL only |
-| 2024-XX-XX | hsql for SQL parsing | Well-maintained, sufficient for our SQL subset | libpg_query, custom parser |
-| 2024-XX-XX | LZ4 over zlib | Speed over compression ratio | zlib, zstd |
+| 2024-12 | Use slotted page format | Industry standard, supports variable-length records | Fixed-length only |
+| 2024-12 | MVCC over strict 2PL | Better read performance, snapshot isolation | Strict 2PL only |
+| 2024-12 | Custom SQL parser | No external dependencies, full control over grammar | hsql, libpg_query |
+| 2024-12 | Volcano iterator model | Industry standard, composable executors | Vectorized, push-based |
+| 2024-12 | TableInfo with embedded TableHeap | Catalog directly manages storage, simpler integration | Separate TableHeap registry |
+| 2024-12 | Schema-aware type conversion | int64→int32 at insertion time, not evaluation time | Type coercion in expressions |
 
 ### Architecture Decisions Records (ADR)
 
@@ -491,13 +497,41 @@ Leaf Node:
 
 #### ADR-002: Index Structure
 - **Context**: Primary index implementation choice
-- **Decision**: B+ tree as primary, hash index for equality
+- **Decision**: B+ tree as primary, hash index for equality (planned)
 - **Consequences**: B+ tree handles range queries, hash for O(1) point lookups
 
 #### ADR-003: Concurrency Control
 - **Context**: How to handle concurrent transactions
-- **Decision**: MVCC with snapshot isolation
+- **Decision**: MVCC with snapshot isolation + 2PL lock manager
 - **Consequences**: Readers don't block writers, requires garbage collection of old versions
+
+#### ADR-004: SQL Parser Design
+- **Context**: Whether to use external SQL parser library
+- **Decision**: Custom recursive descent parser with no external dependencies
+- **Rationale**:
+  - Full control over supported SQL subset
+  - No version compatibility issues with third-party libraries
+  - Educational value for understanding parser internals
+  - Simpler build and deployment
+- **Trade-offs**: More code to maintain, may have grammar edge cases
+
+#### ADR-005: Execution Engine Architecture
+- **Context**: How to execute query plans
+- **Decision**: Volcano iterator model with `init()` / `next()` interface
+- **Rationale**:
+  - Industry standard pattern (used in PostgreSQL, MySQL)
+  - Easy to compose executors into pipelines
+  - Natural for memory-limited processing (one tuple at a time)
+- **Trade-offs**: May be slower than vectorized execution for analytics
+
+#### ADR-006: Catalog-Storage Integration
+- **Context**: How Catalog relates to TableHeap storage
+- **Decision**: `TableInfo` struct holds `shared_ptr<TableHeap>` directly
+- **Rationale**:
+  - Eliminates separate registry for heaps
+  - Creating a table automatically creates its storage
+  - Single lookup to get both schema and storage
+- **Trade-offs**: Catalog becomes larger; TableHeap lifetime tied to catalog entry
 
 ---
 
