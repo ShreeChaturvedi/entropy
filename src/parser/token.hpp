@@ -48,6 +48,15 @@ enum class TokenType {
   TRUE_KEYWORD,
   FALSE_KEYWORD,
 
+  // Keywords - JOIN
+  JOIN,
+  INNER,
+  LEFT,
+  RIGHT,
+  OUTER,
+  CROSS,
+  ON,
+
   // Keywords - Other
   AS,
   ORDER,
