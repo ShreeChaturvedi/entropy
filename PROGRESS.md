@@ -10,12 +10,12 @@
 |-------|--------|----------|
 | Phase 1: Storage Engine | 🟢 Complete | ~90% |
 | Phase 2: Transactions | 🟢 Complete | ~95% |
-| Phase 3: Query Processing | 🔴 Not Started | 0% |
+| Phase 3: Query Processing | 🟡 In Progress | ~70% |
 | Phase 4: Optimization | 🔴 Not Started | 0% |
 
-**Overall Progress**: ~46%
+**Overall Progress**: ~65%
 
-**Last Updated**: 2024-12 - SQL Execution Pipeline Complete (313 tests passing)
+**Last Updated**: 2024-12-17 - SQL Execution Pipeline Complete (313 tests passing)
 
 ---
 
@@ -89,7 +89,7 @@
   - [x] Serialization/deserialization
   - [x] Null bitmap handling
   - [x] Variable-length columns (VARCHAR)
-  - [x] All SQL types supported (BOOLEAN, TINYINT, SMALLINT, INTEGER, BIGINT, FLOAT, DOUBLE, VARCHAR)
+  - [x] All SQL types supported
   - [x] Unit tests written (46 tests passing)
 
 - [x] `TupleValue` class
@@ -110,124 +110,76 @@
 ## Phase 2: Transaction & Concurrency
 
 ### 2.1 Transaction Manager
-- [x] `Transaction` class
-  - [x] Transaction ID generation
-  - [x] Transaction state machine (2PL: GROWING → SHRINKING → COMMITTED/ABORTED)
-  - [x] Write set tracking for undo
-  - [x] Lock tracking for 2PL
-  - [x] MVCC timestamps (start_ts, commit_ts)
-  - [x] Unit tests passing (8 tests)
-
-- [x] `TransactionManager` class
-  - [x] Begin/Commit/Abort operations
-  - [x] Active transaction tracking
-  - [x] WAL integration (log insert/delete/update)
-  - [x] Force-on-commit WAL flushing
-  - [x] Unit tests passing (11 tests)
+- [x] `Transaction` class (8 tests)
+- [x] `TransactionManager` class (11 tests)
 
 ### 2.2 Write-Ahead Logging
-- [x] `LogRecord` class
-  - [x] 32-byte fixed header with serialization
-  - [x] Multiple record types (BEGIN, COMMIT, ABORT, INSERT, DELETE, UPDATE, CHECKPOINT)
-  - [x] Full serialize/deserialize support
-  - [x] Unit tests passing (14 tests)
-
-- [x] `WALManager` class
-  - [x] Log appending with buffered writes
-  - [x] Log flushing (fsync)
-  - [x] Flush-to-LSN for commit
-  - [x] Log recovery/reading
-  - [ ] Group commit optimization
-  - [x] Unit tests passing (6 tests)
+- [x] `LogRecord` class (14 tests)
+- [x] `WALManager` class (6 tests)
 
 ### 2.3 Lock Manager
-- [x] `LockManager` class
+- [x] `LockManager` class (26 tests)
   - [x] Shared/Exclusive locks
-  - [x] Lock table structure with request queues
   - [x] Lock wait with timeout
-  - [x] Lock upgrade (S → X)
   - [x] Deadlock detection (wait-for graph)
-  - [x] 2PL protocol enforcement
-  - [x] Unit tests passing (26 tests)
 
 ### 2.4 MVCC
-- [x] `MVCCManager` class
-  - [x] VersionInfo structure (32 bytes: created_by, deleted_by, begin_ts, end_ts)
-  - [x] Snapshot isolation visibility checking
-  - [x] Read-committed isolation support
-  - [x] Version lifecycle (init, delete, commit, rollback)
-  - [x] Monotonic timestamp generation
-  - [x] Unit tests passing (11 tests)
+- [x] `MVCCManager` class (11 tests)
+  - [x] Snapshot isolation visibility
+  - [x] Version lifecycle management
 
 ### 2.5 Recovery
-- [x] `RecoveryManager` class (ARIES-style)
-  - [x] Analysis phase (build ATT from checkpoint)
-  - [x] REDO phase (replay logged operations)
-  - [x] UNDO phase (rollback via prevLSN chains)
-  - [x] Checkpoint creation
-  - [x] Crash recovery tests (8 tests)
+- [x] `RecoveryManager` class (8 tests)
+  - [x] ARIES-style recovery
 
 ---
 
 ## Phase 3: Query Processing
 
 ### 3.1 Catalog
-- [x] `Column` class
-  - [x] Data type definitions
-  - [ ] Constraints (NOT NULL, etc.)
-  - [x] Unit tests passing
-
-- [x] `Schema` class
-  - [x] Column collection
-  - [x] Column lookup by name
-  - [x] Unit tests passing
-
-- [ ] `Catalog` class
-  - [ ] Table metadata storage
-  - [ ] Index metadata storage
-  - [ ] System tables
-  - [ ] Unit tests passing
+- [x] `Column` class - data type definitions
+- [x] `Schema` class - column collection
+- [x] `Catalog` class with TableInfo
+  - [x] TableInfo struct (oid, name, schema, TableHeap)
+  - [x] Table creation with automatic TableHeap
+  - [x] Table lookup and listing
+  - [x] Unit tests (8 tests passing)
 
 ### 3.2 SQL Parser
 - [x] Custom recursive descent parser (no external deps)
   - [x] Tokenizer/Lexer with 45+ token types
   - [x] Statement AST (SELECT, INSERT, UPDATE, DELETE, CREATE/DROP TABLE)
   - [x] Expression system (constants, columns, operators)
-  - [x] 27 parser tests passing
+  - [x] 27 parser/lexer/expression tests passing
 
-- [ ] `Binder` class
-  - [ ] Name resolution
-  - [ ] Type checking
-  - [ ] Unit tests passing
+### 3.3 Binder
+- [x] `Binder` class
+  - [x] Name resolution (table → catalog, column → schema index)
+  - [x] Type checking
+  - [x] Bound contexts for each statement type
+  - [x] 8 binder tests passing
 
-### 3.3 Execution Engine
-- [ ] `Executor` base class
-  - [ ] Iterator model (Next())
-  - [ ] Context management
+### 3.4 Execution Engine
+- [x] `Executor` base class with init()/next() iterator model
+- [x] `SeqScanExecutor` - TableHeap iteration with optional predicate
+- [x] `FilterExecutor` - predicate-based tuple filtering
+- [x] `ProjectionExecutor` - column selection with output schema
+- [x] `InsertExecutor` - batch tuple insertion
+- [x] `UpdateExecutor` - SET clause with type conversion
+- [x] `DeleteExecutor` - child-based deletion
+- [x] 9 executor tests passing
 
-- [ ] Scan Executors
-  - [ ] `SeqScanExecutor`
-  - [ ] `IndexScanExecutor`
-  - [ ] Unit tests passing
+### 3.5 Database API Integration
+- [x] `Database.execute()` - full SQL pipeline
+  - [x] Parser → Binder → Executors → Result
+  - [x] Type conversion (int64→int32 for INTEGER columns)
+  - [x] 16 end-to-end integration tests passing
 
-- [ ] Modification Executors
-  - [ ] `InsertExecutor`
-  - [ ] `UpdateExecutor`
-  - [ ] `DeleteExecutor`
-  - [ ] Unit tests passing
-
-- [ ] Join Executors
-  - [ ] `NestedLoopJoinExecutor`
-  - [ ] `HashJoinExecutor`
-  - [ ] Unit tests passing
-
-- [ ] Other Executors
-  - [ ] `AggregationExecutor` (COUNT, SUM, AVG, MIN, MAX)
-  - [ ] `ProjectionExecutor`
-  - [ ] `FilterExecutor`
-  - [ ] `SortExecutor`
-  - [ ] `LimitExecutor`
-  - [ ] Unit tests passing
+### 3.6 Remaining (Query Processing)
+- [ ] JOINs (Nested Loop Join, Hash Join)
+- [ ] Aggregations (COUNT, SUM, AVG, MIN, MAX, GROUP BY)
+- [ ] ORDER BY / LIMIT
+- [ ] IndexScan executor
 
 ---
 
@@ -235,159 +187,34 @@
 
 ### 4.1 Query Optimizer
 - [ ] `PlanNode` classes
-  - [ ] Logical plan nodes
-  - [ ] Physical plan nodes
-  - [ ] Plan tree structure
-
 - [ ] `CostModel` class
-  - [ ] I/O cost estimation
-  - [ ] CPU cost estimation
-  - [ ] Selectivity estimation
-
 - [ ] `Statistics` class
-  - [ ] Table cardinality
-  - [ ] Column histograms
-  - [ ] Index statistics
-
-- [ ] `Optimizer` class
-  - [ ] Rule-based optimizations
-  - [ ] Index selection
-  - [ ] Join ordering
-  - [ ] Predicate pushdown
+- [ ] Index selection
 
 ### 4.2 Hash Index
-- [ ] `HashIndex` class
-  - [ ] Extendible hashing
-  - [ ] Point lookups
-  - [ ] Unit tests passing
+- [ ] Extendible hashing
 
 ### 4.3 Advanced Features
 - [ ] EXPLAIN command
 - [ ] Page compression (LZ4)
-- [ ] Bulk loading optimization
-- [ ] Covering index queries
 
 ### 4.4 API & Shell
-- [ ] `Database` class (public API)
-- [ ] `Result` class
-- [ ] Interactive SQL shell
+- [ ] Interactive SQL shell improvements
 - [ ] Error messages
 
-### 4.5 Documentation & Polish
-- [ ] README with architecture diagram
-- [ ] API documentation
-- [ ] Example queries
-- [ ] Performance benchmarks
-
 ---
 
-## Benchmarks & Testing
+## Test Summary
 
-### Unit Test Coverage
-| Component | Tests Written | Tests Passing | Coverage |
-|-----------|---------------|---------------|----------|
-| Storage | 9 files | 161 passing | ~80% |
-| Catalog | 1 file | 5 passing | ~10% |
-| Transaction | 1 file | 84 passing | ~90% |
-| Parser | 1 file | 27 passing | ~70% |
-| Execution | 0 | 0 | 0% |
-| Optimizer | 0 | 0 | 0% |
-| Integration | 1 file | Passing | ~5% |
-
-### Performance Benchmarks
-| Benchmark | Target | Current | Status |
-|-----------|--------|---------|--------|
-| Bulk Insert | 50K/sec | - | Not Run |
-| Point Query | <1ms | - | Not Run |
-| Range Query | 100K/sec | - | Not Run |
-| TPS | 10K | - | Not Run |
-
-### Integration Tests
-- [ ] End-to-end SQL tests
-- [ ] Crash recovery test
-- [ ] Concurrent access test
-- [ ] Large dataset test
-
----
-
-## Development Log
-
-### Session: 2024-12 - Recovery Manager & MVCC Implementation
-- Implemented ARIES-style Recovery Manager (`recovery.hpp`, `recovery.cpp`):
-  - Analysis phase: scans log from checkpoint, builds Active Transaction Table (ATT)
-  - REDO phase: replays all logged data modification operations
-  - UNDO phase: rolls back uncommitted transactions via prevLSN chains
-  - Checkpoint creation support for faster recovery
-- Implemented MVCC (`mvcc.hpp`, `mvcc.cpp`):
-  - VersionInfo: 32-byte structure with created_by, deleted_by, begin_ts, end_ts
-  - Snapshot isolation visibility: transaction sees committed versions from before its start
-  - Read-committed isolation support
-  - Version lifecycle management (init, mark_deleted, finalize_commit, rollback)
-  - Monotonic timestamp generation for transaction ordering
-- Added 19 new tests (8 Recovery + 11 MVCC)
-- All 256 tests passing (161 storage + 84 transaction + 5 catalog + 6 integration)
-
-### Session: 2024-12 - Lock Manager Implementation
-- Implemented complete Lock Manager for 2PL concurrency control:
-  - Shared (S) and Exclusive (X) lock modes with compatibility matrix
-  - Lock request queues for each resource (table or row)
-  - Lock wait with configurable timeout
-  - Lock upgrade (shared → exclusive) with proper handling
-  - Deadlock detection using wait-for graph with DFS cycle detection
-  - 2PL protocol enforcement (GROWING → SHRINKING phase transition)
-  - Thread-safe implementation with condition variables
-  - Release all locks helper for transaction cleanup
-- Added 26 comprehensive Lock Manager tests
-- All 231 tests passing
-
-### Session: 2024-12 - B+ Tree Core Operations
-- Implemented complete B+ Tree index with all core operations
-  - Insert with automatic leaf and internal node splitting
-  - Point lookup (find) with O(log n) tree traversal
-  - Range scan using BPlusTreeIterator with lower_bound support
-  - Simplified delete (marks removed, no rebalancing)
-  - is_empty() checks actual key count in root
-- Added 26 comprehensive B+ Tree tests covering:
-  - Basic operations (insert, find, remove)
-  - Duplicate handling
-  - Range scans with various boundaries
-  - Iterator traversal and lower_bound
-  - Large insertions triggering splits
-  - Random and reverse order insertions
-  - Delete-all and reinsert scenarios
-- All 161 storage tests passing
-
-### Session: 2024-12 - Storage Engine Core Implementation
-- Implemented complete slotted page format (`TablePage` class)
-  - Record insertion, deletion, update
-  - Page compaction for space reclamation
-  - Page linking for heap files
-  - 19 comprehensive tests
-- Implemented full Tuple serialization
-  - `TupleValue` class with variant-based storage for all SQL types
-  - Null bitmap handling
-  - Fixed-size and variable-length column support
-  - Schema-based serialization/deserialization
-  - 46 comprehensive tests (TupleValue + Tuple)
-- Implemented TableHeap with iterator support
-  - CRUD operations (insert, update, delete, get)
-  - Sequential scan via TableIterator
-  - Multi-page support with automatic page allocation
-  - 23 comprehensive tests
-- Fixed PageHeader alignment issue (40 bytes -> 32 bytes)
-- All 111 storage tests passing
-
-### Session: 2024 - Project Initialization
-- Created comprehensive project structure with all directories
-- Set up CMake build system with FetchContent for dependencies
-- Created DESIGN.md with architecture documentation
-- Created PROGRESS.md for tracking
-- Created base README.md for portfolio
-- Implemented core utilities: types, status, config, logger
-- Implemented basic storage layer: Page, DiskManager, BufferPool, LRUReplacer
-- Created stub implementations for all planned components
-- Set up Google Test with initial test files
-- Created example program and SQL shell skeleton
+| Component | Test File | Tests Passing |
+|-----------|-----------|---------------|
+| Storage | 9 files | 161 |
+| Transaction | 1 file | 84 |
+| Catalog | 1 file | 8 |
+| Parser/Binder | 1 file | 35 |
+| Execution | 1 file | 9 |
+| Integration | 1 file | 16 |
+| **Total** | | **313** |
 
 ---
 
@@ -397,17 +224,9 @@
 |-------|----------|-------|
 | TableHeap update may change RID | Medium | When tuple grows, delete+insert occurs |
 | No free space map | Low | Linear scan for page with space |
-| No thread safety in TableHeap | Medium | Add later with lock manager |
+| No thread safety in TableHeap | Medium | Add later with lock manager integration |
+| MVCC not integrated into execution | Medium | Executors don't check visibility |
 
 ---
 
-## Next Steps
-
-1. **Immediate**: Begin catalog system for table metadata
-2. **Next**: Start query processing (parser, binder)
-3. **Then**: Implement execution engine
-4. **Following**: Query optimization
-
----
-
-*Update this document after each development session*
+*Last Updated: 2024-12-17*
