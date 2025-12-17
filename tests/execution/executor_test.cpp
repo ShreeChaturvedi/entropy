@@ -10,6 +10,7 @@
 #include "execution/delete_executor.hpp"
 #include "execution/filter.hpp"
 #include "execution/hash_join.hpp"
+#include "execution/index_scan_executor.hpp"
 #include "execution/insert_executor.hpp"
 #include "execution/limit_executor.hpp"
 #include "execution/nested_loop_join.hpp"
@@ -18,6 +19,7 @@
 #include "execution/sort_executor.hpp"
 #include "execution/update_executor.hpp"
 #include "parser/expression.hpp"
+#include "storage/b_plus_tree.hpp"
 #include "storage/buffer_pool.hpp"
 #include "test_utils.hpp"
 
@@ -880,6 +882,120 @@ TEST_F(JoinTest, HashJoinLeft) {
 
   // Alice:2 + Bob:1 + Charlie:1(null) = 4 rows
   EXPECT_EQ(count, 4);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Index Scan Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+class IndexScanTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    temp_file_ = std::make_unique<test::TempFile>("index_scan_test");
+    disk_manager_ = std::make_shared<DiskManager>(temp_file_->path());
+    buffer_pool_ = std::make_shared<BufferPoolManager>(16, disk_manager_);
+    catalog_ = std::make_unique<Catalog>(buffer_pool_);
+
+    // Create table with id (indexed), name, age
+    std::vector<Column> cols = {
+        Column("id", TypeId::INTEGER),
+        Column("name", TypeId::VARCHAR, 50),
+        Column("age", TypeId::INTEGER),
+    };
+    schema_ = Schema(cols);
+    ASSERT_TRUE(catalog_->create_table("indexed_users", schema_).ok());
+    table_info_ = catalog_->get_table("indexed_users");
+
+    // Create B+ tree index on id column
+    index_ = std::make_unique<BPlusTree>(buffer_pool_);
+
+    // Insert test data and build index
+    insert_test_data();
+  }
+
+  void insert_test_data() {
+    std::vector<std::tuple<int32_t, std::string, int32_t>> data = {
+        {10, "Alice", 25}, {20, "Bob", 30}, {30, "Charlie", 35},
+        {40, "Diana", 28}, {50, "Eve", 32},
+    };
+
+    for (const auto &[id, name, age] : data) {
+      Tuple tuple(std::vector<TupleValue>{TupleValue(id), TupleValue(name),
+                                          TupleValue(age)},
+                  schema_);
+
+      RID rid;
+      Status status = table_info_->table_heap->insert_tuple(tuple, &rid);
+      ASSERT_TRUE(status.ok());
+
+      // Insert into B+ tree index: key=id, value=RID
+      ASSERT_TRUE(index_->insert(static_cast<int64_t>(id), rid).ok());
+    }
+  }
+
+  std::unique_ptr<test::TempFile> temp_file_;
+  std::shared_ptr<DiskManager> disk_manager_;
+  std::shared_ptr<BufferPoolManager> buffer_pool_;
+  std::unique_ptr<Catalog> catalog_;
+  TableInfo *table_info_ = nullptr;
+  Schema schema_;
+  std::unique_ptr<BPlusTree> index_;
+};
+
+TEST_F(IndexScanTest, PointLookup) {
+  // O(log n) point lookup for id=30
+  IndexScanExecutor scan(nullptr, index_.get(), table_info_->table_heap.get(),
+                         &schema_, 30);
+  scan.init();
+
+  auto tuple = scan.next();
+  ASSERT_TRUE(tuple.has_value());
+  EXPECT_EQ(tuple->get_value(schema_, 0).as_integer(), 30);       // id
+  EXPECT_EQ(tuple->get_value(schema_, 1).as_string(), "Charlie"); // name
+  EXPECT_EQ(tuple->get_value(schema_, 2).as_integer(), 35);       // age
+
+  // Should only return one tuple
+  EXPECT_FALSE(scan.next().has_value());
+}
+
+TEST_F(IndexScanTest, RangeScan) {
+  // O(log n + k) range scan for 20 <= id <= 40
+  IndexScanExecutor scan(nullptr, index_.get(), table_info_->table_heap.get(),
+                         &schema_, 20, 40);
+  scan.init();
+
+  std::vector<int32_t> ids;
+  while (auto tuple = scan.next()) {
+    ids.push_back(tuple->get_value(schema_, 0).as_integer());
+  }
+
+  ASSERT_EQ(ids.size(), 3); // Bob(20), Charlie(30), Diana(40)
+  EXPECT_EQ(ids[0], 20);
+  EXPECT_EQ(ids[1], 30);
+  EXPECT_EQ(ids[2], 40);
+}
+
+TEST_F(IndexScanTest, FullScan) {
+  // O(n) full index scan
+  IndexScanExecutor scan(nullptr, index_.get(), table_info_->table_heap.get(),
+                         &schema_);
+  scan.init();
+
+  int count = 0;
+  while (scan.next().has_value()) {
+    count++;
+  }
+
+  EXPECT_EQ(count, 5); // All 5 rows
+}
+
+TEST_F(IndexScanTest, NotFound) {
+  // Point lookup for non-existent key
+  IndexScanExecutor scan(nullptr, index_.get(), table_info_->table_heap.get(),
+                         &schema_, 999);
+  scan.init();
+
+  EXPECT_FALSE(scan.next().has_value());
 }
 
 } // namespace
