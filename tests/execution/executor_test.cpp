@@ -11,6 +11,7 @@
 #include "execution/insert_executor.hpp"
 #include "execution/projection.hpp"
 #include "execution/seq_scan_executor.hpp"
+#include "execution/update_executor.hpp"
 #include "parser/expression.hpp"
 #include "storage/buffer_pool.hpp"
 #include "test_utils.hpp"
@@ -271,6 +272,50 @@ TEST_F(ExecutorTest, ProjectColumns) {
   // Verify projected tuple has only 2 columns
   EXPECT_EQ(tuple->get_value(proj.output_schema(), 0).as_string(), "Alice");
   EXPECT_EQ(tuple->get_value(proj.output_schema(), 1).as_integer(), 25);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Update Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST_F(ExecutorTest, UpdateTuples) {
+  insert_test_data();
+
+  // Create child scan with predicate: id = 2 (Bob)
+  auto id_col = std::make_unique<ColumnRefExpression>("id");
+  id_col->set_column_index(0);
+  id_col->set_type(TypeId::INTEGER);
+  auto const_val = std::make_unique<ConstantExpression>(TupleValue(int32_t(2)));
+  auto predicate = std::make_unique<ComparisonExpression>(
+      ComparisonType::EQUAL, std::move(id_col), std::move(const_val));
+
+  auto child = std::make_unique<SeqScanExecutor>(
+      nullptr, table_info_->table_heap, &schema_, std::move(predicate));
+
+  // SET age = 99
+  std::vector<size_t> col_indices = {2}; // age column
+  std::vector<std::unique_ptr<Expression>> values;
+  values.push_back(
+      std::make_unique<ConstantExpression>(TupleValue(int32_t(99))));
+
+  UpdateExecutor update(nullptr, std::move(child), table_info_->table_heap,
+                        &schema_, std::move(col_indices), std::move(values));
+  update.init();
+  (void)update.next();
+
+  EXPECT_EQ(update.rows_updated(), 1);
+
+  // Verify update: find Bob and check age is 99
+  SeqScanExecutor scan(nullptr, table_info_->table_heap, &schema_);
+  scan.init();
+  bool found_bob = false;
+  while (auto tuple = scan.next()) {
+    if (tuple->get_value(schema_, 0).as_integer() == 2) {
+      EXPECT_EQ(tuple->get_value(schema_, 2).as_integer(), 99);
+      found_bob = true;
+    }
+  }
+  EXPECT_TRUE(found_bob);
 }
 
 } // namespace
