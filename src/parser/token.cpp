@@ -42,6 +42,15 @@ const std::unordered_map<std::string, TokenType> Lexer::keywords_ = {
     {"TRUE", TokenType::TRUE_KEYWORD},
     {"FALSE", TokenType::FALSE_KEYWORD},
 
+    // JOIN
+    {"JOIN", TokenType::JOIN},
+    {"INNER", TokenType::INNER},
+    {"LEFT", TokenType::LEFT},
+    {"RIGHT", TokenType::RIGHT},
+    {"OUTER", TokenType::OUTER},
+    {"CROSS", TokenType::CROSS},
+    {"ON", TokenType::ON},
+
     // Other
     {"AS", TokenType::AS},
     {"ORDER", TokenType::ORDER},
@@ -109,6 +118,20 @@ const char *token_type_to_string(TokenType type) {
     return "TRUE";
   case TokenType::FALSE_KEYWORD:
     return "FALSE";
+  case TokenType::JOIN:
+    return "JOIN";
+  case TokenType::INNER:
+    return "INNER";
+  case TokenType::LEFT:
+    return "LEFT";
+  case TokenType::RIGHT:
+    return "RIGHT";
+  case TokenType::OUTER:
+    return "OUTER";
+  case TokenType::CROSS:
+    return "CROSS";
+  case TokenType::ON:
+    return "ON";
   case TokenType::AS:
     return "AS";
   case TokenType::ORDER:

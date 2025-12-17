@@ -125,9 +125,77 @@ std::unique_ptr<SelectStatement> Parser::parse_select() {
   if (check(TokenType::IDENTIFIER)) {
     stmt->table.table_name = current_.value;
     advance();
+    // Optional alias: FROM users u
+    if (check(TokenType::IDENTIFIER) && !check(TokenType::WHERE) &&
+        !check(TokenType::JOIN) && !check(TokenType::INNER) &&
+        !check(TokenType::LEFT) && !check(TokenType::RIGHT) &&
+        !check(TokenType::CROSS) && !check(TokenType::ORDER) &&
+        !check(TokenType::LIMIT)) {
+      stmt->table.alias = current_.value;
+      advance();
+    }
   } else {
     set_error("Expected table name after FROM");
     return nullptr;
+  }
+
+  // Parse optional JOIN clauses
+  while (true) {
+    JoinType join_type = JoinType::INNER;
+    bool has_join = false;
+
+    if (match(TokenType::INNER)) {
+      join_type = JoinType::INNER;
+      expect(TokenType::JOIN, "Expected JOIN after INNER");
+      has_join = true;
+    } else if (match(TokenType::LEFT)) {
+      join_type = JoinType::LEFT;
+      match(TokenType::OUTER); // Optional OUTER
+      expect(TokenType::JOIN, "Expected JOIN after LEFT [OUTER]");
+      has_join = true;
+    } else if (match(TokenType::RIGHT)) {
+      join_type = JoinType::RIGHT;
+      match(TokenType::OUTER); // Optional OUTER
+      expect(TokenType::JOIN, "Expected JOIN after RIGHT [OUTER]");
+      has_join = true;
+    } else if (match(TokenType::CROSS)) {
+      join_type = JoinType::CROSS;
+      expect(TokenType::JOIN, "Expected JOIN after CROSS");
+      has_join = true;
+    } else if (match(TokenType::JOIN)) {
+      // Plain JOIN = INNER JOIN
+      join_type = JoinType::INNER;
+      has_join = true;
+    }
+
+    if (!has_join)
+      break;
+
+    JoinClause join;
+    join.type = join_type;
+
+    // Parse joined table
+    if (check(TokenType::IDENTIFIER)) {
+      join.table.table_name = current_.value;
+      advance();
+      // Optional alias
+      if (check(TokenType::IDENTIFIER) && !check(TokenType::ON) &&
+          !check(TokenType::WHERE)) {
+        join.table.alias = current_.value;
+        advance();
+      }
+    } else {
+      set_error("Expected table name after JOIN");
+      return nullptr;
+    }
+
+    // Parse ON condition (not required for CROSS JOIN)
+    if (join_type != JoinType::CROSS) {
+      expect(TokenType::ON, "Expected ON after JOIN table");
+      join.condition = parse_expression();
+    }
+
+    stmt->joins.push_back(std::move(join));
   }
 
   // Parse optional WHERE clause

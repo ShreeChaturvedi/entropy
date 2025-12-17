@@ -178,6 +178,7 @@ target_link_libraries(entropy_execution
         entropy_catalog
         entropy_transaction
         entropy_optimizer
+        entropy_parser
 )
 
 # ─────────────────────────────────────────────────────────────────────────────

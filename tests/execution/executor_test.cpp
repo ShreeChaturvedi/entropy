@@ -9,6 +9,7 @@
 #include "execution/delete_executor.hpp"
 #include "execution/filter.hpp"
 #include "execution/insert_executor.hpp"
+#include "execution/nested_loop_join.hpp"
 #include "execution/projection.hpp"
 #include "execution/seq_scan_executor.hpp"
 #include "execution/update_executor.hpp"
@@ -316,6 +317,205 @@ TEST_F(ExecutorTest, UpdateTuples) {
     }
   }
   EXPECT_TRUE(found_bob);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Nested Loop Join Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+class JoinTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    temp_file_ = std::make_unique<test::TempFile>("join_test_");
+    disk_manager_ = std::make_shared<DiskManager>(temp_file_->string());
+    buffer_pool_ = std::make_shared<BufferPoolManager>(20, disk_manager_);
+    catalog_ = std::make_unique<Catalog>(buffer_pool_);
+
+    // Create users table (id, name)
+    users_schema_ = Schema({
+        Column("user_id", TypeId::INTEGER),
+        Column("name", TypeId::VARCHAR, 100),
+    });
+    ASSERT_TRUE(catalog_->create_table("users", users_schema_).ok());
+    users_info_ = catalog_->get_table("users");
+
+    // Create orders table (order_id, user_id, amount)
+    orders_schema_ = Schema({
+        Column("order_id", TypeId::INTEGER),
+        Column("user_id", TypeId::INTEGER),
+        Column("amount", TypeId::INTEGER),
+    });
+    ASSERT_TRUE(catalog_->create_table("orders", orders_schema_).ok());
+    orders_info_ = catalog_->get_table("orders");
+
+    // Create joined output schema
+    output_schema_ = Schema({
+        Column("user_id", TypeId::INTEGER),
+        Column("name", TypeId::VARCHAR, 100),
+        Column("order_id", TypeId::INTEGER),
+        Column("order_user_id", TypeId::INTEGER),
+        Column("amount", TypeId::INTEGER),
+    });
+
+    // Insert test data
+    insert_users();
+    insert_orders();
+  }
+
+  void insert_users() {
+    std::vector<Tuple> tuples;
+    tuples.emplace_back(
+        std::vector<TupleValue>{TupleValue(int32_t(1)),
+                                TupleValue(std::string("Alice"))},
+        users_schema_);
+    tuples.emplace_back(std::vector<TupleValue>{TupleValue(int32_t(2)),
+                                                TupleValue(std::string("Bob"))},
+                        users_schema_);
+    tuples.emplace_back(
+        std::vector<TupleValue>{TupleValue(int32_t(3)),
+                                TupleValue(std::string("Charlie"))},
+        users_schema_);
+
+    InsertExecutor insert(nullptr, users_info_->table_heap, &users_schema_,
+                          std::move(tuples));
+    insert.init();
+    (void)insert.next();
+  }
+
+  void insert_orders() {
+    std::vector<Tuple> tuples;
+    // Alice has 2 orders, Bob has 1, Charlie has none
+    tuples.emplace_back(std::vector<TupleValue>{TupleValue(int32_t(101)),
+                                                TupleValue(int32_t(1)),
+                                                TupleValue(int32_t(100))},
+                        orders_schema_);
+    tuples.emplace_back(std::vector<TupleValue>{TupleValue(int32_t(102)),
+                                                TupleValue(int32_t(1)),
+                                                TupleValue(int32_t(200))},
+                        orders_schema_);
+    tuples.emplace_back(std::vector<TupleValue>{TupleValue(int32_t(103)),
+                                                TupleValue(int32_t(2)),
+                                                TupleValue(int32_t(150))},
+                        orders_schema_);
+    // Order 104 for user_id 99 (no matching user)
+    tuples.emplace_back(std::vector<TupleValue>{TupleValue(int32_t(104)),
+                                                TupleValue(int32_t(99)),
+                                                TupleValue(int32_t(50))},
+                        orders_schema_);
+
+    InsertExecutor insert(nullptr, orders_info_->table_heap, &orders_schema_,
+                          std::move(tuples));
+    insert.init();
+    (void)insert.next();
+  }
+
+  std::unique_ptr<test::TempFile> temp_file_;
+  std::shared_ptr<DiskManager> disk_manager_;
+  std::shared_ptr<BufferPoolManager> buffer_pool_;
+  std::unique_ptr<Catalog> catalog_;
+  TableInfo *users_info_ = nullptr;
+  TableInfo *orders_info_ = nullptr;
+  Schema users_schema_;
+  Schema orders_schema_;
+  Schema output_schema_;
+};
+
+TEST_F(JoinTest, InnerJoin) {
+  auto left = std::make_unique<SeqScanExecutor>(
+      nullptr, users_info_->table_heap, &users_schema_);
+  auto right = std::make_unique<SeqScanExecutor>(
+      nullptr, orders_info_->table_heap, &orders_schema_);
+
+  // Join condition: users.user_id = orders.user_id
+  auto left_col = std::make_unique<ColumnRefExpression>("user_id");
+  left_col->set_column_index(0);
+  left_col->set_type(TypeId::INTEGER);
+
+  auto right_col = std::make_unique<ColumnRefExpression>("order_user_id");
+  right_col->set_column_index(3); // Index in combined schema
+  right_col->set_type(TypeId::INTEGER);
+
+  auto condition = std::make_unique<ComparisonExpression>(
+      ComparisonType::EQUAL, std::move(left_col), std::move(right_col));
+
+  NestedLoopJoinExecutor join(nullptr, std::move(left), std::move(right),
+                              &users_schema_, &orders_schema_, &output_schema_,
+                              JoinType::INNER, std::move(condition));
+  join.init();
+
+  int count = 0;
+  while (auto tuple = join.next()) {
+    // Verify join condition: left user_id == right user_id
+    int32_t left_id = tuple->get_value(output_schema_, 0).as_integer();
+    int32_t right_id = tuple->get_value(output_schema_, 3).as_integer();
+    EXPECT_EQ(left_id, right_id);
+    count++;
+  }
+
+  // Alice has 2 orders, Bob has 1 = 3 matching rows
+  EXPECT_EQ(count, 3);
+}
+
+TEST_F(JoinTest, LeftJoin) {
+  auto left = std::make_unique<SeqScanExecutor>(
+      nullptr, users_info_->table_heap, &users_schema_);
+  auto right = std::make_unique<SeqScanExecutor>(
+      nullptr, orders_info_->table_heap, &orders_schema_);
+
+  // Join condition: users.user_id = orders.user_id
+  auto left_col = std::make_unique<ColumnRefExpression>("user_id");
+  left_col->set_column_index(0);
+  left_col->set_type(TypeId::INTEGER);
+
+  auto right_col = std::make_unique<ColumnRefExpression>("order_user_id");
+  right_col->set_column_index(3);
+  right_col->set_type(TypeId::INTEGER);
+
+  auto condition = std::make_unique<ComparisonExpression>(
+      ComparisonType::EQUAL, std::move(left_col), std::move(right_col));
+
+  NestedLoopJoinExecutor join(nullptr, std::move(left), std::move(right),
+                              &users_schema_, &orders_schema_, &output_schema_,
+                              JoinType::LEFT, std::move(condition));
+  join.init();
+
+  int count = 0;
+  bool found_charlie = false;
+  while (auto tuple = join.next()) {
+    std::string name = tuple->get_value(output_schema_, 1).as_string();
+    if (name == "Charlie") {
+      // Charlie has no orders, right side should be NULL
+      TupleValue order_id = tuple->get_value(output_schema_, 2);
+      EXPECT_TRUE(order_id.is_null());
+      found_charlie = true;
+    }
+    count++;
+  }
+
+  // Alice:2 + Bob:1 + Charlie:1(null) = 4 rows
+  EXPECT_EQ(count, 4);
+  EXPECT_TRUE(found_charlie);
+}
+
+TEST_F(JoinTest, CrossJoin) {
+  auto left = std::make_unique<SeqScanExecutor>(
+      nullptr, users_info_->table_heap, &users_schema_);
+  auto right = std::make_unique<SeqScanExecutor>(
+      nullptr, orders_info_->table_heap, &orders_schema_);
+
+  // No condition for CROSS JOIN
+  NestedLoopJoinExecutor join(nullptr, std::move(left), std::move(right),
+                              &users_schema_, &orders_schema_, &output_schema_,
+                              JoinType::CROSS, nullptr);
+  join.init();
+
+  int count = 0;
+  while (join.next().has_value()) {
+    count++;
+  }
+
+  // 3 users × 4 orders = 12 rows
+  EXPECT_EQ(count, 12);
 }
 
 } // namespace

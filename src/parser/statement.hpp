@@ -112,7 +112,27 @@ struct OrderByItem {
 };
 
 /**
- * @brief SELECT statement: SELECT columns FROM table [WHERE expr] [ORDER BY]
+ * @brief Type of JOIN operation
+ */
+enum class JoinType {
+  INNER, // INNER JOIN (default)
+  LEFT,  // LEFT [OUTER] JOIN
+  RIGHT, // RIGHT [OUTER] JOIN
+  CROSS, // CROSS JOIN (no condition)
+};
+
+/**
+ * @brief JOIN clause: table JOIN other_table ON condition
+ */
+struct JoinClause {
+  TableRef table;                        // The table being joined
+  JoinType type = JoinType::INNER;       // JOIN type
+  std::unique_ptr<Expression> condition; // ON condition (null for CROSS JOIN)
+};
+
+/**
+ * @brief SELECT statement with optional JOIN support
+ * SELECT columns FROM table [JOIN table ON cond]* [WHERE expr] [ORDER BY]
  * [LIMIT n]
  */
 class SelectStatement : public Statement {
@@ -120,7 +140,8 @@ public:
   SelectStatement() : Statement(StatementType::SELECT) {}
 
   std::vector<SelectColumn> columns;
-  TableRef table;
+  TableRef table;                // Primary table in FROM
+  std::vector<JoinClause> joins; // Optional JOINs
   std::unique_ptr<Expression> where_clause;
   std::vector<OrderByItem> order_by;
   std::optional<size_t> limit;
