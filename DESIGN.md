@@ -337,7 +337,7 @@ entropy/
 | ProjectionExecutor | ✅ Complete | `projection.hpp` | `projection.cpp` | 1 passing |
 | NestedLoopJoin | ✅ Complete | `nested_loop_join.hpp` | `nested_loop_join.cpp` | 3 passing |
 | HashJoin | ⭕ Not Started | stub | stub | - |
-| Aggregation | ⭕ Not Started | stub | stub | - |
+| Aggregation | ✅ Complete | `aggregation.hpp` | `aggregation.cpp` | 5 passing |
 | IndexScanExecutor | ⭕ Not Started | stub | stub | - |
 
 ### Optimizer Layer
@@ -546,6 +546,20 @@ Leaf Node:
   - For RIGHT JOIN: materializes right side to track matched tuples
   - Combined output schema created at execution time
 - **Trade-offs**: O(n×m) complexity; Hash Join needed for large tables
+
+#### ADR-008: Hash-Based Aggregation
+- **Context**: Implementing GROUP BY and aggregate functions efficiently
+- **Decision**: Hash-based single-pass aggregation with FNV-1a key hashing
+- **Rationale**:
+  - O(n) scan with O(g) memory (g = groups) - optimal for large datasets
+  - FNV-1a hash provides good distribution for composite keys
+  - Incremental accumulators minimize memory per group
+  - Single pass eliminates sort overhead for GROUP BY
+- **Implementation Notes**:
+  - Type promotion: SUM(INTEGER) → BIGINT to prevent overflow
+  - AVG computed as sum/count at output time (not during accumulation)
+  - Empty table edge case: COUNT(*)=0, SUM=NULL
+- **Trade-offs**: Unordered output (ORDER BY would require separate sort)
 
 ---
 
