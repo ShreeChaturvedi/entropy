@@ -15,7 +15,7 @@
 
 **Overall Progress**: ~46%
 
-**Last Updated**: 2024-12 - Recovery Manager & MVCC Complete (256 tests passing)
+**Last Updated**: 2024-12 - Custom SQL Parser Complete (283 tests passing)
 
 ---
 
@@ -189,10 +189,11 @@
   - [ ] Unit tests passing
 
 ### 3.2 SQL Parser
-- [ ] Parser integration
-  - [ ] hsql library integration
-  - [ ] AST wrapper classes
-  - [ ] Unit tests passing
+- [x] Custom recursive descent parser (no external deps)
+  - [x] Tokenizer/Lexer with 45+ token types
+  - [x] Statement AST (SELECT, INSERT, UPDATE, DELETE, CREATE/DROP TABLE)
+  - [x] Expression system (constants, columns, operators)
+  - [x] 27 parser tests passing
 
 - [ ] `Binder` class
   - [ ] Name resolution
@@ -288,6 +289,7 @@
 | Storage | 9 files | 161 passing | ~80% |
 | Catalog | 1 file | 5 passing | ~10% |
 | Transaction | 1 file | 84 passing | ~90% |
+| Parser | 1 file | 27 passing | ~70% |
 | Execution | 0 | 0 | 0% |
 | Optimizer | 0 | 0 | 0% |
 | Integration | 1 file | Passing | ~5% |
