@@ -9,13 +9,13 @@
 | Phase | Status | Progress |
 |-------|--------|----------|
 | Phase 1: Storage Engine | 🟢 Complete | ~90% |
-| Phase 2: Transactions | 🟡 In Progress | ~60% |
+| Phase 2: Transactions | � Complete | ~95% |
 | Phase 3: Query Processing | 🔴 Not Started | 0% |
 | Phase 4: Optimization | 🔴 Not Started | 0% |
 
-**Overall Progress**: ~38%
+**Overall Progress**: ~46%
 
-**Last Updated**: 2024-12 - Lock Manager Complete (231 tests passing)
+**Last Updated**: 2024-12 - Recovery Manager & MVCC Complete (256 tests passing)
 
 ---
 
@@ -151,22 +151,21 @@
   - [x] Unit tests passing (26 tests)
 
 ### 2.4 MVCC
-- [ ] `VersionChain` structure
-  - [ ] Version storage
-  - [ ] Visibility checking
-  - [ ] Unit tests passing
-
-- [ ] MVCC integration
-  - [ ] Snapshot isolation
-  - [ ] Read uncommitted/committed modes
-  - [ ] Unit tests passing
+- [x] `MVCCManager` class
+  - [x] VersionInfo structure (32 bytes: created_by, deleted_by, begin_ts, end_ts)
+  - [x] Snapshot isolation visibility checking
+  - [x] Read-committed isolation support
+  - [x] Version lifecycle (init, delete, commit, rollback)
+  - [x] Monotonic timestamp generation
+  - [x] Unit tests passing (11 tests)
 
 ### 2.5 Recovery
-- [ ] `RecoveryManager` class
-  - [ ] WAL replay (REDO)
-  - [ ] Transaction rollback (UNDO)
-  - [ ] Checkpoint creation
-  - [ ] Crash recovery test
+- [x] `RecoveryManager` class (ARIES-style)
+  - [x] Analysis phase (build ATT from checkpoint)
+  - [x] REDO phase (replay logged operations)
+  - [x] UNDO phase (rollback via prevLSN chains)
+  - [x] Checkpoint creation
+  - [x] Crash recovery tests (8 tests)
 
 ---
 
@@ -288,7 +287,7 @@
 |-----------|---------------|---------------|----------|
 | Storage | 9 files | 161 passing | ~80% |
 | Catalog | 1 file | 5 passing | ~10% |
-| Transaction | 1 file | 65 passing | ~60% |
+| Transaction | 1 file | 84 passing | ~90% |
 | Execution | 0 | 0 | 0% |
 | Optimizer | 0 | 0 | 0% |
 | Integration | 1 file | Passing | ~5% |
@@ -311,6 +310,21 @@
 
 ## Development Log
 
+### Session: 2024-12 - Recovery Manager & MVCC Implementation
+- Implemented ARIES-style Recovery Manager (`recovery.hpp`, `recovery.cpp`):
+  - Analysis phase: scans log from checkpoint, builds Active Transaction Table (ATT)
+  - REDO phase: replays all logged data modification operations
+  - UNDO phase: rolls back uncommitted transactions via prevLSN chains
+  - Checkpoint creation support for faster recovery
+- Implemented MVCC (`mvcc.hpp`, `mvcc.cpp`):
+  - VersionInfo: 32-byte structure with created_by, deleted_by, begin_ts, end_ts
+  - Snapshot isolation visibility: transaction sees committed versions from before its start
+  - Read-committed isolation support
+  - Version lifecycle management (init, mark_deleted, finalize_commit, rollback)
+  - Monotonic timestamp generation for transaction ordering
+- Added 19 new tests (8 Recovery + 11 MVCC)
+- All 256 tests passing (161 storage + 84 transaction + 5 catalog + 6 integration)
+
 ### Session: 2024-12 - Lock Manager Implementation
 - Implemented complete Lock Manager for 2PL concurrency control:
   - Shared (S) and Exclusive (X) lock modes with compatibility matrix
@@ -321,16 +335,8 @@
   - 2PL protocol enforcement (GROWING → SHRINKING phase transition)
   - Thread-safe implementation with condition variables
   - Release all locks helper for transaction cleanup
-- Added 26 comprehensive Lock Manager tests covering:
-  - Basic table and row lock acquisition
-  - Lock compatibility (S-S, S-X, X-X blocking)
-  - Lock upgrade scenarios
-  - 2PL violation detection
-  - Concurrent shared locks
-  - Lock wait and release
-  - Basic deadlock detection
-  - Multiple waiters granted on release
-- All 231 tests passing (161 storage + 65 transaction + 5 catalog)
+- Added 26 comprehensive Lock Manager tests
+- All 231 tests passing
 
 ### Session: 2024-12 - B+ Tree Core Operations
 - Implemented complete B+ Tree index with all core operations
@@ -395,10 +401,10 @@
 
 ## Next Steps
 
-1. **Immediate**: Add MVCC for snapshot isolation
-2. **Next**: Build recovery manager (REDO/UNDO)
-3. **Then**: Begin catalog system for table metadata
-4. **Following**: Start query processing (parser, binder)
+1. **Immediate**: Begin catalog system for table metadata
+2. **Next**: Start query processing (parser, binder)
+3. **Then**: Implement execution engine
+4. **Following**: Query optimization
 
 ---
 
