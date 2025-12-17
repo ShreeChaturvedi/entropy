@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include "catalog/catalog.hpp"
+#include "execution/aggregation.hpp"
 #include "execution/delete_executor.hpp"
 #include "execution/filter.hpp"
 #include "execution/insert_executor.hpp"
@@ -518,5 +519,198 @@ TEST_F(JoinTest, CrossJoin) {
   EXPECT_EQ(count, 12);
 }
 
-} // namespace
-} // namespace entropy
+// ─────────────────────────────────────────────────────────────────────────────
+// Aggregation Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+class AggregationTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    temp_file_ = std::make_unique<test::TempFile>("agg_test_");
+    disk_manager_ = std::make_shared<DiskManager>(temp_file_->string());
+    buffer_pool_ = std::make_shared<BufferPoolManager>(20, disk_manager_);
+    catalog_ = std::make_unique<Catalog>(buffer_pool_);
+
+    // Create sales table: product, category, price, quantity
+    schema_ = Schema({
+        Column("product", TypeId::VARCHAR, 50),
+        Column("category", TypeId::VARCHAR, 20),
+        Column("price", TypeId::INTEGER),
+        Column("quantity", TypeId::INTEGER),
+    });
+    ASSERT_TRUE(catalog_->create_table("sales", schema_).ok());
+    table_info_ = catalog_->get_table("sales");
+
+    insert_test_data();
+  }
+
+  void insert_test_data() {
+    std::vector<Tuple> tuples;
+    // Electronics: Laptop $1000 x 2, Phone $500 x 5
+    tuples.emplace_back(std::vector<TupleValue>{
+        TupleValue(std::string("Laptop")), TupleValue(std::string("Electronics")),
+        TupleValue(int32_t(1000)), TupleValue(int32_t(2))}, schema_);
+    tuples.emplace_back(std::vector<TupleValue>{
+        TupleValue(std::string("Phone")), TupleValue(std::string("Electronics")),
+        TupleValue(int32_t(500)), TupleValue(int32_t(5))}, schema_);
+    // Books: Novel $20 x 10, Textbook $80 x 3
+    tuples.emplace_back(std::vector<TupleValue>{
+        TupleValue(std::string("Novel")), TupleValue(std::string("Books")),
+        TupleValue(int32_t(20)), TupleValue(int32_t(10))}, schema_);
+    tuples.emplace_back(std::vector<TupleValue>{
+        TupleValue(std::string("Textbook")), TupleValue(std::string("Books")),
+        TupleValue(int32_t(80)), TupleValue(int32_t(3))}, schema_);
+    // Clothing: Shirt $30 x 7
+    tuples.emplace_back(std::vector<TupleValue>{
+        TupleValue(std::string("Shirt")), TupleValue(std::string("Clothing")),
+        TupleValue(int32_t(30)), TupleValue(int32_t(7))}, schema_);
+
+    InsertExecutor insert(nullptr, table_info_->table_heap, &schema_,
+                          std::move(tuples));
+    insert.init();
+    (void)insert.next();
+  }
+
+  std::unique_ptr<test::TempFile> temp_file_;
+  std::shared_ptr<DiskManager> disk_manager_;
+  std::shared_ptr<BufferPoolManager> buffer_pool_;
+  std::unique_ptr<Catalog> catalog_;
+  TableInfo* table_info_ = nullptr;
+  Schema schema_;
+};
+
+TEST_F(AggregationTest, CountStar) {
+  auto child = std::make_unique<SeqScanExecutor>(
+      nullptr, table_info_->table_heap, &schema_);
+
+  std::vector<AggregateExpression> aggs = {
+      AggregateExpression::count_star("total")
+  };
+
+  AggregationExecutor agg(nullptr, std::move(child), &schema_, {}, std::move(aggs));
+  agg.init();
+
+  auto result = agg.next();
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->get_value(agg.output_schema(), 0).as_bigint(), 5);
+
+  // Only one row for scalar aggregation
+  EXPECT_FALSE(agg.next().has_value());
+}
+
+TEST_F(AggregationTest, SumAvgMinMax) {
+  auto child = std::make_unique<SeqScanExecutor>(
+      nullptr, table_info_->table_heap, &schema_);
+
+  std::vector<AggregateExpression> aggs = {
+      AggregateExpression::sum(2, "sum_price"),   // price column
+      AggregateExpression::avg(2, "avg_price"),
+      AggregateExpression::min(2, "min_price"),
+      AggregateExpression::max(2, "max_price"),
+  };
+
+  AggregationExecutor agg(nullptr, std::move(child), &schema_, {}, std::move(aggs));
+  agg.init();
+
+  auto result = agg.next();
+  ASSERT_TRUE(result.has_value());
+
+  // Sum: 1000 + 500 + 20 + 80 + 30 = 1630
+  EXPECT_EQ(result->get_value(agg.output_schema(), 0).as_bigint(), 1630);
+  // Avg: 1630 / 5 = 326
+  EXPECT_DOUBLE_EQ(result->get_value(agg.output_schema(), 1).as_double(), 326.0);
+  // Min: 20
+  EXPECT_EQ(result->get_value(agg.output_schema(), 2).as_integer(), 20);
+  // Max: 1000
+  EXPECT_EQ(result->get_value(agg.output_schema(), 3).as_integer(), 1000);
+}
+
+TEST_F(AggregationTest, GroupByCategory) {
+  auto child = std::make_unique<SeqScanExecutor>(
+      nullptr, table_info_->table_heap, &schema_);
+
+  // GROUP BY category, COUNT(*), SUM(price)
+  std::vector<size_t> group_by = {1};  // category column
+  std::vector<AggregateExpression> aggs = {
+      AggregateExpression::count_star("cnt"),
+      AggregateExpression::sum(2, "sum_price"),
+  };
+
+  AggregationExecutor agg(nullptr, std::move(child), &schema_,
+                           std::move(group_by), std::move(aggs));
+  agg.init();
+
+  std::map<std::string, std::pair<int64_t, int64_t>> results;
+  while (auto result = agg.next()) {
+    std::string cat = result->get_value(agg.output_schema(), 0).as_string();
+    int64_t cnt = result->get_value(agg.output_schema(), 1).as_bigint();
+    int64_t sum = result->get_value(agg.output_schema(), 2).as_bigint();
+    results[cat] = {cnt, sum};
+  }
+
+  EXPECT_EQ(results.size(), 3);  // 3 categories
+
+  // Electronics: 2 items, 1000 + 500 = 1500
+  EXPECT_EQ(results["Electronics"].first, 2);
+  EXPECT_EQ(results["Electronics"].second, 1500);
+
+  // Books: 2 items, 20 + 80 = 100
+  EXPECT_EQ(results["Books"].first, 2);
+  EXPECT_EQ(results["Books"].second, 100);
+
+  // Clothing: 1 item, 30
+  EXPECT_EQ(results["Clothing"].first, 1);
+  EXPECT_EQ(results["Clothing"].second, 30);
+}
+
+TEST_F(AggregationTest, EmptyTable) {
+  // Create empty table
+  Schema empty_schema({Column("x", TypeId::INTEGER)});
+  ASSERT_TRUE(catalog_->create_table("empty", empty_schema).ok());
+  auto empty_info = catalog_->get_table("empty");
+
+  auto child = std::make_unique<SeqScanExecutor>(
+      nullptr, empty_info->table_heap, &empty_schema);
+
+  std::vector<AggregateExpression> aggs = {
+      AggregateExpression::count_star("cnt"),
+      AggregateExpression::sum(0, "sum"),
+  };
+
+  AggregationExecutor agg(nullptr, std::move(child), &empty_schema, {}, std::move(aggs));
+  agg.init();
+
+  auto result = agg.next();
+  ASSERT_TRUE(result.has_value());
+
+  // COUNT(*) on empty table = 0
+  EXPECT_EQ(result->get_value(agg.output_schema(), 0).as_bigint(), 0);
+  // SUM on empty table = NULL
+  EXPECT_TRUE(result->get_value(agg.output_schema(), 1).is_null());
+}
+
+TEST_F(AggregationTest, MultipleGroupByColumns) {
+  auto child = std::make_unique<SeqScanExecutor>(
+      nullptr, table_info_->table_heap, &schema_);
+
+  // GROUP BY category, price (each product is unique by this combo)
+  std::vector<size_t> group_by = {1, 2};  // category, price
+  std::vector<AggregateExpression> aggs = {
+      AggregateExpression::count_star("cnt"),
+  };
+
+  AggregationExecutor agg(nullptr, std::move(child), &schema_,
+                           std::move(group_by), std::move(aggs));
+  agg.init();
+
+  int count = 0;
+  while (agg.next().has_value()) {
+    count++;
+  }
+
+  // Each row has unique (category, price), so 5 groups
+  EXPECT_EQ(count, 5);
+}
+
+}  // namespace
+}  // namespace entropy
