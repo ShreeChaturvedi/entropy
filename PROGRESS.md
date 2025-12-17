@@ -15,7 +15,7 @@
 
 **Overall Progress**: ~65%
 
-**Last Updated**: 2024-12-17 - JOIN Support Complete (316 tests passing)
+**Last Updated**: 2024-12-17 - Aggregation Support Complete (321 tests passing)
 
 ---
 
@@ -177,8 +177,8 @@
 
 ### 3.6 Remaining (Query Processing)
 - [x] JOINs (Nested Loop Join - INNER/LEFT/RIGHT/CROSS)
+- [x] Aggregations (COUNT, SUM, AVG, MIN, MAX with GROUP BY)
 - [ ] Hash Join (optimization)
-- [ ] Aggregations (COUNT, SUM, AVG, MIN, MAX, GROUP BY)
 - [ ] ORDER BY / LIMIT
 - [ ] IndexScan executor
 
@@ -213,9 +213,9 @@
 | Transaction | 1 file | 84 |
 | Catalog | 1 file | 8 |
 | Parser/Binder | 1 file | 35 |
-| Execution | 1 file | 12 |
+| Execution | 1 file | 17 |
 | Integration | 1 file | 16 |
-| **Total** | | **316** |
+| **Total** | | **321** |
 
 ---
 
