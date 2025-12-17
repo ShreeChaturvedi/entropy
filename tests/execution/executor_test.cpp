@@ -9,6 +9,7 @@
 #include "execution/aggregation.hpp"
 #include "execution/delete_executor.hpp"
 #include "execution/filter.hpp"
+#include "execution/hash_join.hpp"
 #include "execution/insert_executor.hpp"
 #include "execution/limit_executor.hpp"
 #include "execution/nested_loop_join.hpp"
@@ -833,6 +834,52 @@ TEST_F(ExecutorTest, OffsetBeyondRows) {
   limit.init();
 
   EXPECT_FALSE(limit.next().has_value());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Hash Join Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST_F(JoinTest, HashJoinInner) {
+  // Hash join on user_id
+  auto left = std::make_unique<SeqScanExecutor>(
+      nullptr, users_info_->table_heap, &users_schema_);
+  auto right = std::make_unique<SeqScanExecutor>(
+      nullptr, orders_info_->table_heap, &orders_schema_);
+
+  HashJoinExecutor hash_join(nullptr, std::move(left), std::move(right),
+                             &users_schema_, &orders_schema_, &output_schema_,
+                             0, 1,
+                             JoinType::INNER); // users.id = orders.user_id
+  hash_join.init();
+
+  int count = 0;
+  while (hash_join.next().has_value()) {
+    count++;
+  }
+
+  // Alice has 2 orders, Bob has 1 = 3 matching rows
+  EXPECT_EQ(count, 3);
+}
+
+TEST_F(JoinTest, HashJoinLeft) {
+  auto left = std::make_unique<SeqScanExecutor>(
+      nullptr, users_info_->table_heap, &users_schema_);
+  auto right = std::make_unique<SeqScanExecutor>(
+      nullptr, orders_info_->table_heap, &orders_schema_);
+
+  HashJoinExecutor hash_join(nullptr, std::move(left), std::move(right),
+                             &users_schema_, &orders_schema_, &output_schema_,
+                             0, 1, JoinType::LEFT);
+  hash_join.init();
+
+  int count = 0;
+  while (hash_join.next().has_value()) {
+    count++;
+  }
+
+  // Alice:2 + Bob:1 + Charlie:1(null) = 4 rows
+  EXPECT_EQ(count, 4);
 }
 
 } // namespace
