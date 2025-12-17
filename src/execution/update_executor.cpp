@@ -7,6 +7,36 @@
 
 namespace entropy {
 
+namespace {
+// Helper to convert a TupleValue to a specific type
+TupleValue convert_to_type(const TupleValue &val, TypeId target_type) {
+  if (val.is_null())
+    return val;
+
+  // Handle integer conversions
+  if (val.is_bigint()) {
+    int64_t v = val.as_bigint();
+    switch (target_type) {
+    case TypeId::TINYINT:
+      return TupleValue(static_cast<int8_t>(v));
+    case TypeId::SMALLINT:
+      return TupleValue(static_cast<int16_t>(v));
+    case TypeId::INTEGER:
+      return TupleValue(static_cast<int32_t>(v));
+    default:
+      return val;
+    }
+  }
+
+  // Handle double to float conversion
+  if (val.is_double() && target_type == TypeId::FLOAT) {
+    return TupleValue(static_cast<float>(val.as_double()));
+  }
+
+  return val;
+}
+} // namespace
+
 void UpdateExecutor::init() {
   rows_updated_ = 0;
   done_ = false;
@@ -34,11 +64,12 @@ std::optional<Tuple> UpdateExecutor::next() {
           tuple->get_value(*schema_, static_cast<uint32_t>(i)));
     }
 
-    // Apply updates from SET clause
+    // Apply updates from SET clause with type conversion
     for (size_t i = 0; i < column_indices_.size(); i++) {
       size_t col_idx = column_indices_[i];
       TupleValue new_val = values_[i]->evaluate(*tuple, *schema_);
-      new_values[col_idx] = new_val;
+      TypeId target_type = schema_->column(col_idx).type();
+      new_values[col_idx] = convert_to_type(new_val, target_type);
     }
 
     // Create new tuple and update
