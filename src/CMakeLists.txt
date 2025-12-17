@@ -103,6 +103,8 @@ target_link_libraries(entropy_transaction
 # ─────────────────────────────────────────────────────────────────────────────
 
 add_library(entropy_parser STATIC
+    parser/token.cpp
+    parser/expression.cpp
     parser/parser.cpp
     parser/ast.cpp
     parser/binder.cpp

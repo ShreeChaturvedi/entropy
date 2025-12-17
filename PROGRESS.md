@@ -9,7 +9,7 @@
 | Phase | Status | Progress |
 |-------|--------|----------|
 | Phase 1: Storage Engine | 🟢 Complete | ~90% |
-| Phase 2: Transactions | � Complete | ~95% |
+| Phase 2: Transactions | 🟢 Complete | ~95% |
 | Phase 3: Query Processing | 🔴 Not Started | 0% |
 | Phase 4: Optimization | 🔴 Not Started | 0% |
 

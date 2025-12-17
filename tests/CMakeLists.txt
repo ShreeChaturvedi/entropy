@@ -88,3 +88,22 @@ target_link_libraries(integration_tests
 )
 
 gtest_discover_tests(integration_tests)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parser Tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+add_executable(parser_tests
+    parser/parser_test.cpp
+)
+
+target_link_libraries(parser_tests
+    PRIVATE
+        entropy_parser
+        entropy_storage
+        test_utils
+        GTest::gtest
+        GTest::gtest_main
+)
+
+gtest_discover_tests(parser_tests)
