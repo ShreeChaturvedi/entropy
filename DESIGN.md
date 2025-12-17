@@ -335,7 +335,7 @@ entropy/
 | DeleteExecutor | ✅ Complete | `delete_executor.hpp` | `delete_executor.cpp` | 1 passing |
 | FilterExecutor | ✅ Complete | `filter.hpp` | `filter.cpp` | 1 passing |
 | ProjectionExecutor | ✅ Complete | `projection.hpp` | `projection.cpp` | 1 passing |
-| NestedLoopJoin | ⭕ Not Started | stub | stub | - |
+| NestedLoopJoin | ✅ Complete | `nested_loop_join.hpp` | `nested_loop_join.cpp` | 3 passing |
 | HashJoin | ⭕ Not Started | stub | stub | - |
 | Aggregation | ⭕ Not Started | stub | stub | - |
 | IndexScanExecutor | ⭕ Not Started | stub | stub | - |
@@ -532,6 +532,20 @@ Leaf Node:
   - Creating a table automatically creates its storage
   - Single lookup to get both schema and storage
 - **Trade-offs**: Catalog becomes larger; TableHeap lifetime tied to catalog entry
+
+#### ADR-007: Nested Loop Join Implementation
+- **Context**: Implementing JOIN operations for multi-table queries
+- **Decision**: Nested Loop Join as the initial join algorithm
+- **Rationale**:
+  - Simplest join algorithm to implement correctly
+  - Works with any join condition (not just equality)
+  - No additional data structure requirements
+  - Supports all join types (INNER, LEFT, RIGHT, CROSS)
+- **Implementation Notes**:
+  - For LEFT JOIN: tracks if left tuple found match, emits NULL-padded row if not
+  - For RIGHT JOIN: materializes right side to track matched tuples
+  - Combined output schema created at execution time
+- **Trade-offs**: O(n×m) complexity; Hash Join needed for large tables
 
 ---
 

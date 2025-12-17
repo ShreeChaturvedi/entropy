@@ -15,7 +15,7 @@
 
 **Overall Progress**: ~65%
 
-**Last Updated**: 2024-12-17 - SQL Execution Pipeline Complete (313 tests passing)
+**Last Updated**: 2024-12-17 - JOIN Support Complete (316 tests passing)
 
 ---
 
@@ -176,7 +176,8 @@
   - [x] 16 end-to-end integration tests passing
 
 ### 3.6 Remaining (Query Processing)
-- [ ] JOINs (Nested Loop Join, Hash Join)
+- [x] JOINs (Nested Loop Join - INNER/LEFT/RIGHT/CROSS)
+- [ ] Hash Join (optimization)
 - [ ] Aggregations (COUNT, SUM, AVG, MIN, MAX, GROUP BY)
 - [ ] ORDER BY / LIMIT
 - [ ] IndexScan executor
@@ -212,9 +213,9 @@
 | Transaction | 1 file | 84 |
 | Catalog | 1 file | 8 |
 | Parser/Binder | 1 file | 35 |
-| Execution | 1 file | 9 |
+| Execution | 1 file | 12 |
 | Integration | 1 file | 16 |
-| **Total** | | **313** |
+| **Total** | | **316** |
 
 ---
 
