@@ -10,9 +10,11 @@
 #include "execution/delete_executor.hpp"
 #include "execution/filter.hpp"
 #include "execution/insert_executor.hpp"
+#include "execution/limit_executor.hpp"
 #include "execution/nested_loop_join.hpp"
 #include "execution/projection.hpp"
 #include "execution/seq_scan_executor.hpp"
+#include "execution/sort_executor.hpp"
 #include "execution/update_executor.hpp"
 #include "parser/expression.hpp"
 #include "storage/buffer_pool.hpp"
@@ -547,23 +549,37 @@ protected:
   void insert_test_data() {
     std::vector<Tuple> tuples;
     // Electronics: Laptop $1000 x 2, Phone $500 x 5
-    tuples.emplace_back(std::vector<TupleValue>{
-        TupleValue(std::string("Laptop")), TupleValue(std::string("Electronics")),
-        TupleValue(int32_t(1000)), TupleValue(int32_t(2))}, schema_);
-    tuples.emplace_back(std::vector<TupleValue>{
-        TupleValue(std::string("Phone")), TupleValue(std::string("Electronics")),
-        TupleValue(int32_t(500)), TupleValue(int32_t(5))}, schema_);
+    tuples.emplace_back(
+        std::vector<TupleValue>{TupleValue(std::string("Laptop")),
+                                TupleValue(std::string("Electronics")),
+                                TupleValue(int32_t(1000)),
+                                TupleValue(int32_t(2))},
+        schema_);
+    tuples.emplace_back(
+        std::vector<TupleValue>{TupleValue(std::string("Phone")),
+                                TupleValue(std::string("Electronics")),
+                                TupleValue(int32_t(500)),
+                                TupleValue(int32_t(5))},
+        schema_);
     // Books: Novel $20 x 10, Textbook $80 x 3
-    tuples.emplace_back(std::vector<TupleValue>{
-        TupleValue(std::string("Novel")), TupleValue(std::string("Books")),
-        TupleValue(int32_t(20)), TupleValue(int32_t(10))}, schema_);
-    tuples.emplace_back(std::vector<TupleValue>{
-        TupleValue(std::string("Textbook")), TupleValue(std::string("Books")),
-        TupleValue(int32_t(80)), TupleValue(int32_t(3))}, schema_);
+    tuples.emplace_back(
+        std::vector<TupleValue>{
+            TupleValue(std::string("Novel")), TupleValue(std::string("Books")),
+            TupleValue(int32_t(20)), TupleValue(int32_t(10))},
+        schema_);
+    tuples.emplace_back(
+        std::vector<TupleValue>{TupleValue(std::string("Textbook")),
+                                TupleValue(std::string("Books")),
+                                TupleValue(int32_t(80)),
+                                TupleValue(int32_t(3))},
+        schema_);
     // Clothing: Shirt $30 x 7
-    tuples.emplace_back(std::vector<TupleValue>{
-        TupleValue(std::string("Shirt")), TupleValue(std::string("Clothing")),
-        TupleValue(int32_t(30)), TupleValue(int32_t(7))}, schema_);
+    tuples.emplace_back(
+        std::vector<TupleValue>{TupleValue(std::string("Shirt")),
+                                TupleValue(std::string("Clothing")),
+                                TupleValue(int32_t(30)),
+                                TupleValue(int32_t(7))},
+        schema_);
 
     InsertExecutor insert(nullptr, table_info_->table_heap, &schema_,
                           std::move(tuples));
@@ -575,7 +591,7 @@ protected:
   std::shared_ptr<DiskManager> disk_manager_;
   std::shared_ptr<BufferPoolManager> buffer_pool_;
   std::unique_ptr<Catalog> catalog_;
-  TableInfo* table_info_ = nullptr;
+  TableInfo *table_info_ = nullptr;
   Schema schema_;
 };
 
@@ -584,10 +600,10 @@ TEST_F(AggregationTest, CountStar) {
       nullptr, table_info_->table_heap, &schema_);
 
   std::vector<AggregateExpression> aggs = {
-      AggregateExpression::count_star("total")
-  };
+      AggregateExpression::count_star("total")};
 
-  AggregationExecutor agg(nullptr, std::move(child), &schema_, {}, std::move(aggs));
+  AggregationExecutor agg(nullptr, std::move(child), &schema_, {},
+                          std::move(aggs));
   agg.init();
 
   auto result = agg.next();
@@ -603,13 +619,14 @@ TEST_F(AggregationTest, SumAvgMinMax) {
       nullptr, table_info_->table_heap, &schema_);
 
   std::vector<AggregateExpression> aggs = {
-      AggregateExpression::sum(2, "sum_price"),   // price column
+      AggregateExpression::sum(2, "sum_price"), // price column
       AggregateExpression::avg(2, "avg_price"),
       AggregateExpression::min(2, "min_price"),
       AggregateExpression::max(2, "max_price"),
   };
 
-  AggregationExecutor agg(nullptr, std::move(child), &schema_, {}, std::move(aggs));
+  AggregationExecutor agg(nullptr, std::move(child), &schema_, {},
+                          std::move(aggs));
   agg.init();
 
   auto result = agg.next();
@@ -618,7 +635,8 @@ TEST_F(AggregationTest, SumAvgMinMax) {
   // Sum: 1000 + 500 + 20 + 80 + 30 = 1630
   EXPECT_EQ(result->get_value(agg.output_schema(), 0).as_bigint(), 1630);
   // Avg: 1630 / 5 = 326
-  EXPECT_DOUBLE_EQ(result->get_value(agg.output_schema(), 1).as_double(), 326.0);
+  EXPECT_DOUBLE_EQ(result->get_value(agg.output_schema(), 1).as_double(),
+                   326.0);
   // Min: 20
   EXPECT_EQ(result->get_value(agg.output_schema(), 2).as_integer(), 20);
   // Max: 1000
@@ -630,14 +648,14 @@ TEST_F(AggregationTest, GroupByCategory) {
       nullptr, table_info_->table_heap, &schema_);
 
   // GROUP BY category, COUNT(*), SUM(price)
-  std::vector<size_t> group_by = {1};  // category column
+  std::vector<size_t> group_by = {1}; // category column
   std::vector<AggregateExpression> aggs = {
       AggregateExpression::count_star("cnt"),
       AggregateExpression::sum(2, "sum_price"),
   };
 
   AggregationExecutor agg(nullptr, std::move(child), &schema_,
-                           std::move(group_by), std::move(aggs));
+                          std::move(group_by), std::move(aggs));
   agg.init();
 
   std::map<std::string, std::pair<int64_t, int64_t>> results;
@@ -648,7 +666,7 @@ TEST_F(AggregationTest, GroupByCategory) {
     results[cat] = {cnt, sum};
   }
 
-  EXPECT_EQ(results.size(), 3);  // 3 categories
+  EXPECT_EQ(results.size(), 3); // 3 categories
 
   // Electronics: 2 items, 1000 + 500 = 1500
   EXPECT_EQ(results["Electronics"].first, 2);
@@ -677,7 +695,8 @@ TEST_F(AggregationTest, EmptyTable) {
       AggregateExpression::sum(0, "sum"),
   };
 
-  AggregationExecutor agg(nullptr, std::move(child), &empty_schema, {}, std::move(aggs));
+  AggregationExecutor agg(nullptr, std::move(child), &empty_schema, {},
+                          std::move(aggs));
   agg.init();
 
   auto result = agg.next();
@@ -694,13 +713,13 @@ TEST_F(AggregationTest, MultipleGroupByColumns) {
       nullptr, table_info_->table_heap, &schema_);
 
   // GROUP BY category, price (each product is unique by this combo)
-  std::vector<size_t> group_by = {1, 2};  // category, price
+  std::vector<size_t> group_by = {1, 2}; // category, price
   std::vector<AggregateExpression> aggs = {
       AggregateExpression::count_star("cnt"),
   };
 
   AggregationExecutor agg(nullptr, std::move(child), &schema_,
-                           std::move(group_by), std::move(aggs));
+                          std::move(group_by), std::move(aggs));
   agg.init();
 
   int count = 0;
@@ -712,5 +731,109 @@ TEST_F(AggregationTest, MultipleGroupByColumns) {
   EXPECT_EQ(count, 5);
 }
 
-}  // namespace
-}  // namespace entropy
+// ─────────────────────────────────────────────────────────────────────────────
+// Sort Executor Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST_F(ExecutorTest, SortAscending) {
+  insert_test_data();
+
+  auto child = std::make_unique<SeqScanExecutor>(
+      nullptr, table_info_->table_heap, &schema_);
+
+  // Sort by age ASC
+  std::vector<SortKey> sort_keys = {{2, true}}; // age column, ascending
+  SortExecutor sort(nullptr, std::move(child), &schema_, std::move(sort_keys));
+  sort.init();
+
+  std::vector<int32_t> ages;
+  while (auto tuple = sort.next()) {
+    ages.push_back(tuple->get_value(schema_, 2).as_integer());
+  }
+
+  ASSERT_EQ(ages.size(), 3);
+  EXPECT_EQ(ages[0], 25); // Alice
+  EXPECT_EQ(ages[1], 30); // Bob
+  EXPECT_EQ(ages[2], 35); // Charlie
+}
+
+TEST_F(ExecutorTest, SortDescending) {
+  insert_test_data();
+
+  auto child = std::make_unique<SeqScanExecutor>(
+      nullptr, table_info_->table_heap, &schema_);
+
+  // Sort by id DESC
+  std::vector<SortKey> sort_keys = {{0, false}}; // id column, descending
+  SortExecutor sort(nullptr, std::move(child), &schema_, std::move(sort_keys));
+  sort.init();
+
+  std::vector<int32_t> ids;
+  while (auto tuple = sort.next()) {
+    ids.push_back(tuple->get_value(schema_, 0).as_integer());
+  }
+
+  ASSERT_EQ(ids.size(), 3);
+  EXPECT_EQ(ids[0], 3); // Charlie
+  EXPECT_EQ(ids[1], 2); // Bob
+  EXPECT_EQ(ids[2], 1); // Alice
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Limit Executor Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST_F(ExecutorTest, LimitOnly) {
+  insert_test_data();
+
+  auto child = std::make_unique<SeqScanExecutor>(
+      nullptr, table_info_->table_heap, &schema_);
+
+  LimitExecutor limit(nullptr, std::move(child), 2, 0);
+  limit.init();
+
+  int count = 0;
+  while (limit.next().has_value()) {
+    count++;
+  }
+
+  EXPECT_EQ(count, 2);
+}
+
+TEST_F(ExecutorTest, LimitWithOffset) {
+  insert_test_data();
+
+  // Sort first to get deterministic order
+  auto scan = std::make_unique<SeqScanExecutor>(
+      nullptr, table_info_->table_heap, &schema_);
+  std::vector<SortKey> sort_keys = {{0, true}}; // id ASC
+  auto sorted = std::make_unique<SortExecutor>(nullptr, std::move(scan),
+                                               &schema_, std::move(sort_keys));
+
+  // OFFSET 1 LIMIT 1
+  LimitExecutor limit(nullptr, std::move(sorted), 1, 1);
+  limit.init();
+
+  auto tuple = limit.next();
+  ASSERT_TRUE(tuple.has_value());
+  EXPECT_EQ(tuple->get_value(schema_, 0).as_integer(),
+            2); // Bob (skipped Alice)
+
+  EXPECT_FALSE(limit.next().has_value()); // Only 1 row due to limit
+}
+
+TEST_F(ExecutorTest, OffsetBeyondRows) {
+  insert_test_data();
+
+  auto child = std::make_unique<SeqScanExecutor>(
+      nullptr, table_info_->table_heap, &schema_);
+
+  // OFFSET 100 - beyond all rows
+  LimitExecutor limit(nullptr, std::move(child), std::nullopt, 100);
+  limit.init();
+
+  EXPECT_FALSE(limit.next().has_value());
+}
+
+} // namespace
+} // namespace entropy

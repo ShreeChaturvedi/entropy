@@ -163,6 +163,8 @@ add_library(entropy_execution STATIC
     execution/aggregation.cpp
     execution/projection.cpp
     execution/filter.cpp
+    execution/sort_executor.cpp
+    execution/limit_executor.cpp
 )
 
 target_include_directories(entropy_execution

@@ -11,8 +11,10 @@
 #include "common/logger.hpp"
 #include "execution/delete_executor.hpp"
 #include "execution/insert_executor.hpp"
+#include "execution/limit_executor.hpp"
 #include "execution/projection.hpp"
 #include "execution/seq_scan_executor.hpp"
+#include "execution/sort_executor.hpp"
 #include "execution/update_executor.hpp"
 #include "parser/binder.hpp"
 #include "parser/parser.hpp"
@@ -98,6 +100,30 @@ public:
                                                        ctx.column_indices);
       output_schema = &proj->output_schema();
       executor = std::move(proj);
+    }
+
+    // Add ORDER BY if specified
+    if (!stmt->order_by.empty()) {
+      std::vector<SortKey> sort_keys;
+      for (const auto &item : stmt->order_by) {
+        // Find column index by name
+        for (size_t i = 0; i < output_schema->column_count(); i++) {
+          if (output_schema->column(i).name() == item.column_name) {
+            sort_keys.emplace_back(i, item.ascending);
+            break;
+          }
+        }
+      }
+      if (!sort_keys.empty()) {
+        executor = std::make_unique<SortExecutor>(
+            nullptr, std::move(executor), output_schema, std::move(sort_keys));
+      }
+    }
+
+    // Add LIMIT/OFFSET if specified
+    if (stmt->limit.has_value() || stmt->offset.has_value()) {
+      executor = std::make_unique<LimitExecutor>(
+          nullptr, std::move(executor), stmt->limit, stmt->offset.value_or(0));
     }
 
     // Execute and collect results
