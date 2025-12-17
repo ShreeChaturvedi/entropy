@@ -107,3 +107,23 @@ target_link_libraries(parser_tests
 )
 
 gtest_discover_tests(parser_tests)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Execution Tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+add_executable(execution_tests
+    execution/executor_test.cpp
+)
+
+target_link_libraries(execution_tests
+    PRIVATE
+        entropy_execution
+        entropy_parser
+        entropy_storage
+        test_utils
+        GTest::gtest
+        GTest::gtest_main
+)
+
+gtest_discover_tests(execution_tests)
