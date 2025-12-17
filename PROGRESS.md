@@ -15,7 +15,7 @@
 
 **Overall Progress**: ~65%
 
-**Last Updated**: 2024-12-17 - Hash Join Complete (328 tests passing)
+**Last Updated**: 2024-12-17 - IndexScan Complete (332 tests passing)
 
 ---
 
@@ -180,7 +180,7 @@
 - [x] Aggregations (COUNT, SUM, AVG, MIN, MAX with GROUP BY)
 - [x] ORDER BY / LIMIT
 - [x] Hash Join (O(n+m) for equi-joins)
-- [ ] IndexScan executor
+- [x] IndexScan executor (O(log n) point lookups, O(log n+k) range scans)
 
 ---
 
@@ -213,9 +213,9 @@
 | Transaction | 1 file | 84 |
 | Catalog | 1 file | 8 |
 | Parser/Binder | 1 file | 35 |
-| Execution | 1 file | 24 |
+| Execution | 1 file | 28 |
 | Integration | 1 file | 16 |
-| **Total** | | **328** |
+| **Total** | | **332** |
 
 ---
 
