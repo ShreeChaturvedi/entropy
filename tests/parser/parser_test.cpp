@@ -1,14 +1,18 @@
 /**
  * @file parser_test.cpp
- * @brief Tests for SQL tokenizer, parser, and expression evaluation
+ * @brief Tests for SQL tokenizer, parser, binder, and expression evaluation
  */
 
 #include <gtest/gtest.h>
 
+#include "catalog/catalog.hpp"
+#include "parser/binder.hpp"
 #include "parser/expression.hpp"
 #include "parser/parser.hpp"
 #include "parser/statement.hpp"
 #include "parser/token.hpp"
+#include "storage/buffer_pool.hpp"
+#include "test_utils.hpp"
 
 namespace entropy {
 namespace {
@@ -424,6 +428,165 @@ TEST_F(ExpressionTest, StringComparison) {
   TupleValue result = expr->evaluate(tuple_, schema_);
   EXPECT_TRUE(result.is_bool());
   EXPECT_TRUE(result.as_bool());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Binder Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+} // namespace
+
+namespace {
+
+class BinderTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    temp_file_ = std::make_unique<test::TempFile>("binder_test_");
+    disk_manager_ = std::make_shared<DiskManager>(temp_file_->string());
+    buffer_pool_ = std::make_shared<BufferPoolManager>(10, disk_manager_);
+    catalog_ = std::make_unique<Catalog>(buffer_pool_);
+    binder_ = std::make_unique<Binder>(catalog_.get());
+
+    // Create a test table
+    Schema schema({
+        Column("id", TypeId::INTEGER),
+        Column("name", TypeId::VARCHAR, 100),
+        Column("age", TypeId::INTEGER),
+    });
+    ASSERT_TRUE(catalog_->create_table("users", schema).ok());
+  }
+
+  void TearDown() override {
+    binder_.reset();
+    catalog_.reset();
+    buffer_pool_.reset();
+    disk_manager_.reset();
+    temp_file_.reset();
+  }
+
+  std::unique_ptr<test::TempFile> temp_file_;
+  std::shared_ptr<DiskManager> disk_manager_;
+  std::shared_ptr<BufferPoolManager> buffer_pool_;
+  std::unique_ptr<Catalog> catalog_;
+  std::unique_ptr<Binder> binder_;
+};
+
+TEST_F(BinderTest, BindSelectStar) {
+  Parser parser("SELECT * FROM users");
+  std::unique_ptr<Statement> stmt;
+  ASSERT_TRUE(parser.parse(&stmt).ok());
+
+  auto *select = dynamic_cast<SelectStatement *>(stmt.get());
+  ASSERT_NE(select, nullptr);
+
+  BoundSelectContext context;
+  auto status = binder_->bind_select(select, &context);
+  EXPECT_TRUE(status.ok()) << status.to_string();
+
+  EXPECT_NE(context.table_info, nullptr);
+  EXPECT_EQ(context.table_info->name, "users");
+  EXPECT_TRUE(context.select_all);
+  EXPECT_EQ(context.column_indices.size(), 3); // id, name, age
+}
+
+TEST_F(BinderTest, BindSelectColumns) {
+  Parser parser("SELECT id, age FROM users");
+  std::unique_ptr<Statement> stmt;
+  ASSERT_TRUE(parser.parse(&stmt).ok());
+
+  auto *select = dynamic_cast<SelectStatement *>(stmt.get());
+  BoundSelectContext context;
+  auto status = binder_->bind_select(select, &context);
+  EXPECT_TRUE(status.ok()) << status.to_string();
+
+  EXPECT_FALSE(context.select_all);
+  ASSERT_EQ(context.column_indices.size(), 2);
+  EXPECT_EQ(context.column_indices[0], 0); // id is index 0
+  EXPECT_EQ(context.column_indices[1], 2); // age is index 2
+}
+
+TEST_F(BinderTest, BindSelectWithWhere) {
+  Parser parser("SELECT * FROM users WHERE id = 1");
+  std::unique_ptr<Statement> stmt;
+  ASSERT_TRUE(parser.parse(&stmt).ok());
+
+  auto *select = dynamic_cast<SelectStatement *>(stmt.get());
+  BoundSelectContext context;
+  auto status = binder_->bind_select(select, &context);
+  EXPECT_TRUE(status.ok()) << status.to_string();
+
+  EXPECT_NE(context.predicate, nullptr);
+}
+
+TEST_F(BinderTest, BindSelectNonexistentTable) {
+  Parser parser("SELECT * FROM nonexistent");
+  std::unique_ptr<Statement> stmt;
+  ASSERT_TRUE(parser.parse(&stmt).ok());
+
+  auto *select = dynamic_cast<SelectStatement *>(stmt.get());
+  BoundSelectContext context;
+  auto status = binder_->bind_select(select, &context);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.code(), StatusCode::kNotFound);
+}
+
+TEST_F(BinderTest, BindSelectNonexistentColumn) {
+  Parser parser("SELECT nonexistent FROM users");
+  std::unique_ptr<Statement> stmt;
+  ASSERT_TRUE(parser.parse(&stmt).ok());
+
+  auto *select = dynamic_cast<SelectStatement *>(stmt.get());
+  BoundSelectContext context;
+  auto status = binder_->bind_select(select, &context);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.code(), StatusCode::kNotFound);
+}
+
+TEST_F(BinderTest, BindInsert) {
+  Parser parser("INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)");
+  std::unique_ptr<Statement> stmt;
+  ASSERT_TRUE(parser.parse(&stmt).ok());
+
+  auto *insert = dynamic_cast<InsertStatement *>(stmt.get());
+  ASSERT_NE(insert, nullptr);
+
+  BoundInsertContext context;
+  auto status = binder_->bind_insert(insert, &context);
+  EXPECT_TRUE(status.ok()) << status.to_string();
+
+  EXPECT_NE(context.table_info, nullptr);
+  ASSERT_EQ(context.column_indices.size(), 3);
+  EXPECT_EQ(context.column_indices[0], 0); // id
+  EXPECT_EQ(context.column_indices[1], 1); // name
+  EXPECT_EQ(context.column_indices[2], 2); // age
+}
+
+TEST_F(BinderTest, BindInsertMismatchedValues) {
+  Parser parser("INSERT INTO users (id, name) VALUES (1)");
+  std::unique_ptr<Statement> stmt;
+  ASSERT_TRUE(parser.parse(&stmt).ok());
+
+  auto *insert = dynamic_cast<InsertStatement *>(stmt.get());
+  BoundInsertContext context;
+  auto status = binder_->bind_insert(insert, &context);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.code(), StatusCode::kInvalidArgument);
+}
+
+TEST_F(BinderTest, BindDelete) {
+  Parser parser("DELETE FROM users WHERE id = 1");
+  std::unique_ptr<Statement> stmt;
+  ASSERT_TRUE(parser.parse(&stmt).ok());
+
+  auto *del = dynamic_cast<DeleteStatement *>(stmt.get());
+  ASSERT_NE(del, nullptr);
+
+  BoundDeleteContext context;
+  auto status = binder_->bind_delete(del, &context);
+  EXPECT_TRUE(status.ok()) << status.to_string();
+
+  EXPECT_NE(context.table_info, nullptr);
+  EXPECT_NE(context.predicate, nullptr);
 }
 
 } // namespace
