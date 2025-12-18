@@ -95,9 +95,12 @@ std::unique_ptr<Statement> Parser::parse_statement() {
     set_error("Expected TABLE after DROP");
     return nullptr;
   }
+  if (check(TokenType::EXPLAIN)) {
+    return parse_explain();
+  }
 
-  set_error(
-      "Expected statement (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP)");
+  set_error("Expected statement (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, "
+            "EXPLAIN)");
   return nullptr;
 }
 
@@ -670,6 +673,25 @@ TypeId Parser::parse_data_type(size_t *length_out) {
   }
 
   return type;
+}
+
+std::unique_ptr<ExplainStatement> Parser::parse_explain() {
+  auto stmt = std::make_unique<ExplainStatement>();
+  expect(TokenType::EXPLAIN, "Expected EXPLAIN");
+
+  // Check for EXPLAIN ANALYZE
+  if (match(TokenType::ANALYZE)) {
+    stmt->analyze = true;
+  }
+
+  // Parse inner statement (SELECT only for now)
+  if (!check(TokenType::SELECT)) {
+    set_error("EXPLAIN currently only supports SELECT statements");
+    return nullptr;
+  }
+
+  stmt->inner_statement = parse_select();
+  return stmt;
 }
 
 } // namespace entropy

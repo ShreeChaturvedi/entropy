@@ -65,6 +65,8 @@ enum class TokenType {
   DESC,
   LIMIT,
   OFFSET,
+  EXPLAIN,
+  ANALYZE,
 
   // Data types
   INT,

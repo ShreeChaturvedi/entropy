@@ -77,6 +77,7 @@ private:
   std::unique_ptr<DeleteStatement> parse_delete();
   std::unique_ptr<CreateTableStatement> parse_create_table();
   std::unique_ptr<DropTableStatement> parse_drop_table();
+  std::unique_ptr<ExplainStatement> parse_explain();
 
   // ─────────────────────────────────────────────────────────────────────────
   // Expression Parsing

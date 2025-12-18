@@ -32,6 +32,7 @@ enum class StatementType {
   DROP_TABLE,
   CREATE_INDEX,
   DROP_INDEX,
+  EXPLAIN,
 };
 
 // Forward declarations
@@ -239,6 +240,23 @@ public:
 
   std::string table_name;
   bool if_exists = false;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EXPLAIN Statement
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * @brief EXPLAIN statement: EXPLAIN SELECT ...
+ *
+ * Wraps another statement and returns execution plan instead of results.
+ */
+class ExplainStatement : public Statement {
+public:
+  ExplainStatement() : Statement(StatementType::EXPLAIN) {}
+
+  std::unique_ptr<Statement> inner_statement;
+  bool analyze = false; // EXPLAIN ANALYZE for actual execution stats
 };
 
 } // namespace entropy

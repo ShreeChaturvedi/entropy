@@ -77,6 +77,8 @@ public:
           dynamic_cast<CreateTableStatement *>(stmt.get()));
     case StatementType::DROP_TABLE:
       return execute_drop_table(dynamic_cast<DropTableStatement *>(stmt.get()));
+    case StatementType::EXPLAIN:
+      return execute_explain(dynamic_cast<ExplainStatement *>(stmt.get()));
     default:
       return Result(Status::NotSupported("Unsupported statement type"));
     }
@@ -300,6 +302,92 @@ public:
     }
 
     return Result(size_t(0)); // 0 rows affected
+  }
+
+  Result execute_explain(ExplainStatement *stmt) {
+    if (!stmt || !stmt->inner_statement) {
+      return Result(Status::InvalidArgument("Invalid EXPLAIN statement"));
+    }
+
+    // Currently only support SELECT
+    if (stmt->inner_statement->type() != StatementType::SELECT) {
+      return Result(Status::NotSupported("EXPLAIN only supports SELECT"));
+    }
+
+    auto* select = dynamic_cast<SelectStatement*>(stmt->inner_statement.get());
+    
+    // Bind to get table info
+    BoundSelectContext ctx;
+    Status status = binder_->bind_select(select, &ctx);
+    if (!status.ok()) {
+      return Result(status);
+    }
+
+    // Generate query plan description
+    std::vector<std::string> plan_lines;
+    plan_lines.push_back("Query Plan:");
+    
+    // Check if index can be used
+    auto selection = index_selector_->select_access_method(
+        ctx.table_info->oid, ctx.predicate.get());
+
+    // Describe access method
+    if (selection.use_index) {
+      std::string access = "-> Index Scan";
+      switch (selection.scan_type) {
+        case IndexScanPlanNode::ScanType::POINT_LOOKUP:
+          access += " (Point Lookup)";
+          break;
+        case IndexScanPlanNode::ScanType::RANGE_SCAN:
+          access += " (Range Scan)";
+          break;
+        case IndexScanPlanNode::ScanType::FULL_SCAN:
+          access += " (Full Index Scan)";
+          break;
+      }
+      plan_lines.push_back(access);
+      plan_lines.push_back("   Index Cost: " + std::to_string(selection.index_cost));
+    } else {
+      plan_lines.push_back("-> Sequential Scan on " + ctx.table_info->name);
+      plan_lines.push_back("   SeqScan Cost: " + std::to_string(selection.seq_scan_cost));
+    }
+
+    // Describe predicate if present
+    if (ctx.predicate) {
+      plan_lines.push_back("   Filter: (predicate)");
+    }
+
+    // Describe ORDER BY if present
+    if (!select->order_by.empty()) {
+      plan_lines.push_back("-> Sort");
+      for (const auto& key : select->order_by) {
+        plan_lines.push_back("   Key: " + key.column_name + 
+                            (key.ascending ? " ASC" : " DESC"));
+      }
+    }
+
+    // Describe LIMIT if present
+    if (select->limit.has_value()) {
+      plan_lines.push_back("-> Limit: " + std::to_string(*select->limit));
+    }
+
+    // Cardinality estimate
+    size_t estimated_rows = statistics_->table_cardinality(ctx.table_info->oid);
+    if (ctx.predicate) {
+      double sel = statistics_->estimate_selectivity(ctx.table_info->oid,
+                                                      ctx.predicate.get());
+      estimated_rows = static_cast<size_t>(estimated_rows * sel);
+    }
+    plan_lines.push_back("Estimated Rows: " + std::to_string(estimated_rows));
+
+    // Build result rows
+    std::vector<Row> rows;
+    std::vector<std::string> column_names = {"QUERY PLAN"};
+    for (const auto& line : plan_lines) {
+      rows.emplace_back(std::vector<Value>{Value(line)}, column_names);
+    }
+
+    return Result(std::move(rows), std::move(column_names));
   }
 
   // ─────────────────────────────────────────────────────────────────────────

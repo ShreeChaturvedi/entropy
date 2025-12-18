@@ -59,6 +59,8 @@ const std::unordered_map<std::string, TokenType> Lexer::keywords_ = {
     {"DESC", TokenType::DESC},
     {"LIMIT", TokenType::LIMIT},
     {"OFFSET", TokenType::OFFSET},
+    {"EXPLAIN", TokenType::EXPLAIN},
+    {"ANALYZE", TokenType::ANALYZE},
 
     // Data types
     {"INT", TokenType::INT},
@@ -146,6 +148,10 @@ const char *token_type_to_string(TokenType type) {
     return "LIMIT";
   case TokenType::OFFSET:
     return "OFFSET";
+  case TokenType::EXPLAIN:
+    return "EXPLAIN";
+  case TokenType::ANALYZE:
+    return "ANALYZE";
   case TokenType::INT:
     return "INT";
   case TokenType::INTEGER:
