@@ -11,11 +11,11 @@
 | Phase 1: Storage Engine | 🟢 Complete | ~90% |
 | Phase 2: Transactions | 🟢 Complete | ~95% |
 | Phase 3: Query Processing | 🟢 Complete | 100% |
-| Phase 4: Optimization | 🟡 In Progress | ~70% |
+| Phase 4: Optimization | 🟡 In Progress | ~85% |
 
-**Overall Progress**: ~85%
+**Overall Progress**: ~90%
 
-**Last Updated**: 2024-12-18 - Optimizer Integrated (332 tests passing)
+**Last Updated**: 2024-12-18 - EXPLAIN Command (332 tests passing)
 
 ---
 
@@ -192,8 +192,8 @@
 - [x] `Statistics` class (cardinality/selectivity estimation)
 - [x] `IndexSelector` class (auto SeqScan vs IndexScan)
 - [x] Optimizer integration into Database.execute()
+- [x] EXPLAIN command
 - [ ] Optimization tests
-- [ ] EXPLAIN command
 
 ### 4.2 Hash Index
 - [ ] Extendible hashing
