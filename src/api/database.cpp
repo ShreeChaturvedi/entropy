@@ -10,12 +10,16 @@
 #include "catalog/catalog.hpp"
 #include "common/logger.hpp"
 #include "execution/delete_executor.hpp"
+#include "execution/index_scan_executor.hpp"
 #include "execution/insert_executor.hpp"
 #include "execution/limit_executor.hpp"
 #include "execution/projection.hpp"
 #include "execution/seq_scan_executor.hpp"
 #include "execution/sort_executor.hpp"
 #include "execution/update_executor.hpp"
+#include "optimizer/cost_model.hpp"
+#include "optimizer/index_selector.hpp"
+#include "optimizer/statistics.hpp"
 #include "parser/binder.hpp"
 #include "parser/parser.hpp"
 #include "parser/statement.hpp"
@@ -37,8 +41,14 @@ public:
                                                        disk_manager_);
 
     // Initialize catalog
-    catalog_ = std::make_unique<Catalog>(buffer_pool_);
+    catalog_ = std::make_shared<Catalog>(buffer_pool_);
     binder_ = std::make_unique<Binder>(catalog_.get());
+
+    // Initialize optimizer components
+    statistics_ = std::make_shared<Statistics>(catalog_);
+    cost_model_ = std::make_shared<CostModel>(statistics_);
+    index_selector_ =
+        std::make_unique<IndexSelector>(catalog_, statistics_, cost_model_);
   }
 
   ~DatabaseImpl() { close(); }
@@ -83,10 +93,51 @@ public:
       return Result(status);
     }
 
-    // Create SeqScan executor
-    auto scan = std::make_unique<SeqScanExecutor>(
-        nullptr, ctx.table_info->table_heap, &ctx.table_info->schema,
-        std::move(ctx.predicate));
+    // Use optimizer to select access method
+    std::unique_ptr<Executor> scan;
+
+    // Try to use IndexScan if predicate matches an indexed column
+    auto selection = index_selector_->select_access_method(ctx.table_info->oid,
+                                                           ctx.predicate.get());
+
+    if (selection.use_index) {
+      // Get index info
+      auto *index_info = catalog_->get_index_for_column(
+          ctx.table_info->oid, static_cast<column_id_t>(selection.index_oid));
+
+      if (index_info && index_info->index) {
+        // Use IndexScan
+        switch (selection.scan_type) {
+        case IndexScanPlanNode::ScanType::POINT_LOOKUP:
+          scan = std::make_unique<IndexScanExecutor>(
+              nullptr, index_info->index.get(),
+              ctx.table_info->table_heap.get(), &ctx.table_info->schema,
+              *selection.start_key);
+          break;
+        case IndexScanPlanNode::ScanType::RANGE_SCAN:
+          scan = std::make_unique<IndexScanExecutor>(
+              nullptr, index_info->index.get(),
+              ctx.table_info->table_heap.get(), &ctx.table_info->schema,
+              selection.start_key.value_or(
+                  std::numeric_limits<BPTreeKey>::min()),
+              selection.end_key.value_or(
+                  std::numeric_limits<BPTreeKey>::max()));
+          break;
+        case IndexScanPlanNode::ScanType::FULL_SCAN:
+          scan = std::make_unique<IndexScanExecutor>(
+              nullptr, index_info->index.get(),
+              ctx.table_info->table_heap.get(), &ctx.table_info->schema);
+          break;
+        }
+      }
+    }
+
+    // Fallback to SeqScan
+    if (!scan) {
+      scan = std::make_unique<SeqScanExecutor>(
+          nullptr, ctx.table_info->table_heap, &ctx.table_info->schema,
+          std::move(ctx.predicate));
+    }
 
     // If not SELECT *, create projection
     std::unique_ptr<Executor> executor;
@@ -354,8 +405,13 @@ private:
   std::shared_ptr<BufferPoolManager> buffer_pool_;
 
   // Catalog & Binder
-  std::unique_ptr<Catalog> catalog_;
+  std::shared_ptr<Catalog> catalog_;
   std::unique_ptr<Binder> binder_;
+
+  // Optimizer
+  std::shared_ptr<Statistics> statistics_;
+  std::shared_ptr<CostModel> cost_model_;
+  std::unique_ptr<IndexSelector> index_selector_;
 };
 
 Database::Database(const std::string &path, const DatabaseOptions &options)
