@@ -209,8 +209,11 @@
 - [x] Page compression tests (3 tests)
 
 ### 4.4 API & Shell
-- [ ] Interactive SQL shell improvements
-- [ ] Error messages
+- [x] Interactive SQL shell improvements
+  - [x] .help, .tables, .schema, .clear, .quit commands
+  - [x] ASCII table formatting with column widths
+  - [x] Banner display
+- [x] EXPLAIN command help
 
 ---
 
