@@ -345,10 +345,11 @@ entropy/
 ### Optimizer Layer
 | Component | Status | Header | Implementation | Tests |
 |-----------|--------|--------|----------------|-------|
-| Optimizer | ⭕ Not Started | stub | stub | - |
-| CostModel | ⭕ Not Started | stub | stub | - |
-| Statistics | ⭕ Not Started | stub | stub | - |
-| IndexSelector | ⭕ Not Started | stub | stub | - |
+| Optimizer | 🟡 Partial | `optimizer.hpp` | `optimizer.cpp` | - |
+| CostModel | ✅ Complete | `cost_model.hpp` | `cost_model.cpp` | - |
+| Statistics | ✅ Complete | `statistics.hpp` | `statistics.cpp` | - |
+| IndexSelector | ✅ Complete | `index_selector.hpp` | `index_selector.cpp` | - |
+| PlanNode | ✅ Complete | `plan_node.hpp` | - | - |
 
 ### API Layer
 | Component | Status | Header | Implementation | Tests |

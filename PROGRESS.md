@@ -10,12 +10,12 @@
 |-------|--------|----------|
 | Phase 1: Storage Engine | 🟢 Complete | ~90% |
 | Phase 2: Transactions | 🟢 Complete | ~95% |
-| Phase 3: Query Processing | � Complete | 100% |
-| Phase 4: Optimization | 🔴 Not Started | 0% |
+| Phase 3: Query Processing | 🟢 Complete | 100% |
+| Phase 4: Optimization | � In Progress | ~50% |
 
-**Overall Progress**: ~75%
+**Overall Progress**: ~80%
 
-**Last Updated**: 2024-12-17 - Phase 3 Query Processing Complete (332 tests passing)
+**Last Updated**: 2024-12-17 - Optimizer Infrastructure (332 tests passing)
 
 ---
 
@@ -187,10 +187,12 @@
 ## Phase 4: Optimization & Polish
 
 ### 4.1 Query Optimizer
-- [ ] `PlanNode` classes
-- [ ] `CostModel` class
-- [ ] `Statistics` class
-- [ ] Index selection
+- [x] `PlanNode` classes (SeqScan, IndexScan, Filter, Sort, Limit, Join, Aggregation)
+- [x] `CostModel` class (operator cost formulas)
+- [x] `Statistics` class (cardinality/selectivity estimation)
+- [x] `IndexSelector` class (auto SeqScan vs IndexScan)
+- [ ] Optimizer main integration into Database.execute()
+- [ ] Optimization tests
 
 ### 4.2 Hash Index
 - [ ] Extendible hashing
