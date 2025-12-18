@@ -127,3 +127,26 @@ target_link_libraries(execution_tests
 )
 
 gtest_discover_tests(execution_tests)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Optimizer Tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+add_executable(optimizer_tests
+    optimizer/optimizer_test.cpp
+)
+
+target_link_libraries(optimizer_tests
+    PRIVATE
+        entropy_optimizer
+        entropy_execution
+        entropy_parser
+        entropy_catalog
+        entropy_storage
+        test_utils
+        GTest::gtest
+        GTest::gtest_main
+)
+
+gtest_discover_tests(optimizer_tests)
+
