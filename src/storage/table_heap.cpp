@@ -124,7 +124,8 @@ Status TableHeap::delete_tuple(const RID &rid) {
   return Status::Ok();
 }
 
-Status TableHeap::update_tuple(const Tuple &tuple, const RID &rid) {
+Status TableHeap::update_tuple(const Tuple &tuple, const RID &rid,
+                               RID *new_rid) {
   std::unique_lock lock(mutex_); // Exclusive lock for write
 
   if (!rid.is_valid()) {
@@ -148,6 +149,10 @@ Status TableHeap::update_tuple(const Tuple &tuple, const RID &rid) {
 
   if (updated) {
     buffer_pool_->unpin_page(rid.page_id, true);
+    // RID didn't change for in-place update
+    if (new_rid != nullptr) {
+      *new_rid = rid;
+    }
     return Status::Ok();
   }
 
@@ -166,20 +171,20 @@ Status TableHeap::update_tuple(const Tuple &tuple, const RID &rid) {
   // Insert the new tuple (may go to a different page)
   // Release lock before recursive call to avoid deadlock
   lock.unlock();
-  RID new_rid;
-  Status status = insert_tuple(tuple, &new_rid);
+  RID inserted_rid;
+  Status status = insert_tuple(tuple, &inserted_rid);
 
   if (!status.ok()) {
     // This is a problem - we deleted the old tuple but couldn't insert the new
-    // one In a real system, we'd use WAL to handle this atomically
+    // one. In a real system, we'd use WAL to handle this atomically.
     return Status::Internal("Failed to insert updated tuple: " +
                             std::string(status.message()));
   }
 
-  // Note: The RID may have changed. In a real system, we might need to
-  // update any indexes pointing to this tuple.
-  // For now, we return success but the caller should be aware the RID may have
-  // changed.
+  // Return the new RID to the caller
+  if (new_rid != nullptr) {
+    *new_rid = inserted_rid;
+  }
 
   return Status::Ok();
 }
