@@ -8,14 +8,14 @@
 
 | Phase | Status | Progress |
 |-------|--------|----------|
-| Phase 1: Storage Engine | 🟢 Complete | ~90% |
+| Phase 1: Storage Engine | 🟢 Complete | 100% |
 | Phase 2: Transactions | 🟢 Complete | ~95% |
 | Phase 3: Query Processing | 🟢 Complete | 100% |
 | Phase 4: Optimization | 🟢 Complete | 100% |
 
-**Overall Progress**: ~95%
+**Overall Progress**: ~98%
 
-**Last Updated**: 2024-12-18 - Optimizer Tests (342 tests passing)
+**Last Updated**: 2024-12-18 - Hash Index + Page Compression (352 tests passing)
 
 ---
 
@@ -196,11 +196,17 @@
 - [x] Optimization tests (10 tests)
 
 ### 4.2 Hash Index
-- [ ] Extendible hashing
+- [x] Extendible hashing (HashBucket, HashIndex)
+- [x] Directory doubling
+- [x] Bucket splitting
+- [x] Hash index tests (7 tests)
 
-### 4.3 Advanced Features
-- [ ] EXPLAIN command
-- [ ] Page compression (LZ4)
+### 4.3 Page Compression
+- [x] LZ4 integration in CMake
+- [x] PageCompression class
+- [x] Compression header with checksum
+- [x] Compile-time conditional support
+- [x] Page compression tests (3 tests)
 
 ### 4.4 API & Shell
 - [ ] Interactive SQL shell improvements
