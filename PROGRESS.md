@@ -11,11 +11,11 @@
 | Phase 1: Storage Engine | 🟢 Complete | ~90% |
 | Phase 2: Transactions | 🟢 Complete | ~95% |
 | Phase 3: Query Processing | 🟢 Complete | 100% |
-| Phase 4: Optimization | � In Progress | ~50% |
+| Phase 4: Optimization | 🟡 In Progress | ~70% |
 
-**Overall Progress**: ~80%
+**Overall Progress**: ~85%
 
-**Last Updated**: 2024-12-17 - Optimizer Infrastructure (332 tests passing)
+**Last Updated**: 2024-12-18 - Optimizer Integrated (332 tests passing)
 
 ---
 
@@ -191,8 +191,9 @@
 - [x] `CostModel` class (operator cost formulas)
 - [x] `Statistics` class (cardinality/selectivity estimation)
 - [x] `IndexSelector` class (auto SeqScan vs IndexScan)
-- [ ] Optimizer main integration into Database.execute()
+- [x] Optimizer integration into Database.execute()
 - [ ] Optimization tests
+- [ ] EXPLAIN command
 
 ### 4.2 Hash Index
 - [ ] Extendible hashing
