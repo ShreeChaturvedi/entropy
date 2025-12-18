@@ -5,7 +5,9 @@
 
 #include "catalog/catalog.hpp"
 
+#include "storage/b_plus_tree.hpp"
 #include "storage/table_heap.hpp"
+#include "storage/tuple.hpp"
 
 namespace entropy {
 
@@ -101,6 +103,123 @@ std::vector<std::string> Catalog::get_table_names() const {
     names.push_back(name);
   }
   return names;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Table lookup by OID
+// ─────────────────────────────────────────────────────────────────────────────
+
+TableInfo *Catalog::get_table(oid_t table_oid) {
+  auto it = tables_.find(table_oid);
+  return (it != tables_.end()) ? &it->second : nullptr;
+}
+
+const TableInfo *Catalog::get_table(oid_t table_oid) const {
+  auto it = tables_.find(table_oid);
+  return (it != tables_.end()) ? &it->second : nullptr;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Index Management
+// ─────────────────────────────────────────────────────────────────────────────
+
+Status Catalog::create_index(const std::string &index_name,
+                             const std::string &table_name,
+                             const std::string &column_name) {
+  // Check if index already exists
+  if (index_names_.find(index_name) != index_names_.end()) {
+    return Status::AlreadyExists("Index already exists: " + index_name);
+  }
+
+  // Get table
+  auto *table_info = get_table(table_name);
+  if (!table_info) {
+    return Status::NotFound("Table not found: " + table_name);
+  }
+
+  // Find column
+  int col_idx = table_info->schema.get_column_index(column_name);
+  if (col_idx < 0) {
+    return Status::NotFound("Column not found: " + column_name);
+  }
+
+  // Create B+ tree index
+  auto index = std::make_shared<BPlusTree>(buffer_pool_);
+
+  // Allocate new OID
+  oid_t oid = next_oid_++;
+
+  // Create IndexInfo
+  IndexInfo info(oid, index_name, table_info->oid,
+                 static_cast<column_id_t>(col_idx), index);
+
+  // Build index from existing data
+  for (auto it = table_info->table_heap->begin();
+       it != table_info->table_heap->end(); ++it) {
+    Tuple tuple = *it;
+    TupleValue key_val =
+        tuple.get_value(table_info->schema, static_cast<uint32_t>(col_idx));
+    // Convert to BPTreeKey (int64_t)
+    BPTreeKey key = 0;
+    if (key_val.is_integer()) {
+      key = static_cast<BPTreeKey>(key_val.as_integer());
+    } else if (key_val.is_bigint()) {
+      key = static_cast<BPTreeKey>(key_val.as_bigint());
+    }
+    (void)index->insert(key, it.rid());
+  }
+
+  // Store in catalog
+  index_names_[index_name] = oid;
+  indexes_[oid] = std::move(info);
+
+  return Status::Ok();
+}
+
+IndexInfo *Catalog::get_index(const std::string &index_name) {
+  auto it = index_names_.find(index_name);
+  if (it == index_names_.end())
+    return nullptr;
+  auto idx_it = indexes_.find(it->second);
+  return (idx_it != indexes_.end()) ? &idx_it->second : nullptr;
+}
+
+const IndexInfo *Catalog::get_index(const std::string &index_name) const {
+  auto it = index_names_.find(index_name);
+  if (it == index_names_.end())
+    return nullptr;
+  auto idx_it = indexes_.find(it->second);
+  return (idx_it != indexes_.end()) ? &idx_it->second : nullptr;
+}
+
+IndexInfo *Catalog::get_index_for_column(oid_t table_oid,
+                                         column_id_t column_id) {
+  for (auto &[oid, info] : indexes_) {
+    if (info.table_oid == table_oid && info.key_column == column_id) {
+      return &info;
+    }
+  }
+  return nullptr;
+}
+
+const IndexInfo *Catalog::get_index_for_column(oid_t table_oid,
+                                               column_id_t column_id) const {
+  for (const auto &[oid, info] : indexes_) {
+    if (info.table_oid == table_oid && info.key_column == column_id) {
+      return &info;
+    }
+  }
+  return nullptr;
+}
+
+std::vector<IndexInfo *> Catalog::get_table_indexes(oid_t table_oid) {
+  std::vector<IndexInfo *> result;
+  for (auto &[oid, info] : indexes_) {
+    if (info.table_oid == table_oid) {
+      result.push_back(&info);
+    }
+  }
+  return result;
 }
 
 } // namespace entropy

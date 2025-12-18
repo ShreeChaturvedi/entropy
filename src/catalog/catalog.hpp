@@ -6,7 +6,7 @@
  *
  * The catalog stores metadata about tables and indexes:
  * - TableInfo: name, schema, and TableHeap for data storage
- * - IndexInfo: name, key schema, and index structure (future)
+ * - IndexInfo: name, key column, and B+ tree index
  */
 
 #include <memory>
@@ -23,6 +23,7 @@ namespace entropy {
 // Forward declarations
 class BufferPoolManager;
 class TableHeap;
+class BPlusTree;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TableInfo - Complete table metadata
@@ -44,23 +45,35 @@ struct TableInfo {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// IndexInfo - Index metadata
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * @brief Complete information about an index
+ */
+struct IndexInfo {
+  oid_t oid;                        ///< Unique index identifier
+  std::string name;                 ///< Index name
+  oid_t table_oid;                  ///< Table this index belongs to
+  column_id_t key_column;           ///< Column being indexed
+  std::shared_ptr<BPlusTree> index; ///< B+ tree index structure
+
+  IndexInfo() = default;
+  IndexInfo(oid_t id, std::string n, oid_t tbl, column_id_t col,
+            std::shared_ptr<BPlusTree> idx)
+      : oid(id), name(std::move(n)), table_oid(tbl), key_column(col),
+        index(std::move(idx)) {}
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Catalog - System catalog manager
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * @brief System catalog - manages table and index metadata
- *
- * The catalog is responsible for:
- * - Creating and dropping tables
- * - Storing table schemas and TableHeap references
- * - Looking up table information by name or OID
  */
 class Catalog {
 public:
-  /**
-   * @brief Construct a catalog with a buffer pool
-   * @param buffer_pool Buffer pool manager for creating TableHeaps
-   */
   explicit Catalog(std::shared_ptr<BufferPoolManager> buffer_pool);
   ~Catalog() = default;
 
@@ -68,71 +81,58 @@ public:
   // Table Management
   // ─────────────────────────────────────────────────────────────────────────
 
-  /**
-   * @brief Create a new table
-   * @param table_name Name of the table
-   * @param schema Schema defining the table columns
-   * @return Status::Ok() on success, Status::AlreadyExists() if table exists
-   */
   [[nodiscard]] Status create_table(const std::string &table_name,
                                     const Schema &schema);
-
-  /**
-   * @brief Drop a table
-   * @param table_name Name of the table to drop
-   * @return Status::Ok() on success, Status::NotFound() if table doesn't exist
-   */
   [[nodiscard]] Status drop_table(const std::string &table_name);
-
-  /**
-   * @brief Get complete table information by name
-   * @param table_name Name of the table
-   * @return Pointer to TableInfo, or nullptr if not found
-   */
   [[nodiscard]] TableInfo *get_table(const std::string &table_name);
-
-  /**
-   * @brief Get complete table information by name (const)
-   * @param table_name Name of the table
-   * @return Const pointer to TableInfo, or nullptr if not found
-   */
   [[nodiscard]] const TableInfo *get_table(const std::string &table_name) const;
-
-  /**
-   * @brief Get table schema by name
-   * @param table_name Name of the table
-   * @return Pointer to Schema, or nullptr if not found
-   */
+  [[nodiscard]] TableInfo *get_table(oid_t table_oid);
+  [[nodiscard]] const TableInfo *get_table(oid_t table_oid) const;
   [[nodiscard]] const Schema *
   get_table_schema(const std::string &table_name) const;
-
-  /**
-   * @brief Check if a table exists
-   * @param table_name Name of the table
-   * @return true if table exists
-   */
   [[nodiscard]] bool table_exists(const std::string &table_name) const;
-
-  /**
-   * @brief Get table OID by name
-   * @param table_name Name of the table
-   * @return Table OID, or INVALID_OID if not found
-   */
   [[nodiscard]] oid_t get_table_oid(const std::string &table_name) const;
+  [[nodiscard]] std::vector<std::string> get_table_names() const;
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Index Management
+  // ─────────────────────────────────────────────────────────────────────────
 
   /**
-   * @brief Get all table names
-   * @return Vector of table names
+   * @brief Create an index on a column
+   * @param index_name Name of the index
+   * @param table_name Table to index
+   * @param column_name Column to index
+   * @return Status::Ok() on success
    */
-  [[nodiscard]] std::vector<std::string> get_table_names() const;
+  [[nodiscard]] Status create_index(const std::string &index_name,
+                                    const std::string &table_name,
+                                    const std::string &column_name);
+
+  /**
+   * @brief Get index info by name
+   */
+  [[nodiscard]] IndexInfo *get_index(const std::string &index_name);
+  [[nodiscard]] const IndexInfo *get_index(const std::string &index_name) const;
+
+  /**
+   * @brief Get index for a specific column
+   * @return IndexInfo if column has an index, nullptr otherwise
+   */
+  [[nodiscard]] IndexInfo *get_index_for_column(oid_t table_oid,
+                                                column_id_t column_id);
+  [[nodiscard]] const IndexInfo *
+  get_index_for_column(oid_t table_oid, column_id_t column_id) const;
+
+  /**
+   * @brief Get all indexes for a table
+   */
+  [[nodiscard]] std::vector<IndexInfo *> get_table_indexes(oid_t table_oid);
 
   // ─────────────────────────────────────────────────────────────────────────
   // Accessors
   // ─────────────────────────────────────────────────────────────────────────
 
-  /**
-   * @brief Get the buffer pool manager
-   */
   [[nodiscard]] std::shared_ptr<BufferPoolManager> buffer_pool() const {
     return buffer_pool_;
   }
@@ -141,6 +141,8 @@ private:
   std::shared_ptr<BufferPoolManager> buffer_pool_;
   std::unordered_map<std::string, oid_t> table_names_; ///< Name -> OID mapping
   std::unordered_map<oid_t, TableInfo> tables_;        ///< OID -> TableInfo
+  std::unordered_map<std::string, oid_t> index_names_; ///< Name -> OID mapping
+  std::unordered_map<oid_t, IndexInfo> indexes_;       ///< OID -> IndexInfo
   oid_t next_oid_ = 1;
 };
 
