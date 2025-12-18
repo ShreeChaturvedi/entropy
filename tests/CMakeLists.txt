@@ -23,6 +23,7 @@ add_executable(storage_tests
     storage/b_plus_tree_page_test.cpp
     storage/b_plus_tree_test.cpp
     storage/hash_index_test.cpp
+    storage/page_compression_test.cpp
 )
 
 target_link_libraries(storage_tests
