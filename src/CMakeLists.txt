@@ -36,7 +36,6 @@ add_library(entropy_storage STATIC
     storage/table_page.cpp
     storage/table_heap.cpp
     storage/b_plus_tree.cpp
-    storage/hash_index.cpp
 )
 
 target_include_directories(entropy_storage
