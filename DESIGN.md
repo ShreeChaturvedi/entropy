@@ -336,9 +336,11 @@ entropy/
 | FilterExecutor | ✅ Complete | `filter.hpp` | `filter.cpp` | 1 passing |
 | ProjectionExecutor | ✅ Complete | `projection.hpp` | `projection.cpp` | 1 passing |
 | NestedLoopJoin | ✅ Complete | `nested_loop_join.hpp` | `nested_loop_join.cpp` | 3 passing |
-| HashJoin | ⭕ Not Started | stub | stub | - |
+| HashJoin | ✅ Complete | `hash_join.hpp` | `hash_join.cpp` | 2 passing |
 | Aggregation | ✅ Complete | `aggregation.hpp` | `aggregation.cpp` | 5 passing |
-| IndexScanExecutor | ⭕ Not Started | stub | stub | - |
+| SortExecutor | ✅ Complete | `sort_executor.hpp` | `sort_executor.cpp` | 2 passing |
+| LimitExecutor | ✅ Complete | `limit_executor.hpp` | `limit_executor.cpp` | 3 passing |
+| IndexScanExecutor | ✅ Complete | `index_scan_executor.hpp` | `index_scan_executor.cpp` | 4 passing |
 
 ### Optimizer Layer
 | Component | Status | Header | Implementation | Tests |
@@ -561,6 +563,60 @@ Leaf Node:
   - Empty table edge case: COUNT(*)=0, SUM=NULL
 - **Trade-offs**: Unordered output (ORDER BY would require separate sort)
 
+#### ADR-009: Sort Executor (ORDER BY)
+- **Context**: Implementing ORDER BY clause for result ordering
+- **Decision**: std::sort (introsort) with custom comparator
+- **Rationale**:
+  - O(n log n) guaranteed time complexity
+  - In-place sorting minimizes memory overhead
+  - Custom comparator supports multi-column sort with mixed ASC/DESC
+- **Implementation Notes**:
+  - NULL handling: NULLs sort first in ASC, last in DESC (SQL standard)
+  - Materialize-then-emit pattern for volcano model compatibility
+  - Type-aware comparison: numeric, string, boolean
+- **Trade-offs**: Requires full materialization (O(n) memory)
+
+#### ADR-010: Limit Executor (LIMIT/OFFSET)
+- **Context**: Implementing LIMIT and OFFSET clauses
+- **Decision**: Streaming O(1) per-tuple implementation
+- **Rationale**:
+  - No materialization required - streams results
+  - O(1) space complexity regardless of LIMIT value
+  - OFFSET skipping without storing skipped tuples
+- **Implementation Notes**:
+  - Counter-based tracking (skipped, returned counts)
+  - Early termination when LIMIT reached
+  - Handles edge cases: OFFSET > row count, no LIMIT
+- **Trade-offs**: Must be applied after ORDER BY (if present)
+
+#### ADR-011: Hash Join (Equi-Joins)
+- **Context**: Performance optimization for equi-joins (key = key)
+- **Decision**: Classic build/probe hash join algorithm
+- **Rationale**:
+  - O(n + m) time complexity vs O(n × m) for nested loop
+  - Optimal for large table joins on equality conditions
+  - unordered_multimap handles duplicate keys efficiently
+- **Implementation Notes**:
+  - Build phase: Hash smaller (left) table into memory
+  - Probe phase: Stream larger (right) table, O(1) lookups
+  - FNV-1a inspired hashing for TupleValue keys
+  - Supports INNER, LEFT, RIGHT joins
+- **Trade-offs**: Requires build side to fit in memory
+
+#### ADR-012: Index Scan Executor
+- **Context**: Leveraging B+ tree indexes for efficient queries
+- **Decision**: Three scan modes with B+ tree iterator integration
+- **Rationale**:
+  - Point lookup: O(log n) - optimal for equality conditions
+  - Range scan: O(log n + k) - efficient for range predicates
+  - Full scan: O(n) via leaf sibling pointers
+- **Implementation Notes**:
+  - Uses lower_bound() for O(log n) seek
+  - RID-to-tuple lookup via TableHeap with buffer pool (O(1))
+  - Graceful handling of deleted tuples (continue to next)
+  - Three modes: POINT_LOOKUP, RANGE_SCAN, FULL_SCAN
+- **Trade-offs**: Index must exist and be maintained
+
 ---
 
 ## File Dependencies Graph
@@ -623,5 +679,5 @@ execution/executor.hpp
 
 ---
 
-*Last Updated: [Date of last update]*
+*Last Updated: 2024-12-17*
 *Version: 0.1.0*
