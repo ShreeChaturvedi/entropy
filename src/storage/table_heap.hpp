@@ -81,13 +81,18 @@ public:
    * @brief Update a tuple in the table
    * @param tuple New tuple data
    * @param rid Record ID of tuple to update
+   * @param new_rid Optional output: if non-null and RID changed, receives new
+   * RID
    * @return Status::Ok() on success, Status::NotFound() if RID invalid
    *
-   * Note: If the new tuple is too large for in-place update,
-   * this will delete the old tuple and insert the new one,
-   * potentially returning a different RID.
+   * If the new tuple is too large for in-place update, this will delete
+   * the old tuple and insert the new one at a different location.
+   * If new_rid is provided, it will be set to the new location.
+   * If new_rid is null and the tuple must be moved, this still succeeds
+   * but the caller won't know the new location.
    */
-  [[nodiscard]] Status update_tuple(const Tuple &tuple, const RID &rid);
+  [[nodiscard]] Status update_tuple(const Tuple &tuple, const RID &rid,
+                                    RID *new_rid = nullptr);
 
   /**
    * @brief Get a tuple by RID
@@ -153,7 +158,7 @@ private:
   std::shared_ptr<BufferPoolManager> buffer_pool_;
   page_id_t first_page_id_ = INVALID_PAGE_ID;
   page_id_t last_page_id_ = INVALID_PAGE_ID;
-  mutable std::shared_mutex mutex_;  /// Protects table heap operations
+  mutable std::shared_mutex mutex_; /// Protects table heap operations
 };
 
 /**
