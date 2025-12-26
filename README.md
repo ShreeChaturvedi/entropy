@@ -23,15 +23,23 @@ ACID transactions, write-ahead logging, and a cost-based query optimizer.
 - Benchmarks with optional SQLite comparison and reproducible scripts.
 - Cross-platform CMake build with Linux/macOS/Windows CI.
 
-## Performance Snapshot
+## Architecture
+
+<p align="center">
+  <img src="docs/diagrams/architecture-light.svg#gh-light-mode-only" width="860" alt="Entropy architecture diagram">
+  <img src="docs/diagrams/architecture-dark.svg#gh-dark-mode-only" width="860" alt="Entropy architecture diagram">
+</p>
+
+## Performance Snapshot (vs SQLite)
 
 Run file: `docs/benchmarks/runs/bench-<timestamp>.json`
 
 - Machine: _populate from your benchmark run_
 - Compiler: _populate from your benchmark run_
 - Build: Release (`-O3`)
+SQLite baselines are collected when `ENTROPY_BENCH_COMPARE_SQLITE=ON`.
 
-Median ns/op (ratio = Entropy / SQLite):
+Median (p50) ns/op (ratio = Entropy / SQLite, lower is better):
 
 | Case | Entropy (ns/op) | SQLite (ns/op) | Ratio |
 | --- | --- | --- | --- |
@@ -43,19 +51,21 @@ Full results: `docs/benchmarks/bench_summary.csv`
 ## Benchmarks
 
 ```bash
-cmake --preset bench
-cmake --build --preset bench
-./build/bench/benchmarks/entropy_bench --benchmark_format=json \
-  --benchmark_out=docs/benchmarks/runs/bench-<timestamp>.json
-python3 scripts/bench/summarize.py \
-  docs/benchmarks/runs/bench-<timestamp>.json \
-  docs/benchmarks/bench_summary.csv
+./scripts/bench/run.sh
 ```
 
-SQLite comparison requires `ENTROPY_BENCH_COMPARE_SQLITE=ON` and a system
-SQLite3 development package.
+Windows:
 
-Detailed methodology and scripts: `docs/benchmarks.md` and `scripts/bench/`.
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/bench/run.ps1
+```
+
+The script writes a timestamped JSON run file in `docs/benchmarks/runs/` and
+updates `docs/benchmarks/bench_summary.csv`.
+
+SQLite comparison requires `ENTROPY_BENCH_COMPARE_SQLITE=ON` and a system
+SQLite3 development package. Manual steps and methodology are in
+`docs/benchmarks.md`.
 
 ## Quick Start
 
