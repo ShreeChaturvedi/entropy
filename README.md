@@ -1,185 +1,136 @@
-# Entropy
+<p align="center">
+  <img src="docs/branding/readme-light.svg#gh-light-mode-only" width="860" alt="Entropy Database Engine">
+  <img src="docs/branding/readme-dark.svg#gh-dark-mode-only" width="860" alt="Entropy Database Engine">
+</p>
 
-A high-performance relational database engine built from scratch in modern C++20.
+---
 
-Entropy is a fully-featured RDBMS implementation demonstrating core database internals including a custom B+ tree storage engine, MVCC-based transaction management, cost-based query optimization, and ACID-compliant transaction processing with write-ahead logging.
+[![ci](https://github.com/ShreeChaturvedi/entropy/actions/workflows/ci.yml/badge.svg)](https://github.com/ShreeChaturvedi/entropy/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/ShreeChaturvedi/entropy?include_prereleases)](https://github.com/ShreeChaturvedi/entropy/releases)
+[![license](https://img.shields.io/github/license/ShreeChaturvedi/entropy)](LICENSE)
+[![c++](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
 
-## Features
+Entropy is a high-performance relational database engine built from scratch in
+modern C++20. It showcases core database internals: B+ tree storage, MVCC,
+ACID transactions, write-ahead logging, and a cost-based query optimizer.
 
-### Storage Engine
-- **B+ Tree Indexes** - Disk-based B+ tree implementation with efficient range scans
-- **Hash Indexes** - O(1) point lookups using extendible hashing
-- **Buffer Pool Manager** - Page caching with LRU eviction policy
-- **Slotted Page Format** - Variable-length record support
+## Highlights
 
-### Transaction Processing
-- **MVCC** - Multi-version concurrency control for snapshot isolation
-- **ACID Compliance** - Full atomicity, consistency, isolation, and durability guarantees
-- **Write-Ahead Logging** - Crash recovery with REDO/UNDO logging
-- **Lock Manager** - Two-phase locking with deadlock detection
+- End-to-end SQL engine: parser, binder, optimizer, execution.
+- Storage engine with B+ trees, hash indexes, and buffer pool caching.
+- MVCC + WAL for snapshot isolation and crash recovery.
+- Unit and integration tests wired to CTest + GoogleTest.
+- Benchmarks with optional SQLite comparison and reproducible scripts.
+- Cross-platform CMake build with Linux/macOS/Windows CI.
 
-### Query Processing
-- **SQL Support** - SELECT, INSERT, UPDATE, DELETE with JOINs
-- **Join Algorithms** - Nested loop join and hash join implementations
-- **Aggregations** - COUNT, SUM, AVG, MIN, MAX, GROUP BY
-- **Query Optimizer** - Cost-based optimization with statistics
+## Performance Snapshot
 
-## Architecture
+Run file: `docs/benchmarks/runs/bench-<timestamp>.json`
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        SQL Interface                            │
-├─────────────────────────────────────────────────────────────────┤
-│                     Parser → Binder → Optimizer                 │
-├─────────────────────────────────────────────────────────────────┤
-│                     Execution Engine                            │
-│         (SeqScan, IndexScan, HashJoin, Aggregate, etc.)        │
-├─────────────────────────────────────────────────────────────────┤
-│              Transaction Manager (MVCC + WAL)                   │
-├─────────────────────────────────────────────────────────────────┤
-│                   Catalog (Schema Metadata)                     │
-├─────────────────────────────────────────────────────────────────┤
-│               Storage (B+ Tree, Table Heap, Tuple)              │
-├─────────────────────────────────────────────────────────────────┤
-│                  Buffer Pool (LRU Cache)                        │
-├─────────────────────────────────────────────────────────────────┤
-│                     Disk Manager                                │
-└─────────────────────────────────────────────────────────────────┘
-```
+- Machine: _populate from your benchmark run_
+- Compiler: _populate from your benchmark run_
+- Build: Release (`-O3`)
 
-## Building
+Median ns/op (ratio = Entropy / SQLite):
 
-### Prerequisites
-- C++20 compatible compiler (GCC 10+, Clang 12+, MSVC 19.29+)
-- CMake 3.20 or higher
-- Git
+| Case | Entropy (ns/op) | SQLite (ns/op) | Ratio |
+| --- | --- | --- | --- |
+| Insert batch (1k rows, txn) | `TBD` | `TBD` | `TBD` |
+| Point select (10k rows) | `TBD` | `TBD` | `TBD` |
 
-### Build Instructions
+Full results: `docs/benchmarks/bench_summary.csv`
+
+## Benchmarks
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/entropy.git
-cd entropy
-
-# Create build directory
-mkdir build && cd build
-
-# Configure and build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make -j$(nproc)
-
-# Run tests
-ctest --output-on-failure
+cmake --preset bench
+cmake --build --preset bench
+./build/bench/benchmarks/entropy_bench --benchmark_format=json \
+  --benchmark_out=docs/benchmarks/runs/bench-<timestamp>.json
+python3 scripts/bench/summarize.py \
+  docs/benchmarks/runs/bench-<timestamp>.json \
+  docs/benchmarks/bench_summary.csv
 ```
 
-### Build Options
+SQLite comparison requires `ENTROPY_BENCH_COMPARE_SQLITE=ON` and a system
+SQLite3 development package.
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `ENTROPY_BUILD_TESTS` | ON | Build unit tests |
-| `ENTROPY_BUILD_BENCHMARKS` | OFF | Build performance benchmarks |
-| `ENTROPY_ENABLE_LZ4` | OFF | Enable page compression |
+Detailed methodology and scripts: `docs/benchmarks.md` and `scripts/bench/`.
 
 ## Quick Start
 
 ```cpp
 #include <entropy/entropy.hpp>
+#include <iostream>
 
 int main() {
-    // Open or create a database
     entropy::Database db("mydb.entropy");
-
-    // Execute SQL
-    db.execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(100))");
+    db.execute("CREATE TABLE users (id INT, name VARCHAR(100))");
     db.execute("INSERT INTO users VALUES (1, 'Alice')");
-    db.execute("INSERT INTO users VALUES (2, 'Bob')");
 
-    // Query with results
-    auto result = db.execute("SELECT * FROM users WHERE id = 1");
-    for (const auto& row : result) {
-        std::cout << row["name"].as_string() << std::endl;
+    auto result = db.execute("SELECT * FROM users");
+    for (const auto &row : result) {
+        std::cout << row["name"].as_string() << "\n";
     }
-
-    return 0;
 }
 ```
 
-## Project Structure
+## Build and Test
 
+### Prerequisites
+
+- C++20 compiler (GCC 10+, Clang 12+, MSVC 19.29+)
+- CMake 3.20+
+- Git
+
+### Configure + Build
+
+Dependencies (spdlog, GoogleTest, Google Benchmark) are fetched with CMake
+FetchContent on first configure (requires network access). Optional
+comparisons use system SQLite3, while compression uses LZ4 when enabled.
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
 ```
-entropy/
-├── include/entropy/     # Public API headers
-├── src/
-│   ├── common/          # Shared utilities and types
-│   ├── storage/         # Storage engine (pages, B+ tree, buffer pool)
-│   ├── catalog/         # Schema and metadata management
-│   ├── transaction/     # MVCC, WAL, lock manager
-│   ├── execution/       # Query executors
-│   ├── optimizer/       # Query optimizer
-│   ├── parser/          # SQL parsing
-│   └── api/             # Public API implementation
-├── tests/               # Unit and integration tests
-├── benchmarks/          # Performance benchmarks
-└── examples/            # Example usage
+
+### Run Tests
+
+```bash
+ctest --test-dir build --output-on-failure -C Release
 ```
 
-## Technical Highlights
+### CMake Presets
 
-### B+ Tree Implementation
-- Supports variable-length keys
-- Efficient range scans with leaf node linking
-- Node splitting and merging for balanced tree maintenance
-- Configurable fan-out for performance tuning
+```bash
+cmake --preset dev
+cmake --build --preset dev
+ctest --preset dev
+```
 
-### Buffer Pool Manager
-- LRU replacement policy with pin counting
-- Dirty page tracking for efficient flushing
-- Thread-safe page access with latching
+## Build Options
 
-### MVCC
-- Snapshot isolation for consistent reads
-- Version chains for concurrent access
-- Garbage collection of old versions
+| Option | Default | Description |
+| --- | --- | --- |
+| `ENTROPY_BUILD_TESTS` | ON | Build unit + integration tests |
+| `ENTROPY_BUILD_BENCHMARKS` | OFF | Build benchmarks |
+| `ENTROPY_BENCH_COMPARE_SQLITE` | OFF | Build SQLite comparison benchmarks |
+| `ENTROPY_BUILD_EXAMPLES` | ON | Build example programs |
+| `ENTROPY_ENABLE_LZ4` | OFF | Enable page compression (LZ4) |
 
-### Write-Ahead Logging
-- ARIES-style recovery protocol
-- Group commit optimization
-- Checkpointing for faster recovery
+LZ4 compression tests are only built when `ENTROPY_ENABLE_LZ4=ON`.
+
+## CI/CD and Releases
+
+- CI builds and tests on Linux/macOS/Windows via GitHub Actions.
+- Releases are created automatically on `v*` tags with OS-specific binaries.
 
 ## Documentation
 
-- [Design Document](DESIGN.md) - Architecture decisions and component details
-- [Progress Tracker](PROGRESS.md) - Development status and roadmap
-
-## Testing
-
-```bash
-# Run all tests
-cd build && ctest --output-on-failure
-
-# Run specific test suite
-./tests/storage_tests
-./tests/transaction_tests
-
-# Run with verbose output
-ctest -V
-```
-
-## Contributing
-
-This is a personal project for learning and demonstration purposes. If you find bugs or have suggestions, feel free to open an issue.
+- `DESIGN.md` -- architecture notes and component details
+- `docs/benchmarks.md` -- benchmark methodology and reporting
+- `PROGRESS.md` -- roadmap and status updates
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
-
-## Acknowledgments
-
-This project was inspired by:
-- [CMU 15-445/645 Database Systems](https://15445.courses.cs.cmu.edu/)
-- [SQLite](https://www.sqlite.org/)
-- [LevelDB](https://github.com/google/leveldb)
-
----
-
-*Built with modern C++20 to demonstrate database internals and systems programming.*
+MIT -- see `LICENSE`.

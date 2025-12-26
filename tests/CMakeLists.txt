@@ -12,7 +12,7 @@ target_include_directories(test_utils INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/comm
 # Storage Tests
 # ─────────────────────────────────────────────────────────────────────────────
 
-add_executable(storage_tests
+set(storage_test_sources
     storage/page_test.cpp
     storage/disk_manager_test.cpp
     storage/buffer_pool_test.cpp
@@ -23,8 +23,13 @@ add_executable(storage_tests
     storage/b_plus_tree_page_test.cpp
     storage/b_plus_tree_test.cpp
     storage/hash_index_test.cpp
-    storage/page_compression_test.cpp
 )
+
+if(ENTROPY_ENABLE_LZ4)
+    list(APPEND storage_test_sources storage/page_compression_test.cpp)
+endif()
+
+add_executable(storage_tests ${storage_test_sources})
 
 target_link_libraries(storage_tests
     PRIVATE
@@ -151,4 +156,3 @@ target_link_libraries(optimizer_tests
 )
 
 gtest_discover_tests(optimizer_tests)
-
