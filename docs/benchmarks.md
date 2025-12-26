@@ -12,6 +12,21 @@ workloads that include SQL parsing, execution, and disk-backed persistence.
 SQLite comparisons are compiled only when `ENTROPY_BENCH_COMPARE_SQLITE=ON`
 **and** a system SQLite3 development package is available.
 
+## Quick Start
+
+```bash
+./scripts/bench/run.sh
+```
+
+Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/bench/run.ps1
+```
+
+The script writes a timestamped JSON run file in `docs/benchmarks/runs/` and
+updates `docs/benchmarks/bench_summary.csv`.
+
 ## Run Benchmarks (Unix)
 
 ```bash
@@ -29,12 +44,6 @@ cmake --build build/bench --config Release
 python3 scripts/bench/summarize.py \
   docs/benchmarks/runs/bench-<timestamp>.json \
   docs/benchmarks/bench_summary.csv
-```
-
-Or use the helper script:
-
-```bash
-./scripts/bench/run.sh
 ```
 
 ## Run Benchmarks (Windows)
@@ -56,11 +65,12 @@ python scripts/bench/summarize.py `
   docs/benchmarks/bench_summary.csv
 ```
 
-Or use the helper script:
+## Metrics
 
-```powershell
-./scripts/bench/run.ps1
-```
+The summary captures p50 latency in `ns/op` (Google Benchmark `real_time`)
+because it is stable for microbenchmarks and easy to compare. For
+system-level reporting, consider adding throughput (`ops/sec`) and higher
+percentiles (p95/p99) if you expand the harness.
 
 ## Reporting
 
