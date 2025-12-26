@@ -42,6 +42,9 @@ coverage/
 # Logs
 *.log
 
+# Benchmark outputs
+docs/benchmarks/runs/*.json
+
 # Dependencies (if manually added)
 third_party/*/
 !third_party/README.md
