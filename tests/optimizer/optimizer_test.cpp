@@ -51,9 +51,9 @@ protected:
   void insert_test_data() {
     for (int i = 1; i <= 100; ++i) {
       std::vector<TupleValue> values = {
-          TupleValue(static_cast<int32_t>(i)),
+          TupleValue(i),
           TupleValue("User" + std::to_string(i)),
-          TupleValue(static_cast<int32_t>(20 + (i % 50))),
+          TupleValue(20 + (i % 50)),
       };
       Tuple tuple(values, output_schema_);
       RID rid;
@@ -90,8 +90,7 @@ TEST_F(OptimizerTest, CollectStatistics) {
 TEST_F(OptimizerTest, PredicateSelectivity) {
   auto eq_expr = std::make_unique<ComparisonExpression>(
       ComparisonType::EQUAL, std::make_unique<ColumnRefExpression>("id"),
-      std::make_unique<ConstantExpression>(
-          TupleValue(static_cast<int32_t>(1))));
+      std::make_unique<ConstantExpression>(TupleValue(1)));
 
   double sel =
       statistics_->estimate_selectivity(table_info_->oid, eq_expr.get());
@@ -149,8 +148,7 @@ TEST_F(OptimizerTest, SelectAccessMethodWithIndex) {
 
   auto predicate = std::make_unique<ComparisonExpression>(
       ComparisonType::EQUAL, std::make_unique<ColumnRefExpression>("id"),
-      std::make_unique<ConstantExpression>(
-          TupleValue(static_cast<int32_t>(42))));
+      std::make_unique<ConstantExpression>(TupleValue(42)));
 
   auto selection =
       index_selector_->select_access_method(table_info_->oid, predicate.get());

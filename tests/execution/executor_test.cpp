@@ -58,18 +58,18 @@ protected:
   void insert_test_data() {
     std::vector<Tuple> tuples;
     tuples.emplace_back(
-        std::vector<TupleValue>{TupleValue(int32_t(1)),
+        std::vector<TupleValue>{TupleValue(1),
                                 TupleValue(std::string("Alice")),
-                                TupleValue(int32_t(25))},
+                                TupleValue(25)},
         schema_);
-    tuples.emplace_back(std::vector<TupleValue>{TupleValue(int32_t(2)),
+    tuples.emplace_back(std::vector<TupleValue>{TupleValue(2),
                                                 TupleValue(std::string("Bob")),
-                                                TupleValue(int32_t(30))},
+                                                TupleValue(30)},
                         schema_);
     tuples.emplace_back(
-        std::vector<TupleValue>{TupleValue(int32_t(3)),
+        std::vector<TupleValue>{TupleValue(3),
                                 TupleValue(std::string("Charlie")),
-                                TupleValue(int32_t(35))},
+                                TupleValue(35)},
         schema_);
 
     InsertExecutor insert(nullptr, table_info_->table_heap, std::move(tuples));
@@ -119,7 +119,7 @@ TEST_F(ExecutorTest, SeqScanWithPredicate) {
   age_col->set_type(TypeId::INTEGER);
 
   auto const_val =
-      std::make_unique<ConstantExpression>(TupleValue(int32_t(28)));
+      std::make_unique<ConstantExpression>(TupleValue(28));
 
   auto predicate = std::make_unique<ComparisonExpression>(
       ComparisonType::GREATER_THAN, std::move(age_col), std::move(const_val));
@@ -143,9 +143,9 @@ TEST_F(ExecutorTest, SeqScanWithPredicate) {
 
 TEST_F(ExecutorTest, InsertSingle) {
   std::vector<Tuple> tuples;
-  tuples.emplace_back(std::vector<TupleValue>{TupleValue(int32_t(1)),
+  tuples.emplace_back(std::vector<TupleValue>{TupleValue(1),
                                               TupleValue(std::string("Test")),
-                                              TupleValue(int32_t(20))},
+                                              TupleValue(20)},
                       schema_);
 
   InsertExecutor insert(nullptr, table_info_->table_heap, std::move(tuples));
@@ -167,9 +167,9 @@ TEST_F(ExecutorTest, InsertMultiple) {
   for (int i = 0; i < 5; i++) {
     tuples.emplace_back(
         std::vector<TupleValue>{
-            TupleValue(int32_t(i)),
-            TupleValue(std::string("User" + std::to_string(i))),
-            TupleValue(int32_t(20 + i))},
+            TupleValue(i),
+            TupleValue("User" + std::to_string(i)),
+            TupleValue(20 + i)},
         schema_);
   }
 
@@ -231,7 +231,7 @@ TEST_F(ExecutorTest, FilterTuples) {
   id_col->set_column_index(0);
   id_col->set_type(TypeId::INTEGER);
 
-  auto const_val = std::make_unique<ConstantExpression>(TupleValue(int32_t(2)));
+  auto const_val = std::make_unique<ConstantExpression>(TupleValue(2));
 
   auto predicate = std::make_unique<ComparisonExpression>(
       ComparisonType::EQUAL, std::move(id_col), std::move(const_val));
@@ -289,7 +289,7 @@ TEST_F(ExecutorTest, UpdateTuples) {
   auto id_col = std::make_unique<ColumnRefExpression>("id");
   id_col->set_column_index(0);
   id_col->set_type(TypeId::INTEGER);
-  auto const_val = std::make_unique<ConstantExpression>(TupleValue(int32_t(2)));
+  auto const_val = std::make_unique<ConstantExpression>(TupleValue(2));
   auto predicate = std::make_unique<ComparisonExpression>(
       ComparisonType::EQUAL, std::move(id_col), std::move(const_val));
 
@@ -300,7 +300,7 @@ TEST_F(ExecutorTest, UpdateTuples) {
   std::vector<size_t> col_indices = {2}; // age column
   std::vector<std::unique_ptr<Expression>> values;
   values.push_back(
-      std::make_unique<ConstantExpression>(TupleValue(int32_t(99))));
+      std::make_unique<ConstantExpression>(TupleValue(99)));
 
   UpdateExecutor update(nullptr, std::move(child), table_info_->table_heap,
                         &schema_, std::move(col_indices), std::move(values));
@@ -368,14 +368,14 @@ protected:
   void insert_users() {
     std::vector<Tuple> tuples;
     tuples.emplace_back(
-        std::vector<TupleValue>{TupleValue(int32_t(1)),
+        std::vector<TupleValue>{TupleValue(1),
                                 TupleValue(std::string("Alice"))},
         users_schema_);
-    tuples.emplace_back(std::vector<TupleValue>{TupleValue(int32_t(2)),
+    tuples.emplace_back(std::vector<TupleValue>{TupleValue(2),
                                                 TupleValue(std::string("Bob"))},
                         users_schema_);
     tuples.emplace_back(
-        std::vector<TupleValue>{TupleValue(int32_t(3)),
+        std::vector<TupleValue>{TupleValue(3),
                                 TupleValue(std::string("Charlie"))},
         users_schema_);
 
@@ -387,22 +387,22 @@ protected:
   void insert_orders() {
     std::vector<Tuple> tuples;
     // Alice has 2 orders, Bob has 1, Charlie has none
-    tuples.emplace_back(std::vector<TupleValue>{TupleValue(int32_t(101)),
-                                                TupleValue(int32_t(1)),
-                                                TupleValue(int32_t(100))},
+    tuples.emplace_back(std::vector<TupleValue>{TupleValue(101),
+                                                TupleValue(1),
+                                                TupleValue(100)},
                         orders_schema_);
-    tuples.emplace_back(std::vector<TupleValue>{TupleValue(int32_t(102)),
-                                                TupleValue(int32_t(1)),
-                                                TupleValue(int32_t(200))},
+    tuples.emplace_back(std::vector<TupleValue>{TupleValue(102),
+                                                TupleValue(1),
+                                                TupleValue(200)},
                         orders_schema_);
-    tuples.emplace_back(std::vector<TupleValue>{TupleValue(int32_t(103)),
-                                                TupleValue(int32_t(2)),
-                                                TupleValue(int32_t(150))},
+    tuples.emplace_back(std::vector<TupleValue>{TupleValue(103),
+                                                TupleValue(2),
+                                                TupleValue(150)},
                         orders_schema_);
     // Order 104 for user_id 99 (no matching user)
-    tuples.emplace_back(std::vector<TupleValue>{TupleValue(int32_t(104)),
-                                                TupleValue(int32_t(99)),
-                                                TupleValue(int32_t(50))},
+    tuples.emplace_back(std::vector<TupleValue>{TupleValue(104),
+                                                TupleValue(99),
+                                                TupleValue(50)},
                         orders_schema_);
 
     InsertExecutor insert(nullptr, orders_info_->table_heap, std::move(tuples));
@@ -550,33 +550,33 @@ protected:
     tuples.emplace_back(
         std::vector<TupleValue>{TupleValue(std::string("Laptop")),
                                 TupleValue(std::string("Electronics")),
-                                TupleValue(int32_t(1000)),
-                                TupleValue(int32_t(2))},
+                                TupleValue(1000),
+                                TupleValue(2)},
         schema_);
     tuples.emplace_back(
         std::vector<TupleValue>{TupleValue(std::string("Phone")),
                                 TupleValue(std::string("Electronics")),
-                                TupleValue(int32_t(500)),
-                                TupleValue(int32_t(5))},
+                                TupleValue(500),
+                                TupleValue(5)},
         schema_);
     // Books: Novel $20 x 10, Textbook $80 x 3
     tuples.emplace_back(
         std::vector<TupleValue>{
             TupleValue(std::string("Novel")), TupleValue(std::string("Books")),
-            TupleValue(int32_t(20)), TupleValue(int32_t(10))},
+            TupleValue(20), TupleValue(10)},
         schema_);
     tuples.emplace_back(
         std::vector<TupleValue>{TupleValue(std::string("Textbook")),
                                 TupleValue(std::string("Books")),
-                                TupleValue(int32_t(80)),
-                                TupleValue(int32_t(3))},
+                                TupleValue(80),
+                                TupleValue(3)},
         schema_);
     // Clothing: Shirt $30 x 7
     tuples.emplace_back(
         std::vector<TupleValue>{TupleValue(std::string("Shirt")),
                                 TupleValue(std::string("Clothing")),
-                                TupleValue(int32_t(30)),
-                                TupleValue(int32_t(7))},
+                                TupleValue(30),
+                                TupleValue(7)},
         schema_);
 
     InsertExecutor insert(nullptr, table_info_->table_heap, std::move(tuples));
