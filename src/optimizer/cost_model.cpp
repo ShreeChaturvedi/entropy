@@ -73,7 +73,7 @@ size_t CostModel::estimate_cardinality(const PlanNode *plan) const {
     if (scan->predicate()) {
       double sel = statistics_->estimate_selectivity(scan->table_oid(),
                                                      scan->predicate());
-      return static_cast<size_t>(base * sel);
+      return static_cast<size_t>(static_cast<double>(base) * sel);
     }
     return base;
   }
@@ -85,7 +85,8 @@ size_t CostModel::estimate_cardinality(const PlanNode *plan) const {
     case IndexScanPlanNode::ScanType::POINT_LOOKUP:
       return 1; // Single row
     case IndexScanPlanNode::ScanType::RANGE_SCAN:
-      return static_cast<size_t>(base * Statistics::RANGE_SELECTIVITY);
+      return static_cast<size_t>(static_cast<double>(base) *
+                                 Statistics::RANGE_SELECTIVITY);
     case IndexScanPlanNode::ScanType::FULL_SCAN:
       return base;
     }
@@ -95,7 +96,7 @@ size_t CostModel::estimate_cardinality(const PlanNode *plan) const {
   case PlanNodeType::FILTER: {
     // Estimate based on predicate selectivity
     double sel = Statistics::DEFAULT_SELECTIVITY;
-    return static_cast<size_t>(child_card * sel);
+    return static_cast<size_t>(static_cast<double>(child_card) * sel);
   }
 
   case PlanNodeType::LIMIT: {
@@ -112,7 +113,8 @@ size_t CostModel::estimate_cardinality(const PlanNode *plan) const {
     if (plan->children().size() >= 2) {
       size_t left_card = estimate_cardinality(plan->children()[0].get());
       size_t right_card = estimate_cardinality(plan->children()[1].get());
-      return static_cast<size_t>(left_card * right_card *
+      return static_cast<size_t>(static_cast<double>(left_card) *
+                                 static_cast<double>(right_card) *
                                  Statistics::EQUALITY_SELECTIVITY);
     }
     return child_card;
@@ -128,11 +130,11 @@ double CostModel::cost_seq_scan(const SeqScanPlanNode *node) const {
   // Estimate pages: ~100 bytes per row, 4KB pages
   size_t pages = std::max<size_t>(1, (rows * 100) / 4096);
 
-  double io_cost = pages * SEQ_PAGE_COST;
-  double cpu_cost = rows * TUPLE_CPU_COST;
+  double io_cost = static_cast<double>(pages) * SEQ_PAGE_COST;
+  double cpu_cost = static_cast<double>(rows) * TUPLE_CPU_COST;
 
   if (node->predicate()) {
-    cpu_cost += rows * TUPLE_CPU_COST; // Extra cost for predicate eval
+    cpu_cost += static_cast<double>(rows) * TUPLE_CPU_COST;
   }
 
   return io_cost + cpu_cost;
@@ -143,7 +145,8 @@ double CostModel::cost_index_scan(const IndexScanPlanNode *node) const {
 
   // Index seek cost: O(log n)
   double seek_cost =
-      std::log2(std::max<size_t>(1, total_rows)) * RANDOM_PAGE_COST;
+      std::log2(static_cast<double>(std::max<size_t>(1, total_rows))) *
+      RANDOM_PAGE_COST;
 
   size_t matching_rows = 0;
   switch (node->scan_type()) {
@@ -152,7 +155,8 @@ double CostModel::cost_index_scan(const IndexScanPlanNode *node) const {
     break;
   case IndexScanPlanNode::ScanType::RANGE_SCAN:
     matching_rows =
-        static_cast<size_t>(total_rows * Statistics::RANGE_SELECTIVITY);
+        static_cast<size_t>(static_cast<double>(total_rows) *
+                            Statistics::RANGE_SELECTIVITY);
     break;
   case IndexScanPlanNode::ScanType::FULL_SCAN:
     matching_rows = total_rows;
@@ -160,7 +164,7 @@ double CostModel::cost_index_scan(const IndexScanPlanNode *node) const {
   }
 
   // Fetch cost: random I/O for each RID
-  double fetch_cost = matching_rows * INDEX_TUPLE_COST;
+  double fetch_cost = static_cast<double>(matching_rows) * INDEX_TUPLE_COST;
 
   return seek_cost + fetch_cost;
 }
@@ -170,7 +174,7 @@ double CostModel::cost_filter(const FilterPlanNode *node) const {
   if (!node->children().empty()) {
     input_rows = estimate_cardinality(node->children()[0].get());
   }
-  return input_rows * TUPLE_CPU_COST;
+  return static_cast<double>(input_rows) * TUPLE_CPU_COST;
 }
 
 double CostModel::cost_projection(const ProjectionPlanNode *node) const {
@@ -178,7 +182,7 @@ double CostModel::cost_projection(const ProjectionPlanNode *node) const {
   if (!node->children().empty()) {
     input_rows = estimate_cardinality(node->children()[0].get());
   }
-  return input_rows * TUPLE_CPU_COST * 0.5; // Light operation
+  return static_cast<double>(input_rows) * TUPLE_CPU_COST * 0.5;
 }
 
 double CostModel::cost_sort(const SortPlanNode *node) const {
@@ -191,7 +195,8 @@ double CostModel::cost_sort(const SortPlanNode *node) const {
     return 0.0;
 
   // O(n log n) sort cost
-  double comparisons = input_rows * std::log2(input_rows);
+  double input_rows_f = static_cast<double>(input_rows);
+  double comparisons = input_rows_f * std::log2(input_rows_f);
   return comparisons * SORT_COST;
 }
 
@@ -209,7 +214,8 @@ CostModel::cost_nested_loop_join(const NestedLoopJoinPlanNode *node) const {
   size_t right_rows = estimate_cardinality(node->children()[1].get());
 
   // O(n × m) comparisons
-  return left_rows * right_rows * JOIN_COST;
+  return static_cast<double>(left_rows) * static_cast<double>(right_rows) *
+         JOIN_COST;
 }
 
 double CostModel::cost_hash_join(const HashJoinPlanNode *node) const {
@@ -220,9 +226,9 @@ double CostModel::cost_hash_join(const HashJoinPlanNode *node) const {
   size_t probe_rows = estimate_cardinality(node->children()[1].get());
 
   // Build phase: hash all build rows
-  double build_cost = build_rows * HASH_BUILD_COST;
+  double build_cost = static_cast<double>(build_rows) * HASH_BUILD_COST;
   // Probe phase: hash lookup for each probe row
-  double probe_cost = probe_rows * HASH_QUAL_COST;
+  double probe_cost = static_cast<double>(probe_rows) * HASH_QUAL_COST;
 
   return build_cost + probe_cost;
 }
@@ -234,11 +240,11 @@ double CostModel::cost_aggregation(const AggregationPlanNode *node) const {
   }
 
   // Hash aggregation: O(n)
-  double agg_cost = input_rows * TUPLE_CPU_COST;
+  double agg_cost = static_cast<double>(input_rows) * TUPLE_CPU_COST;
 
   // GROUP BY adds hashing cost
   if (!node->group_by_columns().empty()) {
-    agg_cost += input_rows * HASH_QUAL_COST;
+    agg_cost += static_cast<double>(input_rows) * HASH_QUAL_COST;
   }
 
   return agg_cost;
