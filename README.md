@@ -33,21 +33,36 @@ ACID transactions, write-ahead logging, and a cost-based query optimizer.
 ## Architecture Details
 
 Entropy is organized as focused C++ libraries that mirror the logical
-database pipeline. The implementation favors explicit data structures and
-clear boundaries between planning, execution, concurrency, and storage.
+database pipeline. The system is split into layers with explicit boundaries.
 
-- SQL front-end: custom lexer/parser builds an AST; the binder resolves
-  names, types, and schema references with optional strict mode checks.
-- Optimizer: statistics-driven cost model builds plan nodes and chooses
-  index access paths (B+ tree for ranges, extendible hash for point lookups).
-- Execution engine: iterator-style operators for scans, joins, aggregates,
-  sorting, filtering, projection, and DML (insert/update/delete).
-- Concurrency + recovery: MVCC version chains with a lock manager for
-  transactional isolation; write-ahead logging with recovery replay.
-- Storage engine: table heap on slotted pages for variable-length tuples,
-  B+ tree indexes for ordered access, and extendible hash indexes.
-- Buffer pool: page table + LRU replacer with pin/dirty tracking; disk
-  manager handles page file and WAL I/O.
+### SQL Frontend
+
+- Lexer and parser build an AST for SELECT, INSERT, UPDATE, DELETE, and CREATE TABLE.
+- Binder resolves names and types using catalog metadata and column indexes.
+
+### Planning and Optimization
+
+- Statistics track row counts and simple selectivity estimates.
+- Cost model compares index scans and sequential scans for predicates.
+- Index selector chooses point lookup and range scan paths when an index exists.
+
+### Execution
+
+- Iterator operators for seq scan, index scan, hash join, nested loop join, sort, aggregate, filter, and limit.
+- Projection and DML executors materialize rows and apply insert, update, and delete.
+
+### Transactions and Recovery
+
+- MVCC version chains with timestamp visibility checks.
+- Lock manager enforces isolation with deadlock detection.
+- WAL records are flushed on commit and replayed on recovery.
+
+### Storage and Buffering
+
+- Slotted pages back a table heap for variable length tuples.
+- B+ tree and extendible hash indexes support range and point access.
+- Buffer pool uses an LRU replacer with pin and dirty tracking.
+- Disk manager handles page and WAL IO.
 
 ## Performance Snapshot (vs SQLite)
 
@@ -67,7 +82,12 @@ Per-iteration ns/op (ratio = Entropy / SQLite, lower is better):
 | Point select | 1k | `46,041` | `23,020` | `2.00x` |
 | Point select | 10k | `459,723` | `179,783` | `2.56x` |
 
-Rows = batch size for inserts; table cardinality for point selects.
+Rows are the batch size for inserts and the table cardinality for point selects.
+
+![Benchmark comparison chart](docs/benchmarks/charts/compare-light.svg#gh-light-mode-only)
+![Benchmark comparison chart](docs/benchmarks/charts/compare-dark.svg#gh-dark-mode-only)
+
+Chart units are microseconds per op. The insert and point select panels use different y axis ranges.
 
 Full results: `docs/benchmarks/bench_summary.csv`
 
@@ -161,9 +181,9 @@ LZ4 compression tests are only built when `ENTROPY_ENABLE_LZ4=ON`.
 
 ## Documentation
 
-- `DESIGN.md` -- architecture notes and component details
-- `docs/benchmarks.md` -- benchmark methodology and reporting
+- `DESIGN.md` for architecture notes and component details
+- `docs/benchmarks.md` for benchmark methodology and reporting
 
 ## License
 
-MIT -- see `LICENSE`.
+MIT. See `LICENSE`.

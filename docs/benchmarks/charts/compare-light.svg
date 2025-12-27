@@ -1,0 +1,70 @@
+<svg width="940" height="540" viewBox="0 0 940 540" xmlns="http://www.w3.org/2000/svg">
+  <rect x="40" y="30" width="860" height="220" rx="16" fill="#F8FAFC" stroke="#CBD5E1" />
+  <rect x="40" y="290" width="860" height="220" rx="16" fill="#F8FAFC" stroke="#CBD5E1" />
+
+  <g font-family="Space Grotesk, Segoe UI, Helvetica, Arial, sans-serif" fill="#0F172A">
+    <text x="60" y="62" font-size="18" font-weight="600">Insert batch (us per op)</text>
+    <text x="60" y="322" font-size="18" font-weight="600">Point select (us per op)</text>
+
+    <g font-size="12" fill="#475569">
+      <text x="86" y="94">10k</text>
+      <text x="86" y="149">5k</text>
+      <text x="96" y="204">0</text>
+
+      <text x="96" y="344">500</text>
+      <text x="96" y="399">250</text>
+      <text x="104" y="454">0</text>
+    </g>
+
+    <g stroke="#E2E8F0" stroke-width="1">
+      <line x1="140" y1="90" x2="800" y2="90" />
+      <line x1="140" y1="145" x2="800" y2="145" />
+      <line x1="140" y1="200" x2="800" y2="200" />
+
+      <line x1="140" y1="340" x2="800" y2="340" />
+      <line x1="140" y1="395" x2="800" y2="395" />
+      <line x1="140" y1="450" x2="800" y2="450" />
+    </g>
+
+    <g font-size="12" fill="#334155">
+      <text x="230" y="220" text-anchor="middle">1k rows</text>
+      <text x="560" y="220" text-anchor="middle">10k rows</text>
+
+      <text x="230" y="470" text-anchor="middle">1k rows</text>
+      <text x="560" y="470" text-anchor="middle">10k rows</text>
+    </g>
+
+    <g font-size="12" font-weight="600">
+      <rect x="640" y="52" width="12" height="12" fill="#111827" />
+      <text x="660" y="62">Entropy</text>
+      <rect x="730" y="52" width="12" height="12" fill="#94A3B8" />
+      <text x="750" y="62">SQLite</text>
+    </g>
+
+    <g fill="#111827">
+      <rect x="215" y="189.6" width="80" height="10.4" rx="4" />
+      <rect x="545" y="93.4" width="80" height="106.6" rx="4" />
+      <rect x="215" y="439.9" width="80" height="10.1" rx="4" />
+      <rect x="545" y="348.9" width="80" height="101.1" rx="4" />
+    </g>
+
+    <g fill="#94A3B8">
+      <rect x="315" y="188.5" width="80" height="11.5" rx="4" />
+      <rect x="645" y="123.1" width="80" height="76.9" rx="4" />
+      <rect x="315" y="444.9" width="80" height="5.1" rx="4" />
+      <rect x="645" y="410.4" width="80" height="39.6" rx="4" />
+    </g>
+
+    <g font-size="11" fill="#0F172A">
+      <text x="255" y="182" text-anchor="middle">941</text>
+      <text x="355" y="182" text-anchor="middle">1,048</text>
+      <text x="585" y="86" text-anchor="middle">9,694</text>
+      <text x="685" y="116" text-anchor="middle">6,992</text>
+
+      <text x="255" y="433" text-anchor="middle">46</text>
+      <text x="355" y="439" text-anchor="middle">23</text>
+      <text x="585" y="342" text-anchor="middle">460</text>
+      <text x="685" y="404" text-anchor="middle">180</text>
+    </g>
+  </g>
+</svg>
