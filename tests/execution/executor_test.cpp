@@ -886,7 +886,7 @@ class IndexScanTest : public ::testing::Test {
 protected:
   void SetUp() override {
     temp_file_ = std::make_unique<test::TempFile>("index_scan_test");
-    disk_manager_ = std::make_shared<DiskManager>(temp_file_->path());
+    disk_manager_ = std::make_shared<DiskManager>(temp_file_->string());
     buffer_pool_ = std::make_shared<BufferPoolManager>(16, disk_manager_);
     catalog_ = std::make_unique<Catalog>(buffer_pool_);
 

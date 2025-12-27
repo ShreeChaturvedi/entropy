@@ -56,7 +56,8 @@ TEST_F(DatabaseTest, NestedTransaction) {
   status = db.begin_transaction();
   EXPECT_FALSE(status.ok());
 
-  db.rollback();
+  status = db.rollback();
+  EXPECT_TRUE(status.ok());
 }
 
 TEST_F(DatabaseTest, CommitWithoutTransaction) {
