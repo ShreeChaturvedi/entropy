@@ -37,7 +37,7 @@ AggregationExecutor::AggregationExecutor(
 
   // Add aggregate result columns (all aggregates produce numeric output)
   for (const auto &agg : aggregates_) {
-    TypeId output_type;
+    TypeId output_type = TypeId::DOUBLE;
     switch (agg.type) {
     case AggregateType::COUNT_STAR:
     case AggregateType::COUNT:
@@ -66,6 +66,9 @@ AggregationExecutor::AggregationExecutor(
       } else {
         output_type = TypeId::DOUBLE;
       }
+      break;
+    default:
+      output_type = TypeId::DOUBLE;
       break;
     }
     output_cols.emplace_back(agg.alias, output_type);
