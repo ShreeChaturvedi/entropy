@@ -55,7 +55,6 @@ entropy/
 ├── CMakeLists.txt              # Root CMake configuration
 ├── README.md                   # Project overview for GitHub
 ├── DESIGN.md                   # This file - architecture decisions
-├── PROGRESS.md                 # Development progress tracking
 ├── LICENSE                     # MIT License
 │
 ├── cmake/                      # CMake modules and config

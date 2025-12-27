@@ -143,6 +143,39 @@ endif()
 if(ENTROPY_BUILD_BENCHMARKS AND ENTROPY_BENCH_COMPARE_SQLITE)
     find_package(SQLite3 QUIET)
 
+    if(NOT SQLite3_FOUND)
+        find_library(SQLite3_LIBRARY sqlite3
+            PATHS
+                /usr/lib
+                /usr/local/lib
+                /opt/homebrew/lib
+                /opt/homebrew/opt/sqlite/lib
+                /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib
+        )
+        find_path(SQLite3_INCLUDE_DIR sqlite3.h
+            PATHS
+                /opt/homebrew/opt/sqlite/include
+                ${CMAKE_OSX_SYSROOT}/usr/include
+                /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include
+                /usr/include
+                /usr/local/include
+                /opt/homebrew/include
+        )
+
+        if(SQLite3_LIBRARY AND SQLite3_INCLUDE_DIR)
+            set(SQLite3_FOUND TRUE)
+        endif()
+    endif()
+
+    if(SQLite3_FOUND)
+        if(NOT SQLite3_LIBRARIES)
+            set(SQLite3_LIBRARIES ${SQLite3_LIBRARY})
+        endif()
+        if(NOT SQLite3_INCLUDE_DIRS)
+            set(SQLite3_INCLUDE_DIRS ${SQLite3_INCLUDE_DIR})
+        endif()
+    endif()
+
     if(SQLite3_FOUND)
         if(NOT TARGET entropy_sqlite)
             add_library(entropy_sqlite INTERFACE)

@@ -25,7 +25,9 @@ powershell -ExecutionPolicy Bypass -File scripts/bench/run.ps1
 ```
 
 The script writes a timestamped JSON run file in `docs/benchmarks/runs/` and
-updates `docs/benchmarks/bench_summary.csv`.
+updates `docs/benchmarks/bench_summary.csv`. If SQLite3 is not available and
+`ENTROPY_BENCH_COMPARE_SQLITE=ON`, the script exits with a clear error so the
+comparison is not silently skipped.
 
 ## Run Benchmarks (Unix)
 
@@ -67,10 +69,10 @@ python scripts/bench/summarize.py `
 
 ## Metrics
 
-The summary captures p50 latency in `ns/op` (Google Benchmark `real_time`)
-because it is stable for microbenchmarks and easy to compare. For
-system-level reporting, consider adding throughput (`ops/sec`) and higher
-percentiles (p95/p99) if you expand the harness.
+The summary captures per-iteration `real_time` in `ns/op` from Google
+Benchmark. This is the mean time per benchmark iteration. If you want
+distribution stats (p50/p95/p99), run with `--benchmark_repetitions` and
+update `summarize.py` to read aggregate entries or compute percentiles.
 
 ## Reporting
 

@@ -30,21 +30,44 @@ ACID transactions, write-ahead logging, and a cost-based query optimizer.
   <img src="docs/diagrams/architecture-dark.svg#gh-dark-mode-only" width="860" alt="Entropy architecture diagram">
 </p>
 
+## Architecture Details
+
+Entropy is organized as focused C++ libraries that mirror the logical
+database pipeline. The implementation favors explicit data structures and
+clear boundaries between planning, execution, concurrency, and storage.
+
+- SQL front-end: custom lexer/parser builds an AST; the binder resolves
+  names, types, and schema references with optional strict mode checks.
+- Optimizer: statistics-driven cost model builds plan nodes and chooses
+  index access paths (B+ tree for ranges, extendible hash for point lookups).
+- Execution engine: iterator-style operators for scans, joins, aggregates,
+  sorting, filtering, projection, and DML (insert/update/delete).
+- Concurrency + recovery: MVCC version chains with a lock manager for
+  transactional isolation; write-ahead logging with recovery replay.
+- Storage engine: table heap on slotted pages for variable-length tuples,
+  B+ tree indexes for ordered access, and extendible hash indexes.
+- Buffer pool: page table + LRU replacer with pin/dirty tracking; disk
+  manager handles page file and WAL I/O.
+
 ## Performance Snapshot (vs SQLite)
 
-Run file: `docs/benchmarks/runs/bench-<timestamp>.json`
+Run file: `docs/benchmarks/runs/bench-20251226-211444.json`
 
-- Machine: _populate from your benchmark run_
-- Compiler: _populate from your benchmark run_
+- Machine: Apple M2 (arm64), macOS 15.5
+- Compiler: Apple clang 17.0.0 (clang-1700.0.13.5)
 - Build: Release (`-O3`)
 SQLite baselines are collected when `ENTROPY_BENCH_COMPARE_SQLITE=ON`.
 
-Median (p50) ns/op (ratio = Entropy / SQLite, lower is better):
+Per-iteration ns/op (ratio = Entropy / SQLite, lower is better):
 
-| Case | Entropy (ns/op) | SQLite (ns/op) | Ratio |
-| --- | --- | --- | --- |
-| Insert batch (1k rows, txn) | `TBD` | `TBD` | `TBD` |
-| Point select (10k rows) | `TBD` | `TBD` | `TBD` |
+| Case | Rows | Entropy (ns/op) | SQLite (ns/op) | Ratio |
+| --- | --- | --- | --- | --- |
+| Insert batch (txn) | 1k | `1,137,350` | `968,605` | `1.17x` |
+| Insert batch (txn) | 10k | `38,729,880` | `6,951,009` | `5.57x` |
+| Point select | 1k | `225,263` | `22,670` | `9.94x` |
+| Point select | 10k | `2,179,541` | `180,032` | `12.11x` |
+
+Rows = batch size for inserts; table cardinality for point selects.
 
 Full results: `docs/benchmarks/bench_summary.csv`
 
@@ -63,8 +86,9 @@ powershell -ExecutionPolicy Bypass -File scripts/bench/run.ps1
 The script writes a timestamped JSON run file in `docs/benchmarks/runs/` and
 updates `docs/benchmarks/bench_summary.csv`.
 
-SQLite comparison requires `ENTROPY_BENCH_COMPARE_SQLITE=ON` and a system
-SQLite3 development package. Manual steps and methodology are in
+SQLite comparison is ON by default for the script. If SQLite3 headers are
+missing, the script fails with an explicit error. To run without SQLite,
+set `ENTROPY_BENCH_COMPARE_SQLITE=OFF`. Manual steps and methodology are in
 `docs/benchmarks.md`.
 
 ## Quick Start
@@ -121,12 +145,12 @@ ctest --preset dev
 ## Build Options
 
 | Option | Default | Description |
-| --- | --- | --- |
-| `ENTROPY_BUILD_TESTS` | ON | Build unit + integration tests |
-| `ENTROPY_BUILD_BENCHMARKS` | OFF | Build benchmarks |
-| `ENTROPY_BENCH_COMPARE_SQLITE` | OFF | Build SQLite comparison benchmarks |
-| `ENTROPY_BUILD_EXAMPLES` | ON | Build example programs |
-| `ENTROPY_ENABLE_LZ4` | OFF | Enable page compression (LZ4) |
+| --- | :---: | --- |
+| `ENTROPY_BUILD_TESTS` | &#10003; | Build unit + integration tests |
+| `ENTROPY_BUILD_BENCHMARKS` | &#10007; | Build benchmarks |
+| `ENTROPY_BENCH_COMPARE_SQLITE` | &#10007; | Build SQLite comparison benchmarks |
+| `ENTROPY_BUILD_EXAMPLES` | &#10003; | Build example programs |
+| `ENTROPY_ENABLE_LZ4` | &#10007; | Enable page compression (LZ4) |
 
 LZ4 compression tests are only built when `ENTROPY_ENABLE_LZ4=ON`.
 
@@ -139,7 +163,6 @@ LZ4 compression tests are only built when `ENTROPY_ENABLE_LZ4=ON`.
 
 - `DESIGN.md` -- architecture notes and component details
 - `docs/benchmarks.md` -- benchmark methodology and reporting
-- `PROGRESS.md` -- roadmap and status updates
 
 ## License
 
