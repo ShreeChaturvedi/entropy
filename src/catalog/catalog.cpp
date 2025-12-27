@@ -164,7 +164,7 @@ Status Catalog::create_index(const std::string &index_name,
     if (key_val.is_integer()) {
       key = static_cast<BPTreeKey>(key_val.as_integer());
     } else if (key_val.is_bigint()) {
-      key = static_cast<BPTreeKey>(key_val.as_bigint());
+      key = key_val.as_bigint();
     }
     (void)index->insert(key, it.rid());
   }
