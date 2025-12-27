@@ -34,7 +34,7 @@
       <text x="672" y="558">Disk Manager</text>
     </g>
 
-    <g font-size="12" fill="#334155" stroke="#CBD5E1" stroke-width="1">
+    <g font-size="12" fill="#0F172A" stroke="#CBD5E1" stroke-width="1">
       <rect x="72" y="90" width="70" height="26" rx="8" fill="#EEF2F7" />
       <rect x="150" y="90" width="70" height="26" rx="8" fill="#EEF2F7" />
       <rect x="228" y="90" width="70" height="26" rx="8" fill="#EEF2F7" />

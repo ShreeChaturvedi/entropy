@@ -50,7 +50,13 @@ Page* BufferPoolManager::fetch_page(page_id_t page_id) {
 
     // If victim page is dirty, flush it
     if (page->is_dirty()) {
-        disk_manager_->write_page(page->page_id(), page->data());
+        auto status = disk_manager_->write_page(page->page_id(), page->data());
+        if (!status.ok()) {
+            LOG_ERROR("Failed to flush dirty page {}: {}", page->page_id(),
+                      status.to_string());
+            free_list_.push_back(frame_id);
+            return nullptr;
+        }
     }
 
     // Remove old page from page table
@@ -135,7 +141,13 @@ Page* BufferPoolManager::new_page(page_id_t* page_id) {
 
     // Flush victim if dirty
     if (page->is_dirty()) {
-        disk_manager_->write_page(page->page_id(), page->data());
+        auto status = disk_manager_->write_page(page->page_id(), page->data());
+        if (!status.ok()) {
+            LOG_ERROR("Failed to flush dirty page {}: {}", page->page_id(),
+                      status.to_string());
+            free_list_.push_back(frame_id);
+            return nullptr;
+        }
     }
 
     // Remove old page from page table
@@ -185,8 +197,13 @@ void BufferPoolManager::flush_all_pages() {
     for (auto& [page_id, frame_id] : page_table_) {
         Page* page = &pages_[frame_id];
         if (page->is_dirty()) {
-            disk_manager_->write_page(page_id, page->data());
-            page->set_dirty(false);
+            auto status = disk_manager_->write_page(page_id, page->data());
+            if (status.ok()) {
+                page->set_dirty(false);
+            } else {
+                LOG_ERROR("Failed to flush page {}: {}", page_id,
+                          status.to_string());
+            }
         }
     }
 }
