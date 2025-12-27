@@ -96,6 +96,26 @@ public:
   void collect_statistics(oid_t table_oid);
 
   /**
+   * @brief Initialize stats for a newly created table
+   */
+  void on_table_created(oid_t table_oid);
+
+  /**
+   * @brief Drop cached stats for a table
+   */
+  void on_table_dropped(oid_t table_oid);
+
+  /**
+   * @brief Update stats after inserts
+   */
+  void on_rows_inserted(oid_t table_oid, size_t rows);
+
+  /**
+   * @brief Update stats after deletes
+   */
+  void on_rows_deleted(oid_t table_oid, size_t rows);
+
+  /**
    * @brief Get cached table statistics
    */
   [[nodiscard]] const TableStatistics *get_table_stats(oid_t table_oid) const;

@@ -6,6 +6,7 @@
 #include "storage/table_heap.hpp"
 
 #include <cstring>
+#include <utility>
 
 #include "common/config.hpp"
 #include "common/status.hpp"
@@ -271,8 +272,21 @@ page_id_t TableHeap::create_new_page() {
 }
 
 page_id_t TableHeap::find_page_with_space(uint32_t size) {
-  // Simple linear scan through all pages
-  // A more sophisticated implementation would use a free space map
+  // Fast path: append to the last page if it has space.
+  if (last_page_id_ != INVALID_PAGE_ID) {
+    Page *page = buffer_pool_->fetch_page(last_page_id_);
+    if (page != nullptr) {
+      TablePage table_page(page);
+      if (table_page.can_fit(static_cast<uint16_t>(size))) {
+        buffer_pool_->unpin_page(last_page_id_, false);
+        return last_page_id_;
+      }
+      buffer_pool_->unpin_page(last_page_id_, false);
+    }
+  }
+
+  // Fallback: linear scan through all pages to reuse free space.
+  // A more sophisticated implementation would use a free space map.
   page_id_t current_id = first_page_id_;
 
   while (current_id != INVALID_PAGE_ID) {
@@ -304,9 +318,71 @@ page_id_t TableHeap::find_page_with_space(uint32_t size) {
 
 TableIterator::TableIterator(TableHeap *table_heap, RID rid)
     : table_heap_(table_heap), rid_(rid) {
+  if (table_heap_) {
+    buffer_pool_ = table_heap_->buffer_pool();
+  }
   // Find the first valid tuple
   advance_to_next_valid();
 }
+
+TableIterator::TableIterator(const TableIterator &other)
+    : table_heap_(other.table_heap_),
+      rid_(other.rid_),
+      current_tuple_(other.current_tuple_),
+      buffer_pool_(other.buffer_pool_) {}
+
+TableIterator &TableIterator::operator=(const TableIterator &other) {
+  if (this == &other) {
+    return *this;
+  }
+  release_page();
+  table_heap_ = other.table_heap_;
+  rid_ = other.rid_;
+  current_tuple_ = other.current_tuple_;
+  buffer_pool_ = other.buffer_pool_;
+  pinned_page_ = nullptr;
+  pinned_page_id_ = INVALID_PAGE_ID;
+  owns_pin_ = false;
+  return *this;
+}
+
+TableIterator::TableIterator(TableIterator &&other) noexcept
+    : table_heap_(other.table_heap_),
+      rid_(other.rid_),
+      current_tuple_(std::move(other.current_tuple_)),
+      buffer_pool_(std::move(other.buffer_pool_)),
+      pinned_page_(other.pinned_page_),
+      pinned_page_id_(other.pinned_page_id_),
+      owns_pin_(other.owns_pin_) {
+  other.table_heap_ = nullptr;
+  other.rid_ = RID();
+  other.pinned_page_ = nullptr;
+  other.pinned_page_id_ = INVALID_PAGE_ID;
+  other.owns_pin_ = false;
+}
+
+TableIterator &TableIterator::operator=(TableIterator &&other) noexcept {
+  if (this == &other) {
+    return *this;
+  }
+  release_page();
+  table_heap_ = other.table_heap_;
+  rid_ = other.rid_;
+  current_tuple_ = std::move(other.current_tuple_);
+  buffer_pool_ = std::move(other.buffer_pool_);
+  pinned_page_ = other.pinned_page_;
+  pinned_page_id_ = other.pinned_page_id_;
+  owns_pin_ = other.owns_pin_;
+
+  other.table_heap_ = nullptr;
+  other.rid_ = RID();
+  other.pinned_page_ = nullptr;
+  other.pinned_page_id_ = INVALID_PAGE_ID;
+  other.owns_pin_ = false;
+  return *this;
+}
+
+TableIterator::~TableIterator() { release_page(); }
 
 TableIterator &TableIterator::operator++() {
   if (!rid_.is_valid()) {
@@ -328,20 +404,33 @@ TableIterator TableIterator::operator++(int) {
 
 void TableIterator::advance_to_next_valid() {
   if (table_heap_ == nullptr) {
+    release_page();
     rid_ = RID();
     return;
   }
 
-  auto buffer_pool = table_heap_->buffer_pool();
+  if (!buffer_pool_) {
+    buffer_pool_ = table_heap_->buffer_pool();
+  }
 
   while (rid_.page_id != INVALID_PAGE_ID) {
-    Page *page = buffer_pool->fetch_page(rid_.page_id);
-    if (page == nullptr) {
+    if (pinned_page_id_ != rid_.page_id || pinned_page_ == nullptr) {
+      release_page();
+      pinned_page_ = buffer_pool_->fetch_page(rid_.page_id);
+      if (pinned_page_ == nullptr) {
+        rid_ = RID();
+        return;
+      }
+      pinned_page_id_ = rid_.page_id;
+      owns_pin_ = true;
+    }
+
+    if (pinned_page_ == nullptr) {
       rid_ = RID();
       return;
     }
 
-    TablePage table_page(page);
+    TablePage table_page(pinned_page_);
     uint16_t slot_count = table_page.get_slot_count();
 
     // Search for a valid slot on this page
@@ -351,7 +440,6 @@ void TableIterator::advance_to_next_valid() {
         // Found a valid record
         std::vector<char> data(record.begin(), record.end());
         current_tuple_ = Tuple(std::move(data), rid_);
-        buffer_pool->unpin_page(rid_.page_id, false);
         return;
       }
       rid_.slot_id++;
@@ -359,7 +447,7 @@ void TableIterator::advance_to_next_valid() {
 
     // No more valid slots on this page, move to next page
     page_id_t next_page_id = table_page.get_next_page_id();
-    buffer_pool->unpin_page(rid_.page_id, false);
+    release_page();
 
     if (next_page_id == INVALID_PAGE_ID) {
       // End of table
@@ -373,6 +461,15 @@ void TableIterator::advance_to_next_valid() {
 
   // No valid tuple found
   rid_ = RID();
+}
+
+void TableIterator::release_page() {
+  if (owns_pin_ && pinned_page_id_ != INVALID_PAGE_ID && buffer_pool_) {
+    buffer_pool_->unpin_page(pinned_page_id_, false);
+  }
+  pinned_page_id_ = INVALID_PAGE_ID;
+  pinned_page_ = nullptr;
+  owns_pin_ = false;
 }
 
 } // namespace entropy
