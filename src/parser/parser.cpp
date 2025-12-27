@@ -570,7 +570,7 @@ std::unique_ptr<Expression> Parser::parse_unary() {
 std::unique_ptr<Expression> Parser::parse_primary() {
   // Integer literal
   if (check(TokenType::INTEGER_LITERAL)) {
-    auto val = TupleValue(std::stoll(current_.value));
+    auto val = TupleValue(static_cast<int64_t>(std::stoll(current_.value)));
     advance();
     return std::make_unique<ConstantExpression>(val);
   }
