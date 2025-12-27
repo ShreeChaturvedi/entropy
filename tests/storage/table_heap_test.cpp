@@ -97,8 +97,10 @@ TEST_F(TableHeapTest, InsertAndRetrieve) {
 TEST_F(TableHeapTest, InsertMultipleTuples) {
     std::vector<RID> rids;
 
-    for (int i = 0; i < 10; ++i) {
-        Tuple tuple = create_tuple(i, "Name" + std::to_string(i), 20 + i);
+    for (size_t i = 0; i < 10; ++i) {
+        auto id = static_cast<int32_t>(i);
+        Tuple tuple = create_tuple(id, "Name" + std::to_string(i),
+                                   static_cast<int32_t>(20 + i));
         RID rid;
         Status status = table_heap_->insert_tuple(tuple, &rid);
         ASSERT_TRUE(status.ok()) << "Failed at i=" << i << ": " << status.message();
@@ -106,11 +108,12 @@ TEST_F(TableHeapTest, InsertMultipleTuples) {
     }
 
     // Verify all tuples can be retrieved
-    for (int i = 0; i < 10; ++i) {
+    for (size_t i = 0; i < 10; ++i) {
         Tuple tuple;
         Status status = table_heap_->get_tuple(rids[i], &tuple);
         ASSERT_TRUE(status.ok()) << "Failed to get tuple at i=" << i;
-        EXPECT_EQ(tuple.get_value(schema_, 0).as_integer(), i);
+        EXPECT_EQ(tuple.get_value(schema_, 0).as_integer(),
+                  static_cast<int64_t>(i));
     }
 }
 

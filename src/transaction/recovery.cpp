@@ -77,7 +77,7 @@ Status RecoveryManager::create_checkpoint(
 
   // Create and append checkpoint record
   LogRecord checkpoint = LogRecord::make_checkpoint(active_txn_ids);
-  wal_->append_log(checkpoint);
+  [[maybe_unused]] auto lsn = wal_->append_log(checkpoint);
 
   // Force flush to ensure checkpoint is durable
   return wal_->flush();

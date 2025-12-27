@@ -25,8 +25,8 @@ public:
    * @param tuples Tuples to insert
    */
   InsertExecutor(ExecutorContext *ctx, std::shared_ptr<TableHeap> table_heap,
-                 const Schema *schema, std::vector<Tuple> tuples)
-      : Executor(ctx), table_heap_(std::move(table_heap)), schema_(schema),
+                 std::vector<Tuple> tuples)
+      : Executor(ctx), table_heap_(std::move(table_heap)),
         tuples_(std::move(tuples)) {}
 
   /**
@@ -47,7 +47,6 @@ public:
 
 private:
   std::shared_ptr<TableHeap> table_heap_;
-  const Schema *schema_;
   std::vector<Tuple> tuples_;
   size_t current_idx_ = 0;
   size_t rows_inserted_ = 0;

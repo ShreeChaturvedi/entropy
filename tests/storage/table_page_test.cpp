@@ -178,7 +178,8 @@ TEST_F(TablePageTest, FreeSpaceDecreases) {
     uint16_t initial_free = table_page_->get_free_space();
 
     const char data[] = "Some test data for the record";
-    table_page_->insert_record(data, sizeof(data));
+    auto slot_id = table_page_->insert_record(data, sizeof(data));
+    ASSERT_TRUE(slot_id.has_value());
 
     uint16_t after_insert = table_page_->get_free_space();
     EXPECT_LT(after_insert, initial_free);

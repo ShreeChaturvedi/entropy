@@ -48,7 +48,7 @@ static int64_t to_int64(const TupleValue &val) {
 // Helper to convert to double for arithmetic
 static double to_double(const TupleValue &val) {
   if (val.is_float())
-    return val.as_float();
+    return static_cast<double>(val.as_float());
   if (val.is_double())
     return val.as_double();
   if (val.is_tinyint())

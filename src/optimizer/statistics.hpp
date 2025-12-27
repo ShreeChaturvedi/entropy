@@ -87,7 +87,7 @@ public:
   /**
    * @brief Estimate selectivity for an expression predicate
    */
-  [[nodiscard]] double estimate_selectivity(oid_t table_oid,
+  [[nodiscard]] double estimate_selectivity([[maybe_unused]] oid_t table_oid,
                                             const Expression *predicate) const;
 
   /**

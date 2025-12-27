@@ -209,7 +209,8 @@ TEST(LogRecordTest, SerializeDeserializeBegin) {
 
   auto serialized = original.serialize();
   auto deserialized =
-      LogRecord::deserialize(serialized.data(), serialized.size());
+      LogRecord::deserialize(serialized.data(),
+                             static_cast<uint32_t>(serialized.size()));
 
   EXPECT_EQ(deserialized.type(), LogRecordType::BEGIN);
   EXPECT_EQ(deserialized.txn_id(), 42);
@@ -223,7 +224,8 @@ TEST(LogRecordTest, SerializeDeserializeInsert) {
 
   auto serialized = original.serialize();
   auto deserialized =
-      LogRecord::deserialize(serialized.data(), serialized.size());
+      LogRecord::deserialize(serialized.data(),
+                             static_cast<uint32_t>(serialized.size()));
 
   EXPECT_EQ(deserialized.type(), LogRecordType::INSERT);
   EXPECT_EQ(deserialized.txn_id(), 42);
@@ -244,7 +246,8 @@ TEST(LogRecordTest, SerializeDeserializeUpdate) {
 
   auto serialized = original.serialize();
   auto deserialized =
-      LogRecord::deserialize(serialized.data(), serialized.size());
+      LogRecord::deserialize(serialized.data(),
+                             static_cast<uint32_t>(serialized.size()));
 
   EXPECT_EQ(deserialized.type(), LogRecordType::UPDATE);
   EXPECT_EQ(deserialized.old_tuple_data(), old_data);
@@ -258,7 +261,8 @@ TEST(LogRecordTest, SerializeDeserializeCheckpoint) {
 
   auto serialized = original.serialize();
   auto deserialized =
-      LogRecord::deserialize(serialized.data(), serialized.size());
+      LogRecord::deserialize(serialized.data(),
+                             static_cast<uint32_t>(serialized.size()));
 
   EXPECT_EQ(deserialized.type(), LogRecordType::CHECKPOINT);
   EXPECT_EQ(deserialized.active_txns(), active_txns);
@@ -334,8 +338,8 @@ TEST_F(WALTest, FlushAndPersist) {
     auto r1 = LogRecord::make_begin(42);
     auto r2 = LogRecord::make_commit(42, 1);
 
-    wal.append_log(r1);
-    wal.append_log(r2);
+    [[maybe_unused]] lsn_t lsn1 = wal.append_log(r1);
+    [[maybe_unused]] lsn_t lsn2 = wal.append_log(r2);
 
     EXPECT_TRUE(wal.flush().ok());
     EXPECT_EQ(wal.flushed_lsn(), 2);
@@ -364,9 +368,9 @@ TEST_F(WALTest, ReadLog) {
     auto r2 = LogRecord::make_insert(1, 1, 10, RID(5, 3), tuple_data);
     auto r3 = LogRecord::make_commit(1, 2);
 
-    wal.append_log(r1);
-    wal.append_log(r2);
-    wal.append_log(r3);
+    [[maybe_unused]] lsn_t lsn1 = wal.append_log(r1);
+    [[maybe_unused]] lsn_t lsn2 = wal.append_log(r2);
+    [[maybe_unused]] lsn_t lsn3 = wal.append_log(r3);
     (void)wal.flush();
   }
 
@@ -384,8 +388,8 @@ TEST_F(WALTest, FlushToLSN) {
   WALManager wal(wal_file_.string());
 
   for (int i = 0; i < 5; ++i) {
-    auto record = LogRecord::make_begin(i + 1);
-    wal.append_log(record);
+    auto record = LogRecord::make_begin(static_cast<txn_id_t>(i + 1));
+    [[maybe_unused]] lsn_t lsn = wal.append_log(record);
   }
 
   EXPECT_TRUE(wal.flush_to_lsn(3).ok());
@@ -398,7 +402,7 @@ TEST_F(WALTest, ReopenExistingWAL) {
   {
     WALManager wal(wal_file_.string());
     for (int i = 0; i < 10; ++i) {
-      auto record = LogRecord::make_begin(i + 1);
+      auto record = LogRecord::make_begin(static_cast<txn_id_t>(i + 1));
       last_lsn = wal.append_log(record);
     }
     (void)wal.flush();
@@ -594,7 +598,6 @@ TEST_F(TransactionManagerTest, FullTransactionWorkflow) {
 
   // Start transaction
   auto *txn = tm.begin();
-  txn_id_t id = txn->txn_id();
   EXPECT_EQ(txn->state(), TransactionState::GROWING);
 
   // Do some operations
@@ -892,12 +895,13 @@ TEST_F(LockManagerTest, ConcurrentSharedLocks) {
   constexpr int NUM_THREADS = 10;
 
   // Create transactions
-  for (int i = 0; i < NUM_THREADS; ++i) {
-    txns.push_back(std::make_unique<Transaction>(i + 1));
+  for (size_t i = 0; i < static_cast<size_t>(NUM_THREADS); ++i) {
+    txns.push_back(
+        std::make_unique<Transaction>(static_cast<txn_id_t>(i + 1)));
   }
 
   // All try to get shared locks concurrently
-  for (int i = 0; i < NUM_THREADS; ++i) {
+  for (size_t i = 0; i < static_cast<size_t>(NUM_THREADS); ++i) {
     threads.emplace_back([this, &txns, i, &success_count]() {
       if (lock_mgr_->lock_table(txns[i].get(), 1, LockMode::SHARED).ok()) {
         success_count++;
@@ -990,7 +994,9 @@ TEST_F(LockManagerTest, BasicDeadlockDetection) {
   t2.join();
 
   // At least one should be aborted due to deadlock or timeout
-  EXPECT_GE(aborted_count.load() + lock_mgr_->deadlock_count(), 1);
+  auto total_aborted = static_cast<uint64_t>(aborted_count.load()) +
+                       lock_mgr_->deadlock_count();
+  EXPECT_GE(total_aborted, static_cast<uint64_t>(1));
 
   lock_mgr_->release_all_locks(&txn1);
   lock_mgr_->release_all_locks(&txn2);
@@ -1113,14 +1119,14 @@ TEST_F(RecoveryTest, AnalysisIdentifiesCommittedTransaction) {
   {
     WALManager wal(wal_file_.string());
     auto begin = LogRecord::make_begin(1);
-    wal.append_log(begin);
+    [[maybe_unused]] lsn_t lsn = wal.append_log(begin);
 
     std::vector<char> data = {'t', 'e', 's', 't'};
     auto insert = LogRecord::make_insert(1, begin.lsn(), 10, RID(1, 0), data);
-    wal.append_log(insert);
+    lsn = wal.append_log(insert);
 
     auto commit = LogRecord::make_commit(1, insert.lsn());
-    wal.append_log(commit);
+    lsn = wal.append_log(commit);
     (void)wal.flush();
   }
 
@@ -1141,11 +1147,11 @@ TEST_F(RecoveryTest, AnalysisIdentifiesUncommittedTransaction) {
   {
     WALManager wal(wal_file_.string());
     auto begin = LogRecord::make_begin(1);
-    wal.append_log(begin);
+    [[maybe_unused]] lsn_t lsn = wal.append_log(begin);
 
     std::vector<char> data = {'t', 'e', 's', 't'};
     auto insert = LogRecord::make_insert(1, begin.lsn(), 10, RID(1, 0), data);
-    wal.append_log(insert);
+    lsn = wal.append_log(insert);
 
     // No commit - simulates crash
     (void)wal.flush();
@@ -1169,18 +1175,18 @@ TEST_F(RecoveryTest, RedoCommittedTransaction) {
   {
     WALManager wal(wal_file_.string());
     auto begin = LogRecord::make_begin(1);
-    wal.append_log(begin);
+    [[maybe_unused]] lsn_t lsn = wal.append_log(begin);
 
     std::vector<char> data = {'d', 'a', 't', 'a'};
     auto insert1 = LogRecord::make_insert(1, begin.lsn(), 10, RID(1, 0), data);
-    wal.append_log(insert1);
+    lsn = wal.append_log(insert1);
 
     auto insert2 =
         LogRecord::make_insert(1, insert1.lsn(), 10, RID(1, 1), data);
-    wal.append_log(insert2);
+    lsn = wal.append_log(insert2);
 
     auto commit = LogRecord::make_commit(1, insert2.lsn());
-    wal.append_log(commit);
+    lsn = wal.append_log(commit);
     (void)wal.flush();
   }
 
@@ -1201,17 +1207,17 @@ TEST_F(RecoveryTest, UndoUncommittedTransaction) {
   {
     WALManager wal(wal_file_.string());
     auto begin = LogRecord::make_begin(42);
-    wal.append_log(begin);
+    [[maybe_unused]] lsn_t lsn = wal.append_log(begin);
 
     std::vector<char> data = {'t', 'e', 's', 't'};
     auto insert = LogRecord::make_insert(42, begin.lsn(), 10, RID(5, 0), data);
-    wal.append_log(insert);
+    lsn = wal.append_log(insert);
 
     auto update_old = std::vector<char>{'o', 'l', 'd'};
     auto update_new = std::vector<char>{'n', 'e', 'w'};
     auto update = LogRecord::make_update(42, insert.lsn(), 10, RID(5, 1),
                                          update_old, update_new);
-    wal.append_log(update);
+    lsn = wal.append_log(update);
 
     // No commit - crash simulation
     (void)wal.flush();
@@ -1236,27 +1242,27 @@ TEST_F(RecoveryTest, MixedCommittedAndUncommittedTransactions) {
 
     // Transaction 1: committed
     auto begin1 = LogRecord::make_begin(1);
-    wal.append_log(begin1);
+    [[maybe_unused]] lsn_t lsn = wal.append_log(begin1);
     std::vector<char> data = {'a'};
     auto insert1 = LogRecord::make_insert(1, begin1.lsn(), 10, RID(1, 0), data);
-    wal.append_log(insert1);
+    lsn = wal.append_log(insert1);
     auto commit1 = LogRecord::make_commit(1, insert1.lsn());
-    wal.append_log(commit1);
+    lsn = wal.append_log(commit1);
 
     // Transaction 2: uncommitted
     auto begin2 = LogRecord::make_begin(2);
-    wal.append_log(begin2);
+    lsn = wal.append_log(begin2);
     auto insert2 = LogRecord::make_insert(2, begin2.lsn(), 20, RID(2, 0), data);
-    wal.append_log(insert2);
+    lsn = wal.append_log(insert2);
     // No commit
 
     // Transaction 3: committed
     auto begin3 = LogRecord::make_begin(3);
-    wal.append_log(begin3);
+    lsn = wal.append_log(begin3);
     auto insert3 = LogRecord::make_insert(3, begin3.lsn(), 30, RID(3, 0), data);
-    wal.append_log(insert3);
+    lsn = wal.append_log(insert3);
     auto commit3 = LogRecord::make_commit(3, insert3.lsn());
-    wal.append_log(commit3);
+    lsn = wal.append_log(commit3);
 
     (void)wal.flush();
   }
@@ -1287,29 +1293,29 @@ TEST_F(RecoveryTest, CheckpointRecovery) {
 
     // Transaction 1: committed before checkpoint
     auto begin1 = LogRecord::make_begin(1);
-    wal.append_log(begin1);
+    [[maybe_unused]] lsn_t lsn = wal.append_log(begin1);
     std::vector<char> data = {'x'};
     auto insert1 = LogRecord::make_insert(1, begin1.lsn(), 10, RID(1, 0), data);
-    wal.append_log(insert1);
+    lsn = wal.append_log(insert1);
     auto commit1 = LogRecord::make_commit(1, insert1.lsn());
-    wal.append_log(commit1);
+    lsn = wal.append_log(commit1);
 
     // Transaction 2: active at checkpoint
     auto begin2 = LogRecord::make_begin(2);
-    wal.append_log(begin2);
+    lsn = wal.append_log(begin2);
     auto insert2 = LogRecord::make_insert(2, begin2.lsn(), 20, RID(2, 0), data);
-    wal.append_log(insert2);
+    lsn = wal.append_log(insert2);
 
     // Checkpoint with txn 2 active
     auto checkpoint = LogRecord::make_checkpoint({2});
-    wal.append_log(checkpoint);
+    lsn = wal.append_log(checkpoint);
 
     // Txn 2 continues and commits after checkpoint
     auto insert2b =
         LogRecord::make_insert(2, insert2.lsn(), 20, RID(2, 1), data);
-    wal.append_log(insert2b);
+    lsn = wal.append_log(insert2b);
     auto commit2 = LogRecord::make_commit(2, insert2b.lsn());
-    wal.append_log(commit2);
+    lsn = wal.append_log(commit2);
 
     (void)wal.flush();
   }

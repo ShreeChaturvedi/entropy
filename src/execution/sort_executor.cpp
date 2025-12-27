@@ -76,8 +76,10 @@ bool SortExecutor::compare(const Tuple &a, const Tuple &b) const {
       less = a_num < b_num;
       equal = a_num == b_num;
     } else if (val_a.is_float() || val_a.is_double()) {
-      double a_num = val_a.is_double() ? val_a.as_double() : val_a.as_float();
-      double b_num = val_b.is_double() ? val_b.as_double() : val_b.as_float();
+      double a_num = val_a.is_double() ? val_a.as_double()
+                                       : static_cast<double>(val_a.as_float());
+      double b_num = val_b.is_double() ? val_b.as_double()
+                                       : static_cast<double>(val_b.as_float());
       less = a_num < b_num;
       equal = a_num == b_num;
     } else if (val_a.is_string()) {

@@ -125,12 +125,17 @@ TEST_F(DatabaseTest, InsertAndSelect) {
 TEST_F(DatabaseTest, SelectWithWhere) {
   Database db(temp_file_->string());
 
-  db.execute("CREATE TABLE users (id INTEGER, name VARCHAR(100), age INTEGER)");
-  db.execute("INSERT INTO users VALUES (1, 'Alice', 25)");
-  db.execute("INSERT INTO users VALUES (2, 'Bob', 30)");
-  db.execute("INSERT INTO users VALUES (3, 'Charlie', 35)");
+  auto result =
+      db.execute("CREATE TABLE users (id INTEGER, name VARCHAR(100), age INTEGER)");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
+  result = db.execute("INSERT INTO users VALUES (1, 'Alice', 25)");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
+  result = db.execute("INSERT INTO users VALUES (2, 'Bob', 30)");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
+  result = db.execute("INSERT INTO users VALUES (3, 'Charlie', 35)");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
 
-  auto result = db.execute("SELECT * FROM users WHERE age > 28");
+  result = db.execute("SELECT * FROM users WHERE age > 28");
   EXPECT_TRUE(result.ok()) << result.status().to_string();
   EXPECT_EQ(result.row_count(), 2); // Bob and Charlie
 }
@@ -138,10 +143,13 @@ TEST_F(DatabaseTest, SelectWithWhere) {
 TEST_F(DatabaseTest, SelectColumns) {
   Database db(temp_file_->string());
 
-  db.execute("CREATE TABLE users (id INTEGER, name VARCHAR(100), age INTEGER)");
-  db.execute("INSERT INTO users VALUES (1, 'Alice', 25)");
+  auto result =
+      db.execute("CREATE TABLE users (id INTEGER, name VARCHAR(100), age INTEGER)");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
+  result = db.execute("INSERT INTO users VALUES (1, 'Alice', 25)");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
 
-  auto result = db.execute("SELECT name, age FROM users");
+  result = db.execute("SELECT name, age FROM users");
   EXPECT_TRUE(result.ok()) << result.status().to_string();
   EXPECT_EQ(result.column_names().size(), 2);
   EXPECT_EQ(result.column_names()[0], "name");
@@ -151,11 +159,15 @@ TEST_F(DatabaseTest, SelectColumns) {
 TEST_F(DatabaseTest, UpdateRows) {
   Database db(temp_file_->string());
 
-  db.execute("CREATE TABLE users (id INTEGER, name VARCHAR(100), age INTEGER)");
-  db.execute("INSERT INTO users VALUES (1, 'Alice', 25)");
-  db.execute("INSERT INTO users VALUES (2, 'Bob', 30)");
+  auto result =
+      db.execute("CREATE TABLE users (id INTEGER, name VARCHAR(100), age INTEGER)");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
+  result = db.execute("INSERT INTO users VALUES (1, 'Alice', 25)");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
+  result = db.execute("INSERT INTO users VALUES (2, 'Bob', 30)");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
 
-  auto result = db.execute("UPDATE users SET age = 99 WHERE id = 1");
+  result = db.execute("UPDATE users SET age = 99 WHERE id = 1");
   EXPECT_TRUE(result.ok()) << result.status().to_string();
   EXPECT_EQ(result.affected_rows(), 1);
 
@@ -168,12 +180,16 @@ TEST_F(DatabaseTest, UpdateRows) {
 TEST_F(DatabaseTest, DeleteRows) {
   Database db(temp_file_->string());
 
-  db.execute("CREATE TABLE users (id INTEGER, name VARCHAR(100))");
-  db.execute("INSERT INTO users VALUES (1, 'Alice')");
-  db.execute("INSERT INTO users VALUES (2, 'Bob')");
-  db.execute("INSERT INTO users VALUES (3, 'Charlie')");
+  auto result = db.execute("CREATE TABLE users (id INTEGER, name VARCHAR(100))");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
+  result = db.execute("INSERT INTO users VALUES (1, 'Alice')");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
+  result = db.execute("INSERT INTO users VALUES (2, 'Bob')");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
+  result = db.execute("INSERT INTO users VALUES (3, 'Charlie')");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
 
-  auto result = db.execute("DELETE FROM users WHERE id = 2");
+  result = db.execute("DELETE FROM users WHERE id = 2");
   EXPECT_TRUE(result.ok()) << result.status().to_string();
   EXPECT_EQ(result.affected_rows(), 1);
 
@@ -186,8 +202,9 @@ TEST_F(DatabaseTest, DeleteRows) {
 TEST_F(DatabaseTest, DropTable) {
   Database db(temp_file_->string());
 
-  db.execute("CREATE TABLE temp (id INTEGER)");
-  auto result = db.execute("DROP TABLE temp");
+  auto result = db.execute("CREATE TABLE temp (id INTEGER)");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
+  result = db.execute("DROP TABLE temp");
   EXPECT_TRUE(result.ok()) << result.status().to_string();
 
   // Should fail - table dropped
@@ -205,8 +222,9 @@ TEST_F(DatabaseTest, SelectNonexistentTable) {
 TEST_F(DatabaseTest, InsertMultipleRows) {
   Database db(temp_file_->string());
 
-  db.execute("CREATE TABLE users (id INTEGER, name VARCHAR(100))");
-  auto result = db.execute(
+  auto result = db.execute("CREATE TABLE users (id INTEGER, name VARCHAR(100))");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
+  result = db.execute(
       "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')");
   EXPECT_TRUE(result.ok()) << result.status().to_string();
   EXPECT_EQ(result.affected_rows(), 3);

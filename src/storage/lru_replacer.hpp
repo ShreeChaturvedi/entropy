@@ -54,7 +54,6 @@ public:
     [[nodiscard]] size_t size() const;
 
 private:
-    size_t num_frames_;
     std::list<frame_id_t> lru_list_;
     std::unordered_map<frame_id_t, std::list<frame_id_t>::iterator> frame_map_;
     mutable std::mutex mutex_;

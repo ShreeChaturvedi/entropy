@@ -232,7 +232,7 @@ public:
     }
 
     InsertExecutor insert(nullptr, ctx.table_info->table_heap,
-                          &ctx.table_info->schema, std::move(tuples));
+                          std::move(tuples));
     insert.init();
     (void)insert.next();
 

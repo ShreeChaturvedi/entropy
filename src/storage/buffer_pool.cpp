@@ -8,6 +8,17 @@
 #include "common/logger.hpp"
 
 namespace entropy {
+namespace {
+
+bool frame_id_is_valid(frame_id_t frame_id) {
+    return frame_id >= 0;
+}
+
+size_t frame_index(frame_id_t frame_id) {
+    return static_cast<size_t>(frame_id);
+}
+
+}  // namespace
 
 BufferPoolManager::BufferPoolManager(size_t pool_size,
                                      std::shared_ptr<DiskManager> disk_manager)
@@ -33,7 +44,11 @@ Page* BufferPoolManager::fetch_page(page_id_t page_id) {
     auto it = page_table_.find(page_id);
     if (it != page_table_.end()) {
         frame_id_t frame_id = it->second;
-        Page* page = &pages_[frame_id];
+        if (!frame_id_is_valid(frame_id)) {
+            LOG_ERROR("Invalid frame id {}", frame_id);
+            return nullptr;
+        }
+        Page* page = &pages_[frame_index(frame_id)];
         page->pin();
         replacer_->pin(frame_id);
         return page;
@@ -46,7 +61,12 @@ Page* BufferPoolManager::fetch_page(page_id_t page_id) {
         return nullptr;
     }
 
-    Page* page = &pages_[frame_id];
+    if (!frame_id_is_valid(frame_id)) {
+        LOG_ERROR("Invalid frame id {}", frame_id);
+        return nullptr;
+    }
+
+    Page* page = &pages_[frame_index(frame_id)];
 
     // If victim page is dirty, flush it
     if (page->is_dirty()) {
@@ -90,7 +110,11 @@ bool BufferPoolManager::unpin_page(page_id_t page_id, bool is_dirty) {
     }
 
     frame_id_t frame_id = it->second;
-    Page* page = &pages_[frame_id];
+    if (!frame_id_is_valid(frame_id)) {
+        LOG_ERROR("Invalid frame id {}", frame_id);
+        return false;
+    }
+    Page* page = &pages_[frame_index(frame_id)];
 
     if (is_dirty) {
         page->set_dirty(true);
@@ -118,7 +142,11 @@ bool BufferPoolManager::flush_page(page_id_t page_id) {
     }
 
     frame_id_t frame_id = it->second;
-    Page* page = &pages_[frame_id];
+    if (!frame_id_is_valid(frame_id)) {
+        LOG_ERROR("Invalid frame id {}", frame_id);
+        return false;
+    }
+    Page* page = &pages_[frame_index(frame_id)];
 
     auto status = disk_manager_->write_page(page_id, page->data());
     if (!status.ok()) {
@@ -137,7 +165,11 @@ Page* BufferPoolManager::new_page(page_id_t* page_id) {
         return nullptr;
     }
 
-    Page* page = &pages_[frame_id];
+    if (!frame_id_is_valid(frame_id)) {
+        LOG_ERROR("Invalid frame id {}", frame_id);
+        return nullptr;
+    }
+    Page* page = &pages_[frame_index(frame_id)];
 
     // Flush victim if dirty
     if (page->is_dirty()) {
@@ -176,7 +208,11 @@ bool BufferPoolManager::delete_page(page_id_t page_id) {
     }
 
     frame_id_t frame_id = it->second;
-    Page* page = &pages_[frame_id];
+    if (!frame_id_is_valid(frame_id)) {
+        LOG_ERROR("Invalid frame id {}", frame_id);
+        return false;
+    }
+    Page* page = &pages_[frame_index(frame_id)];
 
     if (page->pin_count() > 0) {
         return false;  // Page is pinned
@@ -195,7 +231,11 @@ void BufferPoolManager::flush_all_pages() {
     std::lock_guard<std::mutex> lock(mutex_);
 
     for (auto& [page_id, frame_id] : page_table_) {
-        Page* page = &pages_[frame_id];
+        if (!frame_id_is_valid(frame_id)) {
+            LOG_ERROR("Invalid frame id {}", frame_id);
+            continue;
+        }
+        Page* page = &pages_[frame_index(frame_id)];
         if (page->is_dirty()) {
             auto status = disk_manager_->write_page(page_id, page->data());
             if (status.ok()) {

@@ -72,10 +72,9 @@ protected:
                                 TupleValue(int32_t(35))},
         schema_);
 
-    InsertExecutor insert(nullptr, table_info_->table_heap, &schema_,
-                          std::move(tuples));
+    InsertExecutor insert(nullptr, table_info_->table_heap, std::move(tuples));
     insert.init();
-    insert.next();
+    [[maybe_unused]] auto inserted = insert.next();
   }
 
   std::unique_ptr<test::TempFile> temp_file_;
@@ -149,10 +148,9 @@ TEST_F(ExecutorTest, InsertSingle) {
                                               TupleValue(int32_t(20))},
                       schema_);
 
-  InsertExecutor insert(nullptr, table_info_->table_heap, &schema_,
-                        std::move(tuples));
+  InsertExecutor insert(nullptr, table_info_->table_heap, std::move(tuples));
   insert.init();
-  insert.next();
+  [[maybe_unused]] auto inserted = insert.next();
 
   EXPECT_EQ(insert.rows_inserted(), 1);
 
@@ -175,10 +173,9 @@ TEST_F(ExecutorTest, InsertMultiple) {
         schema_);
   }
 
-  InsertExecutor insert(nullptr, table_info_->table_heap, &schema_,
-                        std::move(tuples));
+  InsertExecutor insert(nullptr, table_info_->table_heap, std::move(tuples));
   insert.init();
-  insert.next();
+  [[maybe_unused]] auto inserted = insert.next();
 
   EXPECT_EQ(insert.rows_inserted(), 5);
 
@@ -213,7 +210,7 @@ TEST_F(ExecutorTest, DeleteAll) {
       nullptr, table_info_->table_heap, &schema_);
   DeleteExecutor del(nullptr, std::move(child), table_info_->table_heap);
   del.init();
-  del.next();
+  [[maybe_unused]] auto deleted = del.next();
 
   EXPECT_EQ(del.rows_deleted(), 3);
 }
@@ -382,10 +379,9 @@ protected:
                                 TupleValue(std::string("Charlie"))},
         users_schema_);
 
-    InsertExecutor insert(nullptr, users_info_->table_heap, &users_schema_,
-                          std::move(tuples));
+    InsertExecutor insert(nullptr, users_info_->table_heap, std::move(tuples));
     insert.init();
-    (void)insert.next();
+    [[maybe_unused]] auto inserted = insert.next();
   }
 
   void insert_orders() {
@@ -409,10 +405,9 @@ protected:
                                                 TupleValue(int32_t(50))},
                         orders_schema_);
 
-    InsertExecutor insert(nullptr, orders_info_->table_heap, &orders_schema_,
-                          std::move(tuples));
+    InsertExecutor insert(nullptr, orders_info_->table_heap, std::move(tuples));
     insert.init();
-    (void)insert.next();
+    [[maybe_unused]] auto inserted = insert.next();
   }
 
   std::unique_ptr<test::TempFile> temp_file_;
@@ -584,10 +579,9 @@ protected:
                                 TupleValue(int32_t(7))},
         schema_);
 
-    InsertExecutor insert(nullptr, table_info_->table_heap, &schema_,
-                          std::move(tuples));
+    InsertExecutor insert(nullptr, table_info_->table_heap, std::move(tuples));
     insert.init();
-    (void)insert.next();
+    [[maybe_unused]] auto inserted = insert.next();
   }
 
   std::unique_ptr<test::TempFile> temp_file_;
