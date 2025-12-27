@@ -896,8 +896,8 @@ TEST_F(LockManagerTest, ConcurrentSharedLocks) {
 
   // Create transactions
   for (size_t i = 0; i < static_cast<size_t>(NUM_THREADS); ++i) {
-    txns.push_back(
-        std::make_unique<Transaction>(static_cast<txn_id_t>(i + 1)));
+    const txn_id_t txn_id = i + 1;
+    txns.push_back(std::make_unique<Transaction>(txn_id));
   }
 
   // All try to get shared locks concurrently
