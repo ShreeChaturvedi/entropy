@@ -459,7 +459,7 @@ public:
   }
 
   void set_next_leaf_id(page_id_t id) {
-    std::memcpy(const_cast<char *>(data_area()), &id, sizeof(id));
+    std::memcpy(data_area(), &id, sizeof(id));
     page_->set_dirty(true);
   }
 
@@ -470,8 +470,7 @@ public:
   }
 
   void set_prev_leaf_id(page_id_t id) {
-    std::memcpy(const_cast<char *>(data_area()) + sizeof(page_id_t), &id,
-                sizeof(id));
+    std::memcpy(data_area() + sizeof(page_id_t), &id, sizeof(id));
     page_->set_dirty(true);
   }
 
