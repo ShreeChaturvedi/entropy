@@ -178,6 +178,12 @@ public:
    */
   TableIterator(TableHeap *table_heap, RID rid);
 
+  TableIterator(const TableIterator &other);
+  TableIterator &operator=(const TableIterator &other);
+  TableIterator(TableIterator &&other) noexcept;
+  TableIterator &operator=(TableIterator &&other) noexcept;
+  ~TableIterator();
+
   /**
    * @brief Dereference operator - get current tuple
    */
@@ -227,10 +233,15 @@ private:
    * @brief Advance to the next valid tuple
    */
   void advance_to_next_valid();
+  void release_page();
 
   TableHeap *table_heap_ = nullptr;
   RID rid_;
   Tuple current_tuple_;
+  std::shared_ptr<BufferPoolManager> buffer_pool_;
+  Page *pinned_page_ = nullptr;
+  page_id_t pinned_page_id_ = INVALID_PAGE_ID;
+  bool owns_pin_ = false;
 };
 
 } // namespace entropy

@@ -51,7 +51,7 @@ clear boundaries between planning, execution, concurrency, and storage.
 
 ## Performance Snapshot (vs SQLite)
 
-Run file: `docs/benchmarks/runs/bench-20251226-211444.json`
+Run file: `docs/benchmarks/runs/bench-20251226-214051.json`
 
 - Machine: Apple M2 (arm64), macOS 15.5
 - Compiler: Apple clang 17.0.0 (clang-1700.0.13.5)
@@ -62,10 +62,10 @@ Per-iteration ns/op (ratio = Entropy / SQLite, lower is better):
 
 | Case | Rows | Entropy (ns/op) | SQLite (ns/op) | Ratio |
 | --- | --- | --- | --- | --- |
-| Insert batch (txn) | 1k | `1,137,350` | `968,605` | `1.17x` |
-| Insert batch (txn) | 10k | `38,729,880` | `6,951,009` | `5.57x` |
-| Point select | 1k | `225,263` | `22,670` | `9.94x` |
-| Point select | 10k | `2,179,541` | `180,032` | `12.11x` |
+| Insert batch (txn) | 1k | `940,970` | `1,048,274` | `0.90x` |
+| Insert batch (txn) | 10k | `9,693,951` | `6,992,261` | `1.39x` |
+| Point select | 1k | `46,041` | `23,020` | `2.00x` |
+| Point select | 10k | `459,723` | `179,783` | `2.56x` |
 
 Rows = batch size for inserts; table cardinality for point selects.
 

@@ -1,6 +1,6 @@
 {
   "context": {
-    "date": "2025-12-26T21:15:29-05:00",
+    "date": "2025-12-26T21:41:03-05:00",
     "host_name": "Shrees-MacBook.local",
     "executable": "/Users/shreebatsa/Dev/entropy/build/bench/benchmarks/entropy_bench",
     "num_cpus": 8,
@@ -8,7 +8,7 @@
     "cpu_scaling_enabled": false,
     "caches": [
     ],
-    "load_avg": [2.51318,3.10498,2.5498],
+    "load_avg": [3.88086,4.4248,3.86035],
     "library_build_type": "release"
   },
   "benchmarks": [
@@ -21,11 +21,11 @@
       "repetitions": 1,
       "repetition_index": 0,
       "threads": 1,
-      "iterations": 613,
-      "real_time": 1.1373499002335002e+06,
-      "cpu_time": 1.1372920065252627e+06,
+      "iterations": 737,
+      "real_time": 9.4097017628371995e+05,
+      "cpu_time": 9.4070963364989869e+05,
       "time_unit": "ns",
-      "items_per_second": 8.7928165700845188e+05
+      "items_per_second": 1.0630272766741614e+06
     },
     {
       "name": "BM_Entropy_InsertBatch/10000",
@@ -36,11 +36,11 @@
       "repetitions": 1,
       "repetition_index": 0,
       "threads": 1,
-      "iterations": 18,
-      "real_time": 3.8729879565330014e+07,
-      "cpu_time": 3.8665888888888568e+07,
+      "iterations": 74,
+      "real_time": 9.6939514765541106e+06,
+      "cpu_time": 9.6286891891891304e+06,
       "time_unit": "ns",
-      "items_per_second": 2.5862589190012659e+05
+      "items_per_second": 1.0385629656867281e+06
     },
     {
       "name": "BM_Sqlite_InsertBatch/1000",
@@ -51,11 +51,11 @@
       "repetitions": 1,
       "repetition_index": 0,
       "threads": 1,
-      "iterations": 773,
-      "real_time": 9.6860515883850248e+05,
-      "cpu_time": 9.0659120310476737e+05,
+      "iterations": 763,
+      "real_time": 1.0482740414854955e+06,
+      "cpu_time": 9.4436828309309890e+05,
       "time_unit": "ns",
-      "items_per_second": 1.1030329839682309e+06
+      "items_per_second": 1.0589089213423072e+06
     },
     {
       "name": "BM_Sqlite_InsertBatch/10000",
@@ -66,11 +66,11 @@
       "repetitions": 1,
       "repetition_index": 0,
       "threads": 1,
-      "iterations": 102,
-      "real_time": 6.9510094027089719e+06,
-      "cpu_time": 6.8605588235294390e+06,
+      "iterations": 99,
+      "real_time": 6.9922609090090096e+06,
+      "cpu_time": 6.8795959595961533e+06,
       "time_unit": "ns",
-      "items_per_second": 1.4576072091537674e+06
+      "items_per_second": 1.4535737358312856e+06
     },
     {
       "name": "BM_Entropy_PointSelect/1000",
@@ -81,11 +81,11 @@
       "repetitions": 1,
       "repetition_index": 0,
       "threads": 1,
-      "iterations": 2821,
-      "real_time": 2.2526301242356992e+05,
-      "cpu_time": 2.2336015597305968e+05,
+      "iterations": 15349,
+      "real_time": 4.6041012441944404e+04,
+      "cpu_time": 4.5942667274740998e+04,
       "time_unit": "ns",
-      "items_per_second": 4.4770742375404407e+03
+      "items_per_second": 2.1766259107681239e+04
     },
     {
       "name": "BM_Entropy_PointSelect/10000",
@@ -96,11 +96,11 @@
       "repetitions": 1,
       "repetition_index": 0,
       "threads": 1,
-      "iterations": 343,
-      "real_time": 2.1795406937599182e+06,
-      "cpu_time": 2.1794897959183617e+06,
+      "iterations": 1563,
+      "real_time": 4.5972310172862263e+05,
+      "cpu_time": 4.5959948816378857e+05,
       "time_unit": "ns",
-      "items_per_second": 4.5882297860386842e+02
+      "items_per_second": 2.1758074709683483e+03
     },
     {
       "name": "BM_Sqlite_PointSelect/1000",
@@ -111,11 +111,11 @@
       "repetitions": 1,
       "repetition_index": 0,
       "threads": 1,
-      "iterations": 30635,
-      "real_time": 2.2669782632086633e+04,
-      "cpu_time": 2.2667798269952851e+04,
+      "iterations": 28454,
+      "real_time": 2.3019685279989073e+04,
+      "cpu_time": 2.2867505447388772e+04,
       "time_unit": "ns",
-      "items_per_second": 4.4115444653729042e+04
+      "items_per_second": 4.3730174342833248e+04
     },
     {
       "name": "BM_Sqlite_PointSelect/10000",
@@ -126,11 +126,11 @@
       "repetitions": 1,
       "repetition_index": 0,
       "threads": 1,
-      "iterations": 3926,
-      "real_time": 1.8003247579833909e+05,
-      "cpu_time": 1.7976974019358133e+05,
+      "iterations": 3848,
+      "real_time": 1.7978331808551657e+05,
+      "cpu_time": 1.7833705821205885e+05,
       "time_unit": "ns",
-      "items_per_second": 5.5626714424973352e+03
+      "items_per_second": 5.6073595136402309e+03
     }
   ]
 }

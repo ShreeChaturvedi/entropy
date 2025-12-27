@@ -236,6 +236,7 @@ public:
     insert.init();
     (void)insert.next();
 
+    statistics_->on_rows_inserted(ctx.table_info->oid, insert.rows_inserted());
     return Result(insert.rows_inserted());
   }
 
@@ -276,6 +277,7 @@ public:
     del.init();
     (void)del.next();
 
+    statistics_->on_rows_deleted(ctx.table_info->oid, del.rows_deleted());
     return Result(del.rows_deleted());
   }
 
@@ -292,15 +294,22 @@ public:
       return Result(status);
     }
 
+    if (auto *table_info = catalog_->get_table(stmt->table_name)) {
+      statistics_->on_table_created(table_info->oid);
+    }
     return Result(size_t(0)); // 0 rows affected
   }
 
   Result execute_drop_table(DropTableStatement *stmt) {
+    oid_t table_oid = catalog_->get_table_oid(stmt->table_name);
     Status status = catalog_->drop_table(stmt->table_name);
     if (!status.ok()) {
       return Result(status);
     }
 
+    if (table_oid != INVALID_OID) {
+      statistics_->on_table_dropped(table_oid);
+    }
     return Result(size_t(0)); // 0 rows affected
   }
 

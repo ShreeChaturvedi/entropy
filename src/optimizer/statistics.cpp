@@ -158,6 +158,49 @@ void Statistics::collect_statistics(oid_t table_oid) {
   table_stats_[table_oid] = std::move(stats);
 }
 
+void Statistics::on_table_created(oid_t table_oid) {
+  TableStatistics stats;
+  stats.row_count = 0;
+  stats.page_count = 0;
+  table_stats_[table_oid] = std::move(stats);
+}
+
+void Statistics::on_table_dropped(oid_t table_oid) {
+  table_stats_.erase(table_oid);
+}
+
+void Statistics::on_rows_inserted(oid_t table_oid, size_t rows) {
+  if (rows == 0) {
+    return;
+  }
+  auto &stats = table_stats_[table_oid];
+  stats.row_count += rows;
+  if (stats.row_count == 0) {
+    stats.page_count = 0;
+  } else {
+    stats.page_count = std::max<size_t>(1, (stats.row_count * 100) / 4096);
+  }
+}
+
+void Statistics::on_rows_deleted(oid_t table_oid, size_t rows) {
+  auto it = table_stats_.find(table_oid);
+  if (it == table_stats_.end()) {
+    return;
+  }
+  if (rows >= it->second.row_count) {
+    it->second.row_count = 0;
+  } else {
+    it->second.row_count -= rows;
+  }
+
+  if (it->second.row_count == 0) {
+    it->second.page_count = 0;
+  } else {
+    it->second.page_count =
+        std::max<size_t>(1, (it->second.row_count * 100) / 4096);
+  }
+}
+
 const TableStatistics *Statistics::get_table_stats(oid_t table_oid) const {
   auto it = table_stats_.find(table_oid);
   return (it != table_stats_.end()) ? &it->second : nullptr;

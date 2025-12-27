@@ -47,7 +47,7 @@ PROGRESS.md
 
 # Benchmark outputs
 docs/benchmarks/runs/*.json
-!docs/benchmarks/runs/bench-20251226-211444.json
+!docs/benchmarks/runs/bench-20251226-214051.json
 
 # Dependencies (if manually added)
 third_party/*/
