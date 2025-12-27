@@ -125,7 +125,7 @@ TEST_F(CatalogTest, TableHeapIntegration) {
   ASSERT_NE(info->table_heap, nullptr);
 
   // Insert a tuple using the TableHeap from catalog
-  std::vector<TupleValue> values = {TupleValue(int32_t(42)),
+  std::vector<TupleValue> values = {TupleValue(42),
                                     TupleValue(std::string("hello"))};
   Tuple tuple(values, schema);
 
