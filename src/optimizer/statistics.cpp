@@ -148,7 +148,8 @@ void Statistics::collect_statistics(oid_t table_oid) {
     }
     if (stats.row_count > 0) {
       col_stats.null_fraction =
-          static_cast<double>(null_counts[i]) / stats.row_count;
+          static_cast<double>(null_counts[i]) /
+          static_cast<double>(stats.row_count);
     }
   }
 

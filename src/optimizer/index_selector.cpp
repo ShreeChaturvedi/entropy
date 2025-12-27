@@ -30,8 +30,8 @@ IndexSelector::select_access_method(oid_t table_oid,
   // Estimate seq scan cost
   size_t rows = statistics_->table_cardinality(table_oid);
   size_t pages = std::max<size_t>(1, (rows * 100) / 4096);
-  result.seq_scan_cost =
-      pages * CostModel::SEQ_PAGE_COST + rows * CostModel::TUPLE_CPU_COST;
+  result.seq_scan_cost = static_cast<double>(pages) * CostModel::SEQ_PAGE_COST +
+                         static_cast<double>(rows) * CostModel::TUPLE_CPU_COST;
 
   // No predicate = full scan, prefer seq scan
   if (!predicate) {
@@ -46,7 +46,8 @@ IndexSelector::select_access_method(oid_t table_oid,
     if (index_oid.has_value()) {
       // Calculate index cost
       double seek_cost =
-          std::log2(std::max<size_t>(1, rows)) * CostModel::RANDOM_PAGE_COST;
+          std::log2(static_cast<double>(std::max<size_t>(1, rows))) *
+          CostModel::RANDOM_PAGE_COST;
       double fetch_cost = CostModel::INDEX_TUPLE_COST;
       result.index_cost = seek_cost + fetch_cost;
 
@@ -69,12 +70,15 @@ IndexSelector::select_access_method(oid_t table_oid,
     if (index_oid.has_value()) {
       // Estimate range selectivity
       double selectivity = Statistics::RANGE_SELECTIVITY;
-      size_t matching_rows = static_cast<size_t>(rows * selectivity);
+      size_t matching_rows =
+          static_cast<size_t>(static_cast<double>(rows) * selectivity);
 
       // Calculate index cost
       double seek_cost =
-          std::log2(std::max<size_t>(1, rows)) * CostModel::RANDOM_PAGE_COST;
-      double fetch_cost = matching_rows * CostModel::INDEX_TUPLE_COST;
+          std::log2(static_cast<double>(std::max<size_t>(1, rows))) *
+          CostModel::RANDOM_PAGE_COST;
+      double fetch_cost =
+          static_cast<double>(matching_rows) * CostModel::INDEX_TUPLE_COST;
       result.index_cost = seek_cost + fetch_cost;
 
       // Index is beneficial if selectivity is low
