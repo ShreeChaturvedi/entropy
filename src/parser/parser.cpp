@@ -291,22 +291,24 @@ std::unique_ptr<InsertStatement> Parser::parse_insert() {
 
     do {
       if (check(TokenType::INTEGER_LITERAL)) {
-        row.push_back(std::stoll(current_.value));
+        row.emplace_back(std::in_place_type<int64_t>,
+                         std::stoll(current_.value));
         advance();
       } else if (check(TokenType::FLOAT_LITERAL)) {
-        row.push_back(std::stod(current_.value));
+        row.emplace_back(std::in_place_type<double>,
+                         std::stod(current_.value));
         advance();
       } else if (check(TokenType::STRING_LITERAL)) {
-        row.push_back(current_.value);
+        row.emplace_back(std::in_place_type<std::string>, current_.value);
         advance();
       } else if (check(TokenType::TRUE_KEYWORD)) {
-        row.push_back(true);
+        row.emplace_back(std::in_place_type<bool>, true);
         advance();
       } else if (check(TokenType::FALSE_KEYWORD)) {
-        row.push_back(false);
+        row.emplace_back(std::in_place_type<bool>, false);
         advance();
       } else if (check(TokenType::NULL_KEYWORD)) {
-        row.push_back(std::monostate{});
+        row.emplace_back(std::in_place_type<std::monostate>);
         advance();
       } else {
         set_error("Expected value in VALUES");
