@@ -32,7 +32,12 @@ DiskManager::DiskManager(const std::string& db_file) : db_file_(db_file) {
     // Determine number of pages
     db_io_.seekg(0, std::ios::end);
     auto file_size = db_io_.tellg();
-    num_pages_ = static_cast<page_id_t>(file_size / page_size());
+    const auto page_size_off = static_cast<std::streamoff>(page_size());
+    if (file_size < 0) {
+        num_pages_ = 0;
+    } else {
+        num_pages_ = static_cast<page_id_t>(file_size / page_size_off);
+    }
 
     LOG_INFO("Opened database file: {} with {} pages", db_file_, num_pages_);
 }
@@ -50,8 +55,9 @@ Status DiskManager::read_page(page_id_t page_id, char* page_data) {
         return Status::InvalidArgument("Invalid page ID");
     }
 
-    auto offset = static_cast<std::streamoff>(page_id) * page_size();
-    db_io_.seekg(offset);
+    const auto offset = static_cast<std::streamoff>(page_id) *
+                        static_cast<std::streamoff>(page_size());
+    db_io_.seekg(offset, std::ios::beg);
 
     if (!db_io_) {
         return Status::IOError("Failed to seek to page");
@@ -64,9 +70,14 @@ Status DiskManager::read_page(page_id_t page_id, char* page_data) {
     }
 
     // Handle reading beyond file (return zeroed page)
-    auto bytes_read = db_io_.gcount();
-    if (bytes_read < static_cast<std::streamsize>(page_size())) {
-        std::memset(page_data + bytes_read, 0, page_size() - bytes_read);
+    const auto bytes_read = db_io_.gcount();
+    if (bytes_read < 0) {
+        return Status::IOError("Failed to read page");
+    }
+    const auto bytes_read_size = static_cast<size_t>(bytes_read);
+    if (bytes_read_size < page_size()) {
+        std::memset(page_data + bytes_read_size, 0,
+                    page_size() - bytes_read_size);
     }
 
     return Status::Ok();
@@ -79,8 +90,9 @@ Status DiskManager::write_page(page_id_t page_id, const char* page_data) {
         return Status::InvalidArgument("Invalid page ID");
     }
 
-    auto offset = static_cast<std::streamoff>(page_id) * page_size();
-    db_io_.seekp(offset);
+    const auto offset = static_cast<std::streamoff>(page_id) *
+                        static_cast<std::streamoff>(page_size());
+    db_io_.seekp(offset, std::ios::beg);
 
     if (!db_io_) {
         return Status::IOError("Failed to seek to page");
