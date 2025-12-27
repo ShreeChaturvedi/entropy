@@ -93,7 +93,6 @@ size_t CostModel::estimate_cardinality(const PlanNode *plan) const {
   }
 
   case PlanNodeType::FILTER: {
-    auto *filter = static_cast<const FilterPlanNode *>(plan);
     // Estimate based on predicate selectivity
     double sel = Statistics::DEFAULT_SELECTIVITY;
     return static_cast<size_t>(child_card * sel);

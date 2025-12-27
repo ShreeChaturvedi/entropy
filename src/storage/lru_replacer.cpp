@@ -7,8 +7,7 @@
 
 namespace entropy {
 
-LRUReplacer::LRUReplacer([[maybe_unused]] size_t num_frames)
-    : num_frames_(num_frames) {}
+LRUReplacer::LRUReplacer([[maybe_unused]] size_t num_frames) {}
 
 bool LRUReplacer::evict(frame_id_t* frame_id) {
     std::lock_guard<std::mutex> lock(mutex_);

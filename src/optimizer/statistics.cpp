@@ -31,8 +31,8 @@ size_t Statistics::table_cardinality(oid_t table_oid) const {
 
   // Quick estimate: count tuples
   size_t count = 0;
-  for (auto it = table_info->table_heap->begin();
-       it != table_info->table_heap->end(); ++it) {
+  for (auto tuple_it = table_info->table_heap->begin();
+       tuple_it != table_info->table_heap->end(); ++tuple_it) {
     ++count;
   }
   return count;
@@ -58,7 +58,7 @@ double Statistics::column_selectivity(oid_t table_oid,
   return DEFAULT_SELECTIVITY;
 }
 
-double Statistics::estimate_selectivity(oid_t table_oid,
+double Statistics::estimate_selectivity([[maybe_unused]] oid_t table_oid,
                                         const Expression *predicate) const {
   if (!predicate) {
     return 1.0; // No predicate = all rows

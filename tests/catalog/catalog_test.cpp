@@ -67,7 +67,8 @@ TEST_F(CatalogTest, GetTableSchema) {
       Column("value", TypeId::DOUBLE),
   });
 
-  catalog_->create_table("data", schema);
+  auto status = catalog_->create_table("data", schema);
+  EXPECT_TRUE(status.ok());
 
   const Schema *retrieved = catalog_->get_table_schema("data");
   ASSERT_NE(retrieved, nullptr);
@@ -78,11 +79,12 @@ TEST_F(CatalogTest, GetTableSchema) {
 
 TEST_F(CatalogTest, DropTable) {
   Schema schema({Column("id", TypeId::INTEGER)});
-  catalog_->create_table("temp", schema);
+  auto status = catalog_->create_table("temp", schema);
+  EXPECT_TRUE(status.ok());
 
   EXPECT_TRUE(catalog_->table_exists("temp"));
 
-  auto status = catalog_->drop_table("temp");
+  status = catalog_->drop_table("temp");
   EXPECT_TRUE(status.ok());
 
   EXPECT_FALSE(catalog_->table_exists("temp"));

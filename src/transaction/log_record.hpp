@@ -310,7 +310,7 @@ public:
      * @param data Buffer containing serialized record
      * @return Deserialized log record
      */
-    static LogRecord deserialize(const char* data, uint32_t size) {
+    static LogRecord deserialize(const char* data, [[maybe_unused]] uint32_t size) {
         LogRecord record;
 
         // Read header

@@ -342,7 +342,9 @@ TEST_F(TupleTest, GetValueOutOfRange) {
 
     Tuple tuple(values, simple_schema_);
 
-    EXPECT_THROW(tuple.get_value(simple_schema_, 10), std::out_of_range);
+    EXPECT_THROW({
+        [[maybe_unused]] auto value = tuple.get_value(simple_schema_, 10);
+    }, std::out_of_range);
 }
 
 TEST_F(TupleTest, NullValue) {
@@ -608,17 +610,18 @@ TEST(TupleEdgeCaseTest, ManyColumns) {
     std::vector<TupleValue> values;
 
     // Create 32 integer columns (tests null bitmap with multiple bytes)
-    for (int i = 0; i < 32; ++i) {
+    for (uint32_t i = 0; i < 32; ++i) {
         columns.emplace_back("col_" + std::to_string(i), TypeId::INTEGER);
-        values.emplace_back(i * 100);
+        values.emplace_back(static_cast<int64_t>(i) * 100);
     }
 
     Schema schema(columns);
     Tuple tuple(values, schema);
 
     // Verify all values
-    for (int i = 0; i < 32; ++i) {
-        EXPECT_EQ(tuple.get_value(schema, i).as_integer(), i * 100);
+    for (uint32_t i = 0; i < 32; ++i) {
+        EXPECT_EQ(tuple.get_value(schema, i).as_integer(),
+                  static_cast<int64_t>(i) * 100);
     }
 }
 
@@ -627,10 +630,10 @@ TEST(TupleEdgeCaseTest, ManyNullColumns) {
     std::vector<TupleValue> values;
 
     // Create 16 columns with alternating null values
-    for (int i = 0; i < 16; ++i) {
+    for (uint32_t i = 0; i < 16; ++i) {
         columns.emplace_back("col_" + std::to_string(i), TypeId::INTEGER);
         if (i % 2 == 0) {
-            values.emplace_back(i);
+            values.emplace_back(static_cast<int64_t>(i));
         } else {
             values.push_back(TupleValue::null());
         }
@@ -640,10 +643,11 @@ TEST(TupleEdgeCaseTest, ManyNullColumns) {
     Tuple tuple(values, schema);
 
     // Verify null pattern
-    for (int i = 0; i < 16; ++i) {
+    for (uint32_t i = 0; i < 16; ++i) {
         if (i % 2 == 0) {
             EXPECT_FALSE(tuple.is_null(i)) << "Column " << i << " should not be null";
-            EXPECT_EQ(tuple.get_value(schema, i).as_integer(), i);
+            EXPECT_EQ(tuple.get_value(schema, i).as_integer(),
+                      static_cast<int64_t>(i));
         } else {
             EXPECT_TRUE(tuple.is_null(i)) << "Column " << i << " should be null";
         }

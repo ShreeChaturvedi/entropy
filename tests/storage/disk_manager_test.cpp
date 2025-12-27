@@ -65,9 +65,9 @@ TEST_F(DiskManagerTest, MultiplePages) {
     std::vector<page_id_t> page_ids;
 
     // Allocate and write pages
-    for (int i = 0; i < num_pages; ++i) {
+    for (size_t i = 0; i < static_cast<size_t>(num_pages); ++i) {
         char write_data[config::kDefaultPageSize];
-        std::memset(write_data, i, config::kDefaultPageSize);
+        std::memset(write_data, static_cast<int>(i), config::kDefaultPageSize);
 
         page_id_t page_id = disk_manager_->allocate_page();
         page_ids.push_back(page_id);
@@ -77,10 +77,10 @@ TEST_F(DiskManagerTest, MultiplePages) {
     }
 
     // Verify each page
-    for (int i = 0; i < num_pages; ++i) {
+    for (size_t i = 0; i < static_cast<size_t>(num_pages); ++i) {
         char read_data[config::kDefaultPageSize];
         char expected[config::kDefaultPageSize];
-        std::memset(expected, i, config::kDefaultPageSize);
+        std::memset(expected, static_cast<int>(i), config::kDefaultPageSize);
 
         auto status = disk_manager_->read_page(page_ids[i], read_data);
         EXPECT_TRUE(status.ok());
