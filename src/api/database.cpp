@@ -385,7 +385,8 @@ public:
     if (ctx.predicate) {
       double sel = statistics_->estimate_selectivity(ctx.table_info->oid,
                                                       ctx.predicate.get());
-      estimated_rows = static_cast<size_t>(estimated_rows * sel);
+      double estimated_rows_d = static_cast<double>(estimated_rows);
+      estimated_rows = static_cast<size_t>(estimated_rows_d * sel);
     }
     plan_lines.push_back("Estimated Rows: " + std::to_string(estimated_rows));
 
