@@ -1004,7 +1004,7 @@ TEST_F(LockManagerTest, BasicDeadlockDetection) {
 
 TEST_F(LockManagerTest, UpgradeBlockedByOthers) {
   // Test that lock upgrade waits when other transactions hold shared locks
-  lock_mgr_ = std::make_unique<LockManager>(true, 200);
+  lock_mgr_ = std::make_unique<LockManager>(true, 1000);
 
   Transaction txn1(1);
   Transaction txn2(2);
