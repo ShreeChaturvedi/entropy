@@ -20,7 +20,7 @@
       <rect x="660" y="530" width="260" height="110" rx="16" />
     </g>
 
-    <g font-size="15" font-weight="600" fill="#0F172A">
+    <g font-size="15" font-weight="600" fill="#0B0B0B">
       <text x="72" y="68">Client Interfaces</text>
       <text x="72" y="213">SQL Frontend</text>
       <text x="72" y="393">Planner</text>
@@ -34,32 +34,18 @@
       <text x="672" y="558">Disk Manager</text>
     </g>
 
-    <g font-size="12" fill="#0F172A" stroke="#CBD5E1" stroke-width="1">
+    <g font-size="12" fill="#EEF2F7" stroke="#CBD5E1" stroke-width="1">
       <rect x="72" y="90" width="70" height="26" rx="8" fill="#EEF2F7" />
       <rect x="150" y="90" width="70" height="26" rx="8" fill="#EEF2F7" />
       <rect x="228" y="90" width="70" height="26" rx="8" fill="#EEF2F7" />
-      <text x="107" y="107" text-anchor="middle">CLI</text>
-      <text x="185" y="107" text-anchor="middle">C++ API</text>
-      <text x="263" y="107" text-anchor="middle">SQL Text</text>
-
       <rect x="72" y="230" width="100" height="26" rx="8" fill="#EEF2F7" />
       <rect x="184" y="230" width="100" height="26" rx="8" fill="#EEF2F7" />
       <rect x="72" y="262" width="100" height="26" rx="8" fill="#EEF2F7" />
       <rect x="184" y="262" width="100" height="26" rx="8" fill="#EEF2F7" />
-      <text x="122" y="247" text-anchor="middle">Lexer</text>
-      <text x="234" y="247" text-anchor="middle">Parser</text>
-      <text x="122" y="279" text-anchor="middle">AST</text>
-      <text x="234" y="279" text-anchor="middle">Binder</text>
-
       <rect x="72" y="410" width="100" height="26" rx="8" fill="#EEF2F7" />
       <rect x="184" y="410" width="100" height="26" rx="8" fill="#EEF2F7" />
       <rect x="72" y="442" width="100" height="26" rx="8" fill="#EEF2F7" />
       <rect x="184" y="442" width="100" height="26" rx="8" fill="#EEF2F7" />
-      <text x="122" y="427" text-anchor="middle">Statistics</text>
-      <text x="234" y="427" text-anchor="middle">Cost Model</text>
-      <text x="122" y="459" text-anchor="middle">Index Select</text>
-      <text x="234" y="459" text-anchor="middle">Plan Nodes</text>
-
       <rect x="372" y="130" width="100" height="24" rx="8" fill="#EEF2F7" />
       <rect x="484" y="130" width="100" height="24" rx="8" fill="#EEF2F7" />
       <rect x="372" y="160" width="100" height="24" rx="8" fill="#EEF2F7" />
@@ -68,6 +54,39 @@
       <rect x="484" y="190" width="100" height="24" rx="8" fill="#EEF2F7" />
       <rect x="372" y="220" width="100" height="24" rx="8" fill="#EEF2F7" />
       <rect x="484" y="220" width="100" height="24" rx="8" fill="#EEF2F7" />
+      <rect x="372" y="376" width="100" height="26" rx="8" fill="#EEF2F7" />
+      <rect x="484" y="376" width="100" height="26" rx="8" fill="#EEF2F7" />
+      <rect x="372" y="408" width="100" height="26" rx="8" fill="#EEF2F7" />
+      <rect x="484" y="408" width="100" height="26" rx="8" fill="#EEF2F7" />
+      <rect x="372" y="566" width="70" height="26" rx="8" fill="#EEF2F7" />
+      <rect x="450" y="566" width="70" height="26" rx="8" fill="#EEF2F7" />
+      <rect x="528" y="566" width="70" height="26" rx="8" fill="#EEF2F7" />
+      <rect x="672" y="168" width="100" height="26" rx="8" fill="#EEF2F7" />
+      <rect x="784" y="168" width="100" height="26" rx="8" fill="#EEF2F7" />
+      <rect x="672" y="200" width="100" height="26" rx="8" fill="#EEF2F7" />
+      <rect x="784" y="200" width="100" height="26" rx="8" fill="#EEF2F7" />
+      <rect x="672" y="232" width="100" height="26" rx="8" fill="#EEF2F7" />
+      <rect x="784" y="232" width="100" height="26" rx="8" fill="#EEF2F7" />
+      <rect x="672" y="396" width="100" height="26" rx="8" fill="#EEF2F7" />
+      <rect x="784" y="396" width="100" height="26" rx="8" fill="#EEF2F7" />
+      <rect x="672" y="428" width="100" height="26" rx="8" fill="#EEF2F7" />
+      <rect x="784" y="428" width="100" height="26" rx="8" fill="#EEF2F7" />
+      <rect x="672" y="576" width="100" height="26" rx="8" fill="#EEF2F7" />
+      <rect x="784" y="576" width="100" height="26" rx="8" fill="#EEF2F7" />
+    </g>
+
+    <g font-size="12" fill="#0B0B0B">
+      <text x="107" y="107" text-anchor="middle">CLI</text>
+      <text x="185" y="107" text-anchor="middle">C++ API</text>
+      <text x="263" y="107" text-anchor="middle">SQL Text</text>
+      <text x="122" y="247" text-anchor="middle">Lexer</text>
+      <text x="234" y="247" text-anchor="middle">Parser</text>
+      <text x="122" y="279" text-anchor="middle">AST</text>
+      <text x="234" y="279" text-anchor="middle">Binder</text>
+      <text x="122" y="427" text-anchor="middle">Statistics</text>
+      <text x="234" y="427" text-anchor="middle">Cost Model</text>
+      <text x="122" y="459" text-anchor="middle">Index Select</text>
+      <text x="234" y="459" text-anchor="middle">Plan Nodes</text>
       <text x="422" y="146" text-anchor="middle">Seq Scan</text>
       <text x="534" y="146" text-anchor="middle">Index Scan</text>
       <text x="422" y="176" text-anchor="middle">Hash Join</text>
@@ -76,47 +95,23 @@
       <text x="534" y="206" text-anchor="middle">Aggregate</text>
       <text x="422" y="236" text-anchor="middle">Filter</text>
       <text x="534" y="236" text-anchor="middle">DML</text>
-
-      <rect x="372" y="376" width="100" height="26" rx="8" fill="#EEF2F7" />
-      <rect x="484" y="376" width="100" height="26" rx="8" fill="#EEF2F7" />
-      <rect x="372" y="408" width="100" height="26" rx="8" fill="#EEF2F7" />
-      <rect x="484" y="408" width="100" height="26" rx="8" fill="#EEF2F7" />
       <text x="422" y="393" text-anchor="middle">MVCC</text>
       <text x="534" y="393" text-anchor="middle">Lock Mgr</text>
       <text x="422" y="425" text-anchor="middle">WAL</text>
       <text x="534" y="425" text-anchor="middle">Recovery</text>
-
-      <rect x="372" y="566" width="70" height="26" rx="8" fill="#EEF2F7" />
-      <rect x="450" y="566" width="70" height="26" rx="8" fill="#EEF2F7" />
-      <rect x="528" y="566" width="70" height="26" rx="8" fill="#EEF2F7" />
       <text x="407" y="583" text-anchor="middle">Schemas</text>
       <text x="485" y="583" text-anchor="middle">Tables</text>
       <text x="563" y="583" text-anchor="middle">Indexes</text>
-
-      <rect x="672" y="168" width="100" height="26" rx="8" fill="#EEF2F7" />
-      <rect x="784" y="168" width="100" height="26" rx="8" fill="#EEF2F7" />
-      <rect x="672" y="200" width="100" height="26" rx="8" fill="#EEF2F7" />
-      <rect x="784" y="200" width="100" height="26" rx="8" fill="#EEF2F7" />
-      <rect x="672" y="232" width="100" height="26" rx="8" fill="#EEF2F7" />
-      <rect x="784" y="232" width="100" height="26" rx="8" fill="#EEF2F7" />
       <text x="722" y="185" text-anchor="middle">Table Heap</text>
       <text x="834" y="185" text-anchor="middle">Slotted</text>
       <text x="722" y="217" text-anchor="middle">Tuple</text>
       <text x="834" y="217" text-anchor="middle">B+ Tree</text>
       <text x="722" y="249" text-anchor="middle">Hash Index</text>
       <text x="834" y="249" text-anchor="middle">Compress</text>
-
-      <rect x="672" y="396" width="100" height="26" rx="8" fill="#EEF2F7" />
-      <rect x="784" y="396" width="100" height="26" rx="8" fill="#EEF2F7" />
-      <rect x="672" y="428" width="100" height="26" rx="8" fill="#EEF2F7" />
-      <rect x="784" y="428" width="100" height="26" rx="8" fill="#EEF2F7" />
       <text x="722" y="413" text-anchor="middle">Page Table</text>
       <text x="834" y="413" text-anchor="middle">LRU</text>
       <text x="722" y="445" text-anchor="middle">Pin</text>
       <text x="834" y="445" text-anchor="middle">Dirty</text>
-
-      <rect x="672" y="576" width="100" height="26" rx="8" fill="#EEF2F7" />
-      <rect x="784" y="576" width="100" height="26" rx="8" fill="#EEF2F7" />
       <text x="722" y="593" text-anchor="middle">Page IO</text>
       <text x="834" y="593" text-anchor="middle">WAL IO</text>
     </g>
