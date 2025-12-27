@@ -5,6 +5,9 @@
 
 #include "optimizer/index_selector.hpp"
 
+#include <algorithm>
+#include <cmath>
+
 #include "catalog/catalog.hpp"
 #include "parser/expression.hpp"
 
@@ -126,7 +129,7 @@ bool IndexSelector::extract_point_lookup(const Expression *predicate,
       return true;
     }
     if (val.is_bigint()) {
-      *key = static_cast<BPTreeKey>(val.as_bigint());
+      *key = val.as_bigint();
       return true;
     }
   }
@@ -143,7 +146,7 @@ bool IndexSelector::extract_point_lookup(const Expression *predicate,
       return true;
     }
     if (val.is_bigint()) {
-      *key = static_cast<BPTreeKey>(val.as_bigint());
+      *key = val.as_bigint();
       return true;
     }
   }
@@ -172,7 +175,7 @@ bool IndexSelector::extract_range_scan(const Expression *predicate,
   if (val.is_integer()) {
     value = static_cast<BPTreeKey>(val.as_integer());
   } else if (val.is_bigint()) {
-    value = static_cast<BPTreeKey>(val.as_bigint());
+    value = val.as_bigint();
   } else {
     return false;
   }
