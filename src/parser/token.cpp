@@ -67,6 +67,7 @@ const std::unordered_map<std::string, TokenType> Lexer::keywords_ = {
     {"INTEGER", TokenType::INTEGER},
     {"BIGINT", TokenType::BIGINT},
     {"SMALLINT", TokenType::SMALLINT},
+    {"TINYINT", TokenType::TINYINT},
     {"BOOLEAN", TokenType::BOOLEAN},
     {"VARCHAR", TokenType::VARCHAR},
     {"TEXT", TokenType::TEXT},
@@ -160,6 +161,8 @@ const char *token_type_to_string(TokenType type) {
     return "BIGINT";
   case TokenType::SMALLINT:
     return "SMALLINT";
+  case TokenType::TINYINT:
+    return "TINYINT";
   case TokenType::BOOLEAN:
     return "BOOLEAN";
   case TokenType::VARCHAR:

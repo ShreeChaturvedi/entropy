@@ -5,6 +5,9 @@
 
 #include "parser/parser.hpp"
 
+#include <stdexcept>
+#include <string>
+
 namespace entropy {
 
 Parser::Parser(std::string_view sql)
@@ -59,6 +62,38 @@ void Parser::set_error(const std::string &message) {
     error_.message = message;
     error_.line = current_.line;
     error_.column = current_.column;
+  }
+}
+
+// std::out_of_range and std::invalid_argument both derive from
+// std::logic_error, so a single catch guards overflow and malformed input.
+bool Parser::to_int64(const std::string &text, int64_t *out) {
+  try {
+    *out = static_cast<int64_t>(std::stoll(text));
+    return true;
+  } catch (const std::logic_error &) {
+    set_error("Invalid integer literal '" + text + "' (out of range)");
+    return false;
+  }
+}
+
+bool Parser::to_uint64(const std::string &text, uint64_t *out) {
+  try {
+    *out = std::stoull(text);
+    return true;
+  } catch (const std::logic_error &) {
+    set_error("Invalid integer literal '" + text + "' (out of range)");
+    return false;
+  }
+}
+
+bool Parser::to_double(const std::string &text, double *out) {
+  try {
+    *out = std::stod(text);
+    return true;
+  } catch (const std::logic_error &) {
+    set_error("Invalid floating-point literal '" + text + "' (out of range)");
+    return false;
   }
 }
 
@@ -230,7 +265,11 @@ std::unique_ptr<SelectStatement> Parser::parse_select() {
   // Parse optional LIMIT clause
   if (match(TokenType::LIMIT)) {
     if (check(TokenType::INTEGER_LITERAL)) {
-      stmt->limit = std::stoull(current_.value);
+      uint64_t limit = 0;
+      if (!to_uint64(current_.value, &limit)) {
+        return nullptr;
+      }
+      stmt->limit = static_cast<size_t>(limit);
       advance();
     } else {
       set_error("Expected integer after LIMIT");
@@ -240,7 +279,11 @@ std::unique_ptr<SelectStatement> Parser::parse_select() {
     // Optional OFFSET
     if (match(TokenType::OFFSET)) {
       if (check(TokenType::INTEGER_LITERAL)) {
-        stmt->offset = std::stoull(current_.value);
+        uint64_t offset = 0;
+        if (!to_uint64(current_.value, &offset)) {
+          return nullptr;
+        }
+        stmt->offset = static_cast<size_t>(offset);
         advance();
       } else {
         set_error("Expected integer after OFFSET");
@@ -291,12 +334,18 @@ std::unique_ptr<InsertStatement> Parser::parse_insert() {
 
     do {
       if (check(TokenType::INTEGER_LITERAL)) {
-        row.emplace_back(std::in_place_type<int64_t>,
-                         std::stoll(current_.value));
+        int64_t int_val = 0;
+        if (!to_int64(current_.value, &int_val)) {
+          return nullptr;
+        }
+        row.emplace_back(std::in_place_type<int64_t>, int_val);
         advance();
       } else if (check(TokenType::FLOAT_LITERAL)) {
-        row.emplace_back(std::in_place_type<double>,
-                         std::stod(current_.value));
+        double float_val = 0.0;
+        if (!to_double(current_.value, &float_val)) {
+          return nullptr;
+        }
+        row.emplace_back(std::in_place_type<double>, float_val);
         advance();
       } else if (check(TokenType::STRING_LITERAL)) {
         row.emplace_back(std::in_place_type<std::string>, current_.value);
@@ -572,14 +621,22 @@ std::unique_ptr<Expression> Parser::parse_unary() {
 std::unique_ptr<Expression> Parser::parse_primary() {
   // Integer literal
   if (check(TokenType::INTEGER_LITERAL)) {
-    auto val = TupleValue(static_cast<int64_t>(std::stoll(current_.value)));
+    int64_t int_val = 0;
+    if (!to_int64(current_.value, &int_val)) {
+      return nullptr;
+    }
+    auto val = TupleValue(int_val);
     advance();
     return std::make_unique<ConstantExpression>(val);
   }
 
   // Float literal
   if (check(TokenType::FLOAT_LITERAL)) {
-    auto val = TupleValue(std::stod(current_.value));
+    double float_val = 0.0;
+    if (!to_double(current_.value, &float_val)) {
+      return nullptr;
+    }
+    auto val = TupleValue(float_val);
     advance();
     return std::make_unique<ConstantExpression>(val);
   }
@@ -650,6 +707,8 @@ TypeId Parser::parse_data_type(size_t *length_out) {
     type = TypeId::BIGINT;
   } else if (match(TokenType::SMALLINT)) {
     type = TypeId::SMALLINT;
+  } else if (match(TokenType::TINYINT)) {
+    type = TypeId::TINYINT;
   } else if (match(TokenType::BOOLEAN)) {
     type = TypeId::BOOLEAN;
   } else if (match(TokenType::FLOAT)) {
@@ -661,8 +720,12 @@ TypeId Parser::parse_data_type(size_t *length_out) {
     // Parse optional length: VARCHAR(100)
     if (match(TokenType::LPAREN)) {
       if (check(TokenType::INTEGER_LITERAL)) {
+        uint64_t length = 0;
+        if (!to_uint64(current_.value, &length)) {
+          return type;
+        }
         if (length_out) {
-          *length_out = std::stoull(current_.value);
+          *length_out = static_cast<size_t>(length);
         }
         advance();
       }

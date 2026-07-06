@@ -97,16 +97,23 @@ Status Binder::bind_expression(Expression *expr, const TableInfo *table_info) {
     if (logical == nullptr) {
       return Status::InvalidArgument("Invalid logical expression");
     }
-    // Note: LogicalExpression uses left_ for both binary and unary NOT
-    // We need to access left and right through the interface
-    // For simplicity, we'll bind the children recursively
-    // This requires adding accessors to LogicalExpression
-    return Status::Ok(); // For now, logical expressions are self-contained
+    // AND/OR are binary; NOT is unary with left() as its operand and a null
+    // right(). Recurse into both children so columns under AND/OR/NOT get
+    // resolved and unknown columns surface as a clean NotFound (bind_expression
+    // treats a null child as Ok).
+    auto status =
+        bind_expression(const_cast<Expression *>(logical->left()), table_info);
+    if (!status.ok())
+      return status;
+    return bind_expression(const_cast<Expression *>(logical->right()),
+                           table_info);
   }
 
   case ExpressionType::IS_NULL:
   case ExpressionType::UNARY:
-    // These would need similar treatment
+    // No concrete expression classes currently produce these node types
+    // (unary minus lowers to a BinaryOpExpression and NOT to a
+    // LogicalExpression), so there are no children to bind here.
     return Status::Ok();
   }
 

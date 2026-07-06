@@ -346,6 +346,91 @@ TEST_F(ParserTest, ParseError) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Numeric literal overflow / malformed handling (issue #28)
+//
+// Overflowing or malformed numeric literals must be reported through the
+// Status-based error path, never crash the process with an uncaught
+// std::out_of_range / std::invalid_argument.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST_F(ParserTest, LimitLiteralOverflow) {
+  Parser parser("SELECT * FROM t LIMIT 99999999999999999999999");
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  EXPECT_FALSE(status.ok());
+}
+
+TEST_F(ParserTest, OffsetLiteralOverflow) {
+  Parser parser("SELECT * FROM t LIMIT 10 OFFSET 99999999999999999999999");
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  EXPECT_FALSE(status.ok());
+}
+
+TEST_F(ParserTest, WhereIntLiteralOverflow) {
+  Parser parser("SELECT * FROM t WHERE id = 99999999999999999999999");
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  EXPECT_FALSE(status.ok());
+}
+
+TEST_F(ParserTest, WhereNegativeIntLiteralOverflow) {
+  Parser parser("SELECT * FROM t WHERE id = -99999999999999999999999");
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  EXPECT_FALSE(status.ok());
+}
+
+TEST_F(ParserTest, WhereFloatLiteralOverflow) {
+  // A float literal far beyond the range of double (~1.8e308). The lexer has
+  // no exponent notation, so the magnitude comes from the digit count.
+  std::string big_float = std::string(400, '9') + ".0";
+  Parser parser("SELECT * FROM t WHERE x = " + big_float);
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  EXPECT_FALSE(status.ok());
+}
+
+TEST_F(ParserTest, InsertIntLiteralOverflow) {
+  Parser parser("INSERT INTO t VALUES (99999999999999999999999)");
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  EXPECT_FALSE(status.ok());
+}
+
+TEST_F(ParserTest, InsertFloatLiteralOverflow) {
+  std::string big_float = std::string(400, '9') + ".0";
+  Parser parser("INSERT INTO t VALUES (" + big_float + ")");
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  EXPECT_FALSE(status.ok());
+}
+
+TEST_F(ParserTest, VarcharLengthOverflow) {
+  Parser parser("CREATE TABLE t (a VARCHAR(99999999999999999999999))");
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  EXPECT_FALSE(status.ok());
+}
+
+// A valid boundary literal must still parse cleanly.
+TEST_F(ParserTest, MaxInt64LiteralParses) {
+  Parser parser("SELECT * FROM t WHERE id = 9223372036854775807");
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  EXPECT_TRUE(status.ok());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Expression Evaluation Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -421,6 +506,86 @@ TEST_F(ExpressionTest, StringComparison) {
       std::make_unique<ConstantExpression>(TupleValue(std::string("abc")));
   auto right =
       std::make_unique<ConstantExpression>(TupleValue(std::string("abc")));
+
+  auto expr = std::make_unique<ComparisonExpression>(
+      ComparisonType::EQUAL, std::move(left), std::move(right));
+
+  TupleValue result = expr->evaluate(tuple_, schema_);
+  EXPECT_TRUE(result.is_bool());
+  EXPECT_TRUE(result.as_bool());
+}
+
+// Incompatible operand types have no defined ordering. Under SQL three-valued
+// logic the comparison must evaluate to NULL (not-true), never silently match.
+TEST_F(ExpressionTest, IncompatibleTypeEqualIsNull) {
+  auto left =
+      std::make_unique<ConstantExpression>(TupleValue(static_cast<int64_t>(5)));
+  auto right =
+      std::make_unique<ConstantExpression>(TupleValue(std::string("abc")));
+
+  auto expr = std::make_unique<ComparisonExpression>(
+      ComparisonType::EQUAL, std::move(left), std::move(right));
+
+  TupleValue result = expr->evaluate(tuple_, schema_);
+  EXPECT_TRUE(result.is_null());
+}
+
+TEST_F(ExpressionTest, IncompatibleTypeEqualIsNullStringVsInt) {
+  auto left =
+      std::make_unique<ConstantExpression>(TupleValue(std::string("abc")));
+  auto right =
+      std::make_unique<ConstantExpression>(TupleValue(static_cast<int64_t>(5)));
+
+  auto expr = std::make_unique<ComparisonExpression>(
+      ComparisonType::EQUAL, std::move(left), std::move(right));
+
+  TupleValue result = expr->evaluate(tuple_, schema_);
+  EXPECT_TRUE(result.is_null());
+}
+
+TEST_F(ExpressionTest, IncompatibleTypeBoolVsIntIsNull) {
+  auto left = std::make_unique<ConstantExpression>(TupleValue(true));
+  auto right =
+      std::make_unique<ConstantExpression>(TupleValue(static_cast<int64_t>(1)));
+
+  auto expr = std::make_unique<ComparisonExpression>(
+      ComparisonType::EQUAL, std::move(left), std::move(right));
+
+  TupleValue result = expr->evaluate(tuple_, schema_);
+  EXPECT_TRUE(result.is_null());
+}
+
+TEST_F(ExpressionTest, IncompatibleTypeLessEqualIsNull) {
+  auto left =
+      std::make_unique<ConstantExpression>(TupleValue(static_cast<int64_t>(5)));
+  auto right =
+      std::make_unique<ConstantExpression>(TupleValue(std::string("abc")));
+
+  auto expr = std::make_unique<ComparisonExpression>(
+      ComparisonType::LESS_EQUAL, std::move(left), std::move(right));
+
+  TupleValue result = expr->evaluate(tuple_, schema_);
+  EXPECT_TRUE(result.is_null());
+}
+
+TEST_F(ExpressionTest, IncompatibleTypeGreaterEqualIsNull) {
+  auto left =
+      std::make_unique<ConstantExpression>(TupleValue(static_cast<int64_t>(5)));
+  auto right =
+      std::make_unique<ConstantExpression>(TupleValue(std::string("abc")));
+
+  auto expr = std::make_unique<ComparisonExpression>(
+      ComparisonType::GREATER_EQUAL, std::move(left), std::move(right));
+
+  TupleValue result = expr->evaluate(tuple_, schema_);
+  EXPECT_TRUE(result.is_null());
+}
+
+// int/float mixing stays a valid numeric comparison and must NOT become NULL.
+TEST_F(ExpressionTest, IntFloatComparisonStillValid) {
+  auto left =
+      std::make_unique<ConstantExpression>(TupleValue(static_cast<int64_t>(3)));
+  auto right = std::make_unique<ConstantExpression>(TupleValue(3.0));
 
   auto expr = std::make_unique<ComparisonExpression>(
       ComparisonType::EQUAL, std::move(left), std::move(right));
@@ -587,6 +752,73 @@ TEST_F(BinderTest, BindDelete) {
 
   EXPECT_NE(context.table_info, nullptr);
   EXPECT_NE(context.predicate, nullptr);
+}
+
+// Regression tests for #29: the binder must descend into the children of
+// AND/OR/NOT so that unknown columns under a logical operator are rejected.
+TEST_F(BinderTest, BindSelectUnknownColumnUnderAnd) {
+  Parser parser("SELECT * FROM users WHERE bogus_col = 1 AND age = 2");
+  std::unique_ptr<Statement> stmt;
+  ASSERT_TRUE(parser.parse(&stmt).ok());
+
+  auto *select = dynamic_cast<SelectStatement *>(stmt.get());
+  BoundSelectContext context;
+  auto status = binder_->bind_select(select, &context);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.code(), StatusCode::kNotFound);
+}
+
+TEST_F(BinderTest, BindSelectUnknownColumnUnderOr) {
+  Parser parser("SELECT * FROM users WHERE age = 1 OR bogus_col = 2");
+  std::unique_ptr<Statement> stmt;
+  ASSERT_TRUE(parser.parse(&stmt).ok());
+
+  auto *select = dynamic_cast<SelectStatement *>(stmt.get());
+  BoundSelectContext context;
+  auto status = binder_->bind_select(select, &context);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.code(), StatusCode::kNotFound);
+}
+
+TEST_F(BinderTest, BindSelectUnknownColumnUnderNot) {
+  Parser parser("SELECT * FROM users WHERE NOT (bogus_col = 1)");
+  std::unique_ptr<Statement> stmt;
+  ASSERT_TRUE(parser.parse(&stmt).ok());
+
+  auto *select = dynamic_cast<SelectStatement *>(stmt.get());
+  BoundSelectContext context;
+  auto status = binder_->bind_select(select, &context);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.code(), StatusCode::kNotFound);
+}
+
+TEST_F(BinderTest, BindSelectValidColumnsUnderLogical) {
+  Parser parser("SELECT * FROM users WHERE age = 1 AND id = 2");
+  std::unique_ptr<Statement> stmt;
+  ASSERT_TRUE(parser.parse(&stmt).ok());
+
+  auto *select = dynamic_cast<SelectStatement *>(stmt.get());
+  BoundSelectContext context;
+  auto status = binder_->bind_select(select, &context);
+  EXPECT_TRUE(status.ok()) << status.to_string();
+  ASSERT_NE(context.predicate, nullptr);
+
+  // Column indices under the logical operator must be resolved by the binder.
+  auto *logical = dynamic_cast<LogicalExpression *>(context.predicate.get());
+  ASSERT_NE(logical, nullptr);
+  EXPECT_EQ(logical->op(), LogicalOpType::AND);
+
+  auto *lhs = dynamic_cast<const ComparisonExpression *>(logical->left());
+  ASSERT_NE(lhs, nullptr);
+  auto *lhs_col = dynamic_cast<const ColumnRefExpression *>(lhs->left());
+  ASSERT_NE(lhs_col, nullptr);
+  EXPECT_EQ(lhs_col->column_index(), 2u); // age is index 2
+
+  auto *rhs = dynamic_cast<const ComparisonExpression *>(logical->right());
+  ASSERT_NE(rhs, nullptr);
+  auto *rhs_col = dynamic_cast<const ColumnRefExpression *>(rhs->left());
+  ASSERT_NE(rhs_col, nullptr);
+  EXPECT_EQ(rhs_col->column_index(), 0u); // id is index 0
 }
 
 } // namespace

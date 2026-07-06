@@ -271,5 +271,38 @@ TEST_F(DatabaseTest, EmptySelectIsDistinguishableFromDml) {
   EXPECT_TRUE(result.has_rows());
 }
 
+// Regression test for #9: SELECT of narrow numeric columns (SMALLINT/TINYINT/
+// FLOAT) must return the stored value, not a silent NULL. Before the fix,
+// tuple_value_to_value handled only int32/int64/double and these fell through
+// to Value() (NULL).
+TEST_F(DatabaseTest, SelectNarrowNumericTypes) {
+  Database db(temp_file_->string());
+
+  auto result = db.execute(
+      "CREATE TABLE nums (s SMALLINT, t TINYINT, f FLOAT)");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
+
+  result = db.execute("INSERT INTO nums VALUES (5, 7, 2.5)");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
+  EXPECT_EQ(result.affected_rows(), 1);
+
+  result = db.execute("SELECT s, t, f FROM nums");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
+  ASSERT_EQ(result.row_count(), 1);
+
+  const auto &row = result.rows()[0];
+  ASSERT_EQ(row.size(), 3u);
+
+  // None of these may be NULL (the bug returned NULL for all three).
+  EXPECT_FALSE(row[0].is_null()) << "SMALLINT column returned NULL";
+  EXPECT_FALSE(row[1].is_null()) << "TINYINT column returned NULL";
+  EXPECT_FALSE(row[2].is_null()) << "FLOAT column returned NULL";
+
+  // Narrow integers widen to int32, FLOAT widens to double.
+  EXPECT_EQ(row[0].as_int32(), 5);
+  EXPECT_EQ(row[1].as_int32(), 7);
+  EXPECT_DOUBLE_EQ(row[2].as_double(), 2.5);
+}
+
 } // namespace
 } // namespace entropy

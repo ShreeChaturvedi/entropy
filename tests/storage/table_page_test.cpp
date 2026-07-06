@@ -174,6 +174,59 @@ TEST_F(TablePageTest, UpdateRecordLarger) {
     EXPECT_STREQ(record.data(), updated);
 }
 
+// Regression test for issue #1: growing a non-last record on a nearly-full
+// page must fail gracefully instead of overflowing the page buffer.
+//
+// The grow path relocates the record to `size` fresh bytes at free_space_end
+// while leaving the old bytes as a hole. The buggy check only required the
+// (size - old_length) delta of free space; when the true contiguous free
+// space was between (size - old_length) and size, `free_space_end - size`
+// underflowed a uint16_t (~65000) and the subsequent memcpy wrote tens of KB
+// past the 4096-byte page. This test builds exactly that boundary condition.
+TEST_F(TablePageTest, UpdateRecordGrowDoesNotFitReturnsFalse) {
+    // Record 0 is the (non-last) record we will try to grow.
+    const std::string rec0(100, 'A');
+    auto slot0 = table_page_->insert_record(
+        rec0.data(), static_cast<uint16_t>(rec0.size()));
+    ASSERT_TRUE(slot0.has_value());
+
+    // Record 1 fills most of the page, driving free_space_end down to a small
+    // value (~296) so that a large `size` exceeds free_space_end.
+    const std::string rec1(3700, 'B');
+    auto slot1 = table_page_->insert_record(
+        rec1.data(), static_cast<uint16_t>(rec1.size()));
+    ASSERT_TRUE(slot1.has_value());
+
+    // Now: contiguous free space ~256 bytes. Growing record 0 (old length 100)
+    // to 350 bytes has delta 250 (<= 256, so the OLD check passed) but needs
+    // the full 350 bytes (> 256), which does not fit.
+    const uint16_t new_size = 350;
+    ASSERT_LT(table_page_->get_free_space(), new_size);
+    ASSERT_GE(table_page_->get_free_space(),
+              static_cast<uint16_t>(new_size - rec0.size()));
+
+    const uint16_t free_before = table_page_->get_free_space();
+    const uint16_t slot_count_before = table_page_->get_slot_count();
+
+    const std::string big(new_size, 'C');
+    // Old code: underflows and overflows the page (crash / ASan report).
+    // Fixed code: detects the shortfall and returns false.
+    EXPECT_FALSE(table_page_->update_record(
+        slot0.value(), big.data(), static_cast<uint16_t>(big.size())));
+
+    // The page must be untouched: both records intact, space accounting stable.
+    EXPECT_EQ(table_page_->get_free_space(), free_before);
+    EXPECT_EQ(table_page_->get_slot_count(), slot_count_before);
+
+    auto r0 = table_page_->get_record(slot0.value());
+    ASSERT_EQ(r0.size(), rec0.size());
+    EXPECT_EQ(std::string(r0.data(), r0.size()), rec0);
+
+    auto r1 = table_page_->get_record(slot1.value());
+    ASSERT_EQ(r1.size(), rec1.size());
+    EXPECT_EQ(std::string(r1.data(), r1.size()), rec1);
+}
+
 TEST_F(TablePageTest, FreeSpaceDecreases) {
     uint16_t initial_free = table_page_->get_free_space();
 
