@@ -73,6 +73,7 @@ enum class TokenType {
   INTEGER,
   BIGINT,
   SMALLINT,
+  TINYINT,
   BOOLEAN,
   VARCHAR,
   TEXT,

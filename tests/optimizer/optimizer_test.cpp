@@ -87,6 +87,65 @@ TEST_F(OptimizerTest, CollectStatistics) {
   EXPECT_GT(stats->page_count, 0);
 }
 
+// Regression test for issue #15: collect_statistics previously used fixed
+// 32-element stack arrays (null_counts[32], distinct_estimates[32]) indexed by
+// the table's column_count() with no bound check. A table with more than 32
+// columns wrote past the end of those arrays, corrupting the stack (UB). This
+// builds a 40-column table and verifies per-column statistics are correct;
+// under AddressSanitizer it flags a stack-buffer-overflow before the fix.
+TEST_F(OptimizerTest, CollectStatisticsManyColumns) {
+  constexpr size_t kNumColumns = 40; // > 32, past the old fixed-array bound
+  constexpr int kNumRows = 10;
+  constexpr size_t kNullColumn = 35; // > 32, exercises OOB write directly
+
+  std::vector<Column> columns;
+  columns.reserve(kNumColumns);
+  for (size_t c = 0; c < kNumColumns; ++c) {
+    columns.emplace_back("col" + std::to_string(c), TypeId::INTEGER);
+  }
+  Schema wide_schema(columns);
+  ASSERT_TRUE(catalog_->create_table("wide", wide_schema).ok());
+  TableInfo *wide_info = catalog_->get_table("wide");
+  ASSERT_NE(wide_info, nullptr);
+
+  // Column kNullColumn is NULL in every row; all other columns are non-null.
+  for (int r = 0; r < kNumRows; ++r) {
+    std::vector<TupleValue> values;
+    values.reserve(kNumColumns);
+    for (size_t c = 0; c < kNumColumns; ++c) {
+      if (c == kNullColumn) {
+        values.push_back(TupleValue::null());
+      } else {
+        values.push_back(TupleValue(r * 100 + static_cast<int>(c)));
+      }
+    }
+    Tuple tuple(values, wide_schema);
+    RID rid;
+    ASSERT_TRUE(wide_info->table_heap->insert_tuple(tuple, &rid).ok());
+  }
+
+  statistics_->collect_statistics(wide_info->oid);
+  const auto *stats = statistics_->get_table_stats(wide_info->oid);
+  ASSERT_NE(stats, nullptr);
+  EXPECT_EQ(stats->row_count, static_cast<size_t>(kNumRows));
+  EXPECT_EQ(stats->columns.size(), kNumColumns);
+
+  for (size_t c = 0; c < kNumColumns; ++c) {
+    auto it = stats->columns.find(static_cast<column_id_t>(c));
+    ASSERT_NE(it, stats->columns.end()) << "missing stats for column " << c;
+    const ColumnStatistics &cs = it->second;
+    if (c == kNullColumn) {
+      // All-null column: no distinct non-null values, null_fraction == 1.0.
+      EXPECT_DOUBLE_EQ(cs.null_fraction, 1.0) << "column " << c;
+      EXPECT_DOUBLE_EQ(cs.distinct_values, 0.0) << "column " << c;
+    } else {
+      // Non-null column: distinct_estimates == row_count, scaled by 0.9.
+      EXPECT_DOUBLE_EQ(cs.null_fraction, 0.0) << "column " << c;
+      EXPECT_DOUBLE_EQ(cs.distinct_values, kNumRows * 0.9) << "column " << c;
+    }
+  }
+}
+
 TEST_F(OptimizerTest, PredicateSelectivity) {
   auto eq_expr = std::make_unique<ComparisonExpression>(
       ComparisonType::EQUAL, std::make_unique<ColumnRefExpression>("id"),

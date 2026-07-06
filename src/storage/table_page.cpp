@@ -121,33 +121,40 @@ bool TablePage::update_record(slot_id_t slot_id, const char* data, uint16_t size
         return true;
     }
 
-    // New record is larger - check if we have enough free space
-    uint16_t extra_space_needed = size - slot->length;
-    if (get_free_space() < extra_space_needed) {
-        return false;  // Caller should delete + insert
+    // New record is larger than its slot, so it must be relocated to `size`
+    // fresh bytes at free_space_end. The record's old bytes are NOT reclaimed
+    // here (they become a hole until compact()), so relocation consumes the
+    // FULL `size` bytes of contiguous free space -- not just the
+    // (size - old_length) delta. Checking only the delta lets
+    // `free_space_end - size` underflow a uint16_t and memcpy run tens of KB
+    // past the 4096-byte page (issue #1).
+    if (get_free_space() < size) {
+        // Try reclaiming holes left by prior deletes / in-place shrinks, then
+        // re-check against the full record size.
+        compact();
+        if (get_free_space() < size) {
+            return false;  // Cannot fit; caller falls back to delete + insert.
+        }
     }
 
-    // Delete old record and insert at new location
-    // First, mark the old slot as empty temporarily
-    uint16_t old_offset = slot->offset;
-    uint16_t old_length = slot->length;
-    slot->offset = Slot::INVALID_OFFSET;
-
-    // Allocate new space
+    // Allocate new space at the end of the free region.
     auto* header = page_->header();
-    uint16_t new_offset = header->free_space_end - size;
+    uint16_t new_offset = static_cast<uint16_t>(header->free_space_end - size);
 
-    // Copy new data
+    // Defensive: the check above guarantees this, but never let the record
+    // region grow down into (and clobber) the slot array.
+    if (new_offset < header->free_space_offset) {
+        return false;
+    }
+
+    // Copy new data into the fresh region (does not overlap the old bytes,
+    // which sit at a higher offset and are left as reclaimable fragmentation).
     std::memcpy(page_->data() + new_offset, data, size);
 
-    // Update slot
+    // Repoint the slot at the new location.
     slot->offset = new_offset;
     slot->length = size;
     header->free_space_end = new_offset;
-
-    // Note: old space becomes fragmentation, compact() can reclaim it
-    (void)old_offset;
-    (void)old_length;
 
     page_->set_dirty(true);
     return true;
