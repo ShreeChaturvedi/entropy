@@ -10,6 +10,7 @@
 #include "entropy/database.hpp"
 #include "entropy/result.hpp"
 #include "entropy/status.hpp"
+#include "entropy/version.hpp"
 
 namespace entropy {
 
@@ -18,28 +19,28 @@ namespace entropy {
  * @return Version string in format "major.minor.patch"
  */
 constexpr const char* version() noexcept {
-    return "0.1.0";
+    return kVersionString;
 }
 
 /**
  * @brief Get the major version number
  */
 constexpr int version_major() noexcept {
-    return 0;
+    return kVersionMajor;
 }
 
 /**
  * @brief Get the minor version number
  */
 constexpr int version_minor() noexcept {
-    return 1;
+    return kVersionMinor;
 }
 
 /**
  * @brief Get the patch version number
  */
 constexpr int version_patch() noexcept {
-    return 0;
+    return kVersionPatch;
 }
 
 }  // namespace entropy
