@@ -83,20 +83,6 @@ if(ENTROPY_BUILD_BENCHMARKS)
 endif()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# sql-parser (hsql) - SQL parsing library
-# ─────────────────────────────────────────────────────────────────────────────
-
-FetchContent_Declare(
-    sqlparser
-    GIT_REPOSITORY https://github.com/hyrise/sql-parser.git
-    GIT_TAG        master
-    GIT_SHALLOW    TRUE
-)
-
-# Note: hsql uses a different build approach, we'll handle it separately
-# For now, we'll set up the declaration - implementation can be adjusted later
-
-# ─────────────────────────────────────────────────────────────────────────────
 # LZ4 - Fast compression library (optional)
 # ─────────────────────────────────────────────────────────────────────────────
 

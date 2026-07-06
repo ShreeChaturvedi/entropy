@@ -138,7 +138,7 @@ void run_shell(Database &db) {
     if (!query.empty() && query.find(';') != std::string::npos) {
       auto result = db.execute(query);
       if (result.ok()) {
-        if (result.has_rows()) {
+        if (result.is_query()) {
           const auto &columns = result.column_names();
 
           std::vector<size_t> widths(columns.size());
