@@ -11,11 +11,16 @@ set(FETCHCONTENT_BASE_DIR "${CMAKE_BINARY_DIR}/_deps")
 # spdlog - Fast C++ logging library
 # ─────────────────────────────────────────────────────────────────────────────
 
+# SYSTEM: treat spdlog's (and its bundled fmt's) headers as system headers so
+# their diagnostics do not trip our -Werror. Without this, fmt v9's core.h emits
+# -Wdangling-reference on GCC 13+, which breaks the CI build. Our own code keeps
+# the full warning set.
 FetchContent_Declare(
     spdlog
     GIT_REPOSITORY https://github.com/gabime/spdlog.git
     GIT_TAG        v1.12.0
     GIT_SHALLOW    TRUE
+    SYSTEM
 )
 
 set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
@@ -34,6 +39,7 @@ if(ENTROPY_BUILD_TESTS)
         GIT_REPOSITORY https://github.com/google/googletest.git
         GIT_TAG        v1.14.0
         GIT_SHALLOW    TRUE
+        SYSTEM
     )
 
     # For Windows: Prevent overriding the parent project's compiler/linker settings
@@ -62,6 +68,7 @@ if(ENTROPY_BUILD_BENCHMARKS)
         GIT_REPOSITORY https://github.com/google/benchmark.git
         GIT_TAG        v1.8.3
         GIT_SHALLOW    TRUE
+        SYSTEM
     )
 
     set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
