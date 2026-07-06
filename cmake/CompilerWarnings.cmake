@@ -35,6 +35,16 @@ function(entropy_set_compiler_warnings)
         # Treat warnings as errors in CI
         if(DEFINED ENV{CI})
             add_compile_options(-Werror)
+
+            # GCC's -Wmaybe-uninitialized emits well-known false positives when a
+            # std::variant holding a std::string (our TupleValue) is moved/copied
+            # at -O2/-O3; the diagnostic points into libstdc++ headers, not our
+            # code. Keep it visible as a warning but non-fatal so these library
+            # false positives do not break CI. Real uninitialized uses still show.
+            # Refs: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=101831
+            if(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+                add_compile_options(-Wno-error=maybe-uninitialized)
+            endif()
         endif()
 
     elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
