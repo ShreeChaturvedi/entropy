@@ -769,6 +769,48 @@ TEST_F(AggregationTest, MultipleGroupByColumns) {
   EXPECT_EQ(count, 5);
 }
 
+TEST_F(AggregationTest, SumAvgBigIntExactBeyond2Pow53) {
+  // Regression (#21): SUM/AVG must not lose precision by accumulating integers
+  // in a double. 2^53 is the largest integer a double can represent exactly, so
+  // any integer sum beyond it is rounded when accumulated as a double.
+  Schema big_schema({Column("v", TypeId::BIGINT)});
+  ASSERT_TRUE(catalog_->create_table("bigints", big_schema).ok());
+  auto *big_info = catalog_->get_table("bigints");
+
+  const int64_t v1 = int64_t{9007199254740993}; // 2^53 + 1
+  const int64_t v2 = int64_t{9007199254740994}; // 2^53 + 2
+  std::vector<Tuple> tuples;
+  tuples.emplace_back(std::vector<TupleValue>{TupleValue(v1)}, big_schema);
+  tuples.emplace_back(std::vector<TupleValue>{TupleValue(v2)}, big_schema);
+  {
+    InsertExecutor insert(nullptr, big_info->table_heap, std::move(tuples));
+    insert.init();
+    [[maybe_unused]] auto inserted = insert.next();
+  }
+
+  auto child = std::make_unique<SeqScanExecutor>(
+      nullptr, big_info->table_heap, &big_schema);
+  std::vector<AggregateExpression> aggs = {
+      AggregateExpression::sum(0, "sum_v"),
+      AggregateExpression::avg(0, "avg_v"),
+  };
+  AggregationExecutor agg(nullptr, std::move(child), &big_schema, {},
+                          std::move(aggs));
+  agg.init();
+
+  auto result = agg.next();
+  ASSERT_TRUE(result.has_value());
+
+  // Exact sum is 18014398509481987; a double accumulator rounds it to
+  // 18014398509481984, dropping the low bits.
+  EXPECT_EQ(result->get_value(agg.output_schema(), 0).as_bigint(),
+            int64_t{18014398509481987});
+  // AVG from the exact integer sum: 18014398509481987 / 2 rounds to
+  // 9007199254740994.0; the double accumulator yields 9007199254740992.0.
+  EXPECT_EQ(result->get_value(agg.output_schema(), 1).as_double(),
+            9007199254740994.0);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Sort Executor Tests
 // ─────────────────────────────────────────────────────────────────────────────
