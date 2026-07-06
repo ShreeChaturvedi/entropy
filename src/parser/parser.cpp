@@ -707,6 +707,8 @@ TypeId Parser::parse_data_type(size_t *length_out) {
     type = TypeId::BIGINT;
   } else if (match(TokenType::SMALLINT)) {
     type = TypeId::SMALLINT;
+  } else if (match(TokenType::TINYINT)) {
+    type = TypeId::TINYINT;
   } else if (match(TokenType::BOOLEAN)) {
     type = TypeId::BOOLEAN;
   } else if (match(TokenType::FLOAT)) {
