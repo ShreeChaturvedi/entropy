@@ -24,11 +24,9 @@ std::optional<Tuple> SeqScanExecutor::next() {
       return tuple;
     }
 
-    // Evaluate predicate. A non-boolean or NULL predicate value is treated as
-    // false (matches NestedLoopJoinExecutor) rather than throwing
-    // bad_variant_access from as_bool().
+    // Keep the tuple only when the predicate evaluates to boolean true.
     TupleValue result = predicate_->evaluate(tuple, *schema_);
-    if (result.is_bool() && result.as_bool()) {
+    if (predicate_is_true(result)) {
       return tuple;
     }
   }

@@ -133,7 +133,7 @@ bool NestedLoopJoinExecutor::evaluate_condition(const Tuple &left,
   Tuple combined = combine_tuples(&left, &right);
   TupleValue result = condition_->evaluate(combined, *output_schema_);
 
-  return result.is_bool() && result.as_bool();
+  return predicate_is_true(result);
 }
 
 Tuple NestedLoopJoinExecutor::combine_tuples(const Tuple *left,
