@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <unordered_set>
+#include <vector>
 
 #include "catalog/catalog.hpp"
 #include "storage/table_heap.hpp"
@@ -115,9 +116,11 @@ void Statistics::collect_statistics(oid_t table_oid) {
     stats.columns[static_cast<column_id_t>(i)] = ColumnStatistics{};
   }
 
-  // Single pass: count rows and estimate distinct values
-  size_t null_counts[32] = {};        // Up to 32 columns
-  size_t distinct_estimates[32] = {}; // Simple distinct counter
+  // Single pass: count rows and estimate distinct values.
+  // Sized to the actual column count so tables with any number of columns are
+  // handled (previously fixed 32-element stack arrays overflowed for >32).
+  std::vector<size_t> null_counts(schema.column_count(), 0);
+  std::vector<size_t> distinct_estimates(schema.column_count(), 0);
 
   for (auto it = table_info->table_heap->begin();
        it != table_info->table_heap->end(); ++it) {
