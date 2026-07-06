@@ -154,15 +154,23 @@ private:
  * Uses running accumulators to minimize memory and enable single-pass.
  */
 struct AggregateValue {
-  int64_t count = 0;      // For COUNT and AVG denominator
-  double sum = 0.0;       // For SUM and AVG numerator
-  TupleValue min_val;     // For MIN
-  TupleValue max_val;     // For MAX
-  bool has_value = false; // Has seen at least one non-NULL value
+  int64_t count = 0; // For COUNT and AVG denominator
+  // SUM/AVG numerator. Integer inputs accumulate exactly in a wrapping unsigned
+  // accumulator (two's-complement, no UB, exact within int64 range); floating
+  // inputs accumulate in a double. Using a double for integer sums loses
+  // precision past 2^53, so the two paths are kept separate.
+  uint64_t int_sum = 0;
+  double float_sum = 0.0;
+  bool sum_is_float = false; // True once a floating input contributes to the sum
+  TupleValue min_val;        // For MIN
+  TupleValue max_val;        // For MAX
+  bool has_value = false;    // Has seen at least one non-NULL value
 
   void reset() {
     count = 0;
-    sum = 0.0;
+    int_sum = 0;
+    float_sum = 0.0;
+    sum_is_float = false;
     min_val = TupleValue::null();
     max_val = TupleValue::null();
     has_value = false;
@@ -229,6 +237,19 @@ private:
    * @brief Convert numeric TupleValue to double for aggregation
    */
   static double to_numeric(const TupleValue &val);
+
+  /**
+   * @brief Convert an integer TupleValue to int64 (0 for non-integer/NULL)
+   */
+  static int64_t to_int64(const TupleValue &val);
+
+  /**
+   * @brief Add a non-NULL numeric value into a SUM/AVG accumulator
+   *
+   * Integer inputs feed the exact integer accumulator; floating inputs feed the
+   * double accumulator and flip @c sum_is_float.
+   */
+  static void add_to_sum(AggregateValue &val, const TupleValue &col_val);
 
   /**
    * @brief Compare two values for MIN/MAX

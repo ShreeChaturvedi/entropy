@@ -173,7 +173,7 @@ void AggregationExecutor::accumulate(const Tuple &tuple,
       TupleValue col_val = tuple.get_value(
           *input_schema_, static_cast<uint32_t>(agg.column_index));
       if (!col_val.is_null()) {
-        val.sum += to_numeric(col_val);
+        add_to_sum(val, col_val);
         val.has_value = true;
       }
       break;
@@ -183,7 +183,7 @@ void AggregationExecutor::accumulate(const Tuple &tuple,
       TupleValue col_val = tuple.get_value(
           *input_schema_, static_cast<uint32_t>(agg.column_index));
       if (!col_val.is_null()) {
-        val.sum += to_numeric(col_val);
+        add_to_sum(val, col_val);
         val.count++;
         val.has_value = true;
       }
@@ -237,6 +237,32 @@ double AggregationExecutor::to_numeric(const TupleValue &val) {
   return 0.0; // NULL or non-numeric
 }
 
+int64_t AggregationExecutor::to_int64(const TupleValue &val) {
+  if (val.is_tinyint())
+    return val.as_tinyint();
+  if (val.is_smallint())
+    return val.as_smallint();
+  if (val.is_integer())
+    return val.as_integer();
+  if (val.is_bigint())
+    return val.as_bigint();
+  return 0; // NULL or non-integer
+}
+
+void AggregationExecutor::add_to_sum(AggregateValue &val,
+                                     const TupleValue &col_val) {
+  if (col_val.is_float() || col_val.is_double()) {
+    val.sum_is_float = true;
+    val.float_sum += col_val.is_double()
+                         ? col_val.as_double()
+                         : static_cast<double>(col_val.as_float());
+  } else {
+    // Unsigned accumulation is well-defined two's-complement modular arithmetic;
+    // it is exact for any total that fits in int64 and never invokes UB.
+    val.int_sum += static_cast<uint64_t>(to_int64(col_val));
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: Compare values for MIN/MAX
 // ─────────────────────────────────────────────────────────────────────────────
@@ -281,7 +307,6 @@ Tuple AggregationExecutor::make_output_tuple(
   for (size_t i = 0; i < aggregates_.size(); i++) {
     const auto &agg = aggregates_[i];
     const auto &val = agg_values[i];
-    const Column &out_col = output_schema_.column(group_by_indices_.size() + i);
 
     switch (agg.type) {
     case AggregateType::COUNT_STAR:
@@ -292,18 +317,27 @@ Tuple AggregationExecutor::make_output_tuple(
     case AggregateType::SUM:
       if (!val.has_value) {
         values.push_back(TupleValue::null());
-      } else if (out_col.type() == TypeId::BIGINT) {
-        values.push_back(TupleValue(static_cast<int64_t>(val.sum)));
+      } else if (val.sum_is_float) {
+        values.push_back(TupleValue(val.float_sum));
       } else {
-        values.push_back(TupleValue(val.sum));
+        // Integer SUM output is BIGINT; emit the exact accumulated total.
+        values.push_back(TupleValue(static_cast<int64_t>(val.int_sum)));
       }
       break;
 
     case AggregateType::AVG:
       if (val.count == 0) {
         values.push_back(TupleValue::null());
+      } else if (val.sum_is_float) {
+        values.push_back(
+            TupleValue(val.float_sum / static_cast<double>(val.count)));
       } else {
-        values.push_back(TupleValue(val.sum / static_cast<double>(val.count)));
+        // Divide the exact integer sum at extended precision so the result is
+        // the correctly-rounded double rather than one derived from a
+        // precision-lossy double accumulator.
+        long double avg = static_cast<long double>(static_cast<int64_t>(val.int_sum)) /
+                          static_cast<long double>(val.count);
+        values.push_back(TupleValue(static_cast<double>(avg)));
       }
       break;
 
