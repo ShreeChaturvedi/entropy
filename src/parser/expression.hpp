@@ -238,6 +238,11 @@ public:
   [[nodiscard]] std::unique_ptr<Expression> clone() const override;
 
   [[nodiscard]] LogicalOpType op() const noexcept { return op_; }
+  // left() holds the sole operand for unary NOT; right() is null in that case.
+  [[nodiscard]] const Expression *left() const noexcept { return left_.get(); }
+  [[nodiscard]] const Expression *right() const noexcept {
+    return right_.get();
+  }
 
 private:
   LogicalOpType op_;
