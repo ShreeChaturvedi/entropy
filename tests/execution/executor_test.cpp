@@ -249,6 +249,47 @@ TEST_F(ExecutorTest, FilterTuples) {
   EXPECT_FALSE(filter.next().has_value());
 }
 
+// A non-boolean WHERE predicate (e.g. `WHERE 1`, `WHERE age`, `WHERE a + b`)
+// must not crash the process. Defined behavior: a non-bool/NULL predicate value
+// is treated as false, so the row is excluded. Previously as_bool() called
+// std::get<bool> on a non-bool variant and threw std::bad_variant_access.
+TEST_F(ExecutorTest, FilterNonBooleanPredicateExcludesRows) {
+  insert_test_data();
+
+  auto child = std::make_unique<SeqScanExecutor>(
+      nullptr, table_info_->table_heap, &schema_);
+
+  // Predicate is a bare integer constant (like `WHERE 1`), not a boolean.
+  auto predicate = std::make_unique<ConstantExpression>(TupleValue(1));
+
+  FilterExecutor filter(nullptr, std::move(child), std::move(predicate),
+                        &schema_);
+  filter.init();
+
+  // Must not throw; non-bool predicate => no rows pass.
+  std::optional<Tuple> tuple;
+  ASSERT_NO_THROW(tuple = filter.next());
+  EXPECT_FALSE(tuple.has_value());
+}
+
+// Same guarantee for the seq-scan pushed-down predicate path.
+TEST_F(ExecutorTest, SeqScanNonBooleanPredicateExcludesRows) {
+  insert_test_data();
+
+  // Predicate references the bare integer column `age` (like `WHERE age`).
+  auto age_col = std::make_unique<ColumnRefExpression>("age");
+  age_col->set_column_index(2);
+  age_col->set_type(TypeId::INTEGER);
+
+  SeqScanExecutor scan(nullptr, table_info_->table_heap, &schema_,
+                       std::move(age_col));
+
+  std::optional<Tuple> tuple;
+  ASSERT_NO_THROW(scan.init());
+  ASSERT_NO_THROW(tuple = scan.next());
+  EXPECT_FALSE(tuple.has_value());
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Projection Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -774,6 +815,56 @@ TEST_F(ExecutorTest, SortDescending) {
   EXPECT_EQ(ids[0], 3); // Charlie
   EXPECT_EQ(ids[1], 2); // Bob
   EXPECT_EQ(ids[2], 1); // Alice
+}
+
+// Sort must be stable: rows with equal sort keys preserve their input order.
+// The header documents a stable guarantee, so ties must break deterministically
+// by input position. Uses enough rows to defeat introsort's small-range
+// insertion-sort fast path (which is accidentally stable for tiny inputs).
+TEST_F(ExecutorTest, SortStableOnDuplicateKeys) {
+  constexpr int kRows = 64;
+
+  // All rows share the same age (the sort key); ids run 0..kRows-1 in insert
+  // order. A stable sort by age must return ids in that exact input order.
+  std::vector<Tuple> tuples;
+  tuples.reserve(kRows);
+  for (int i = 0; i < kRows; i++) {
+    tuples.emplace_back(
+        std::vector<TupleValue>{TupleValue(i),
+                                TupleValue("User" + std::to_string(i)),
+                                TupleValue(42)}, // identical sort key
+        schema_);
+  }
+  InsertExecutor insert(nullptr, table_info_->table_heap, std::move(tuples));
+  insert.init();
+  [[maybe_unused]] auto inserted = insert.next();
+
+  auto child = std::make_unique<SeqScanExecutor>(
+      nullptr, table_info_->table_heap, &schema_);
+
+  // Capture the scan (input) order first, so the assertion is against the
+  // actual materialization order rather than an assumed one.
+  std::vector<int32_t> input_ids;
+  {
+    SeqScanExecutor order_scan(nullptr, table_info_->table_heap, &schema_);
+    order_scan.init();
+    while (auto tuple = order_scan.next()) {
+      input_ids.push_back(tuple->get_value(schema_, 0).as_integer());
+    }
+  }
+  ASSERT_EQ(input_ids.size(), static_cast<size_t>(kRows));
+
+  std::vector<SortKey> sort_keys = {{2, true}}; // age ASC (all equal)
+  SortExecutor sort(nullptr, std::move(child), &schema_, std::move(sort_keys));
+  sort.init();
+
+  std::vector<int32_t> output_ids;
+  while (auto tuple = sort.next()) {
+    output_ids.push_back(tuple->get_value(schema_, 0).as_integer());
+  }
+
+  // Stability: output order of equal-key rows == input order.
+  EXPECT_EQ(output_ids, input_ids);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
