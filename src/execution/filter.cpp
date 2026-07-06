@@ -18,8 +18,10 @@ std::optional<Tuple> FilterExecutor::next() {
     // Evaluate predicate
     TupleValue result = predicate_->evaluate(*tuple, *schema_);
 
-    // Return tuple if predicate is true
-    if (!result.is_null() && result.as_bool()) {
+    // Return tuple if predicate is true. A non-boolean or NULL predicate value
+    // is treated as false (matches NestedLoopJoinExecutor) rather than throwing
+    // bad_variant_access from as_bool().
+    if (result.is_bool() && result.as_bool()) {
       return tuple;
     }
   }
