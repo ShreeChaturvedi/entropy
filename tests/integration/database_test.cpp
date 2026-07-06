@@ -235,6 +235,42 @@ TEST_F(DatabaseTest, InsertMultipleRows) {
   EXPECT_EQ(result.row_count(), 3);
 }
 
+// Regression test for #24: a SELECT that legitimately matches zero rows
+// must still be distinguishable from a DML result, so the shell can render
+// column headers instead of an "affected rows" message.
+TEST_F(DatabaseTest, EmptySelectIsDistinguishableFromDml) {
+  Database db(temp_file_->string());
+
+  auto result =
+      db.execute("CREATE TABLE users (id INTEGER, name VARCHAR(100))");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
+  result = db.execute("INSERT INTO users VALUES (1, 'Alice')");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
+
+  // A SELECT that matches zero rows is still a query: is_query() is true,
+  // column names are still populated, and it has no rows.
+  result = db.execute("SELECT * FROM users WHERE 1 = 0");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
+  EXPECT_TRUE(result.is_query());
+  EXPECT_FALSE(result.has_rows());
+  EXPECT_EQ(result.row_count(), 0);
+  EXPECT_EQ(result.column_names().size(), 2);
+
+  // A DML statement that affects zero rows is not a query: is_query() is
+  // false even though it also has no rows.
+  result = db.execute("UPDATE users SET name = 'Bob' WHERE id = 999");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
+  EXPECT_FALSE(result.is_query());
+  EXPECT_FALSE(result.has_rows());
+  EXPECT_EQ(result.affected_rows(), 0);
+
+  // A non-empty SELECT is still a query, of course.
+  result = db.execute("SELECT * FROM users");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
+  EXPECT_TRUE(result.is_query());
+  EXPECT_TRUE(result.has_rows());
+}
+
 // Regression test for #9: SELECT of narrow numeric columns (SMALLINT/TINYINT/
 // FLOAT) must return the stored value, not a silent NULL. Before the fix,
 // tuple_value_to_value handled only int32/int64/double and these fell through

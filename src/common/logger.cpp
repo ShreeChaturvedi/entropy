@@ -11,7 +11,7 @@ std::shared_ptr<spdlog::logger> Logger::logger_ = nullptr;
 
 void Logger::init(const std::string& name, spdlog::level::level_enum level) {
     if (logger_ == nullptr) {
-        logger_ = spdlog::stdout_color_mt(name);
+        logger_ = spdlog::stderr_color_mt(name);
         logger_->set_level(level);
         logger_->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%s:%#] %v");
     }

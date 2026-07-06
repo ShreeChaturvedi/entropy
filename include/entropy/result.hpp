@@ -144,6 +144,12 @@ public:
     /// Check if result has rows
     [[nodiscard]] bool has_rows() const noexcept { return !rows_.empty(); }
 
+    /// Check if this result came from a query (e.g. SELECT/EXPLAIN) rather
+    /// than a DML/DDL statement. Unlike has_rows(), this stays true even
+    /// when a query legitimately matched zero rows, so callers can still
+    /// render column headers instead of an "affected rows" message.
+    [[nodiscard]] bool is_query() const noexcept { return is_query_; }
+
     /// Iterator support for range-based for loops
     [[nodiscard]] auto begin() const noexcept { return rows_.begin(); }
     [[nodiscard]] auto end() const noexcept { return rows_.end(); }
@@ -153,6 +159,7 @@ private:
     std::vector<Row> rows_;
     std::vector<std::string> column_names_;
     size_t affected_rows_ = 0;
+    bool is_query_ = false;
 };
 
 }  // namespace entropy
