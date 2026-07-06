@@ -246,6 +246,12 @@ TupleValue ComparisonExpression::evaluate(const Tuple &tuple,
     bool l = lval.as_bool();
     bool r = rval.as_bool();
     cmp_result = (l == r) ? 0 : (l ? 1 : -1);
+  } else {
+    // Incompatible operand types have no defined ordering. Under SQL
+    // three-valued logic the comparison is NULL (unknown), which downstream
+    // filters treat as not-true, rather than falling through to cmp_result 0
+    // and matching every row.
+    return TupleValue::null();
   }
 
   bool result = false;

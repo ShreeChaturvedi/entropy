@@ -515,6 +515,86 @@ TEST_F(ExpressionTest, StringComparison) {
   EXPECT_TRUE(result.as_bool());
 }
 
+// Incompatible operand types have no defined ordering. Under SQL three-valued
+// logic the comparison must evaluate to NULL (not-true), never silently match.
+TEST_F(ExpressionTest, IncompatibleTypeEqualIsNull) {
+  auto left =
+      std::make_unique<ConstantExpression>(TupleValue(static_cast<int64_t>(5)));
+  auto right =
+      std::make_unique<ConstantExpression>(TupleValue(std::string("abc")));
+
+  auto expr = std::make_unique<ComparisonExpression>(
+      ComparisonType::EQUAL, std::move(left), std::move(right));
+
+  TupleValue result = expr->evaluate(tuple_, schema_);
+  EXPECT_TRUE(result.is_null());
+}
+
+TEST_F(ExpressionTest, IncompatibleTypeEqualIsNullStringVsInt) {
+  auto left =
+      std::make_unique<ConstantExpression>(TupleValue(std::string("abc")));
+  auto right =
+      std::make_unique<ConstantExpression>(TupleValue(static_cast<int64_t>(5)));
+
+  auto expr = std::make_unique<ComparisonExpression>(
+      ComparisonType::EQUAL, std::move(left), std::move(right));
+
+  TupleValue result = expr->evaluate(tuple_, schema_);
+  EXPECT_TRUE(result.is_null());
+}
+
+TEST_F(ExpressionTest, IncompatibleTypeBoolVsIntIsNull) {
+  auto left = std::make_unique<ConstantExpression>(TupleValue(true));
+  auto right =
+      std::make_unique<ConstantExpression>(TupleValue(static_cast<int64_t>(1)));
+
+  auto expr = std::make_unique<ComparisonExpression>(
+      ComparisonType::EQUAL, std::move(left), std::move(right));
+
+  TupleValue result = expr->evaluate(tuple_, schema_);
+  EXPECT_TRUE(result.is_null());
+}
+
+TEST_F(ExpressionTest, IncompatibleTypeLessEqualIsNull) {
+  auto left =
+      std::make_unique<ConstantExpression>(TupleValue(static_cast<int64_t>(5)));
+  auto right =
+      std::make_unique<ConstantExpression>(TupleValue(std::string("abc")));
+
+  auto expr = std::make_unique<ComparisonExpression>(
+      ComparisonType::LESS_EQUAL, std::move(left), std::move(right));
+
+  TupleValue result = expr->evaluate(tuple_, schema_);
+  EXPECT_TRUE(result.is_null());
+}
+
+TEST_F(ExpressionTest, IncompatibleTypeGreaterEqualIsNull) {
+  auto left =
+      std::make_unique<ConstantExpression>(TupleValue(static_cast<int64_t>(5)));
+  auto right =
+      std::make_unique<ConstantExpression>(TupleValue(std::string("abc")));
+
+  auto expr = std::make_unique<ComparisonExpression>(
+      ComparisonType::GREATER_EQUAL, std::move(left), std::move(right));
+
+  TupleValue result = expr->evaluate(tuple_, schema_);
+  EXPECT_TRUE(result.is_null());
+}
+
+// int/float mixing stays a valid numeric comparison and must NOT become NULL.
+TEST_F(ExpressionTest, IntFloatComparisonStillValid) {
+  auto left =
+      std::make_unique<ConstantExpression>(TupleValue(static_cast<int64_t>(3)));
+  auto right = std::make_unique<ConstantExpression>(TupleValue(3.0));
+
+  auto expr = std::make_unique<ComparisonExpression>(
+      ComparisonType::EQUAL, std::move(left), std::move(right));
+
+  TupleValue result = expr->evaluate(tuple_, schema_);
+  EXPECT_TRUE(result.is_bool());
+  EXPECT_TRUE(result.as_bool());
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Binder Tests
 // ─────────────────────────────────────────────────────────────────────────────
