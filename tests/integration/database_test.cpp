@@ -75,10 +75,10 @@ TEST_F(DatabaseTest, RollbackWithoutTransaction) {
 }
 
 TEST_F(DatabaseTest, Version) {
-  EXPECT_STREQ(version(), "0.1.0");
+  EXPECT_STREQ(version(), "0.1.1");
   EXPECT_EQ(version_major(), 0);
   EXPECT_EQ(version_minor(), 1);
-  EXPECT_EQ(version_patch(), 0);
+  EXPECT_EQ(version_patch(), 1);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
