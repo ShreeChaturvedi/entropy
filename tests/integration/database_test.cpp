@@ -235,5 +235,48 @@ TEST_F(DatabaseTest, InsertMultipleRows) {
   EXPECT_EQ(result.row_count(), 3);
 }
 
+TEST_F(DatabaseTest, OrderByNonProjectedColumn) {
+  Database db(temp_file_->string());
+
+  auto result = db.execute("CREATE TABLE t (name VARCHAR(20), age INTEGER)");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
+  EXPECT_TRUE(db.execute("INSERT INTO t VALUES ('Alice', 30)").ok());
+  EXPECT_TRUE(db.execute("INSERT INTO t VALUES ('Bob', 10)").ok());
+  EXPECT_TRUE(db.execute("INSERT INTO t VALUES ('Carol', 20)").ok());
+
+  // Regression (#21): ORDER BY on a column absent from the SELECT list must
+  // still sort the output rather than being silently dropped.
+  result = db.execute("SELECT name FROM t ORDER BY age");
+  ASSERT_TRUE(result.ok()) << result.status().to_string();
+  ASSERT_EQ(result.row_count(), 3);
+  ASSERT_EQ(result.column_names().size(), 1);
+  EXPECT_EQ(result.column_names()[0], "name");
+  // Ordered by age ascending: Bob (10), Carol (20), Alice (30).
+  EXPECT_EQ(result.rows()[0][0].as_string(), "Bob");
+  EXPECT_EQ(result.rows()[1][0].as_string(), "Carol");
+  EXPECT_EQ(result.rows()[2][0].as_string(), "Alice");
+
+  // Descending on a non-projected column too.
+  result = db.execute("SELECT name FROM t ORDER BY age DESC");
+  ASSERT_TRUE(result.ok()) << result.status().to_string();
+  ASSERT_EQ(result.row_count(), 3);
+  EXPECT_EQ(result.rows()[0][0].as_string(), "Alice");
+  EXPECT_EQ(result.rows()[1][0].as_string(), "Carol");
+  EXPECT_EQ(result.rows()[2][0].as_string(), "Bob");
+}
+
+TEST_F(DatabaseTest, OrderByUnknownColumnErrors) {
+  Database db(temp_file_->string());
+
+  auto result = db.execute("CREATE TABLE t (name VARCHAR(20), age INTEGER)");
+  EXPECT_TRUE(result.ok()) << result.status().to_string();
+  EXPECT_TRUE(db.execute("INSERT INTO t VALUES ('Alice', 30)").ok());
+
+  // ORDER BY a column that does not exist must be a clear error, not a
+  // silently-unsorted result.
+  result = db.execute("SELECT name FROM t ORDER BY nonexistent");
+  EXPECT_FALSE(result.ok());
+}
+
 } // namespace
 } // namespace entropy

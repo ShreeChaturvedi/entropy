@@ -141,36 +141,44 @@ public:
           std::move(ctx.predicate));
     }
 
-    // If not SELECT *, create projection
-    std::unique_ptr<Executor> executor;
-    const Schema *output_schema;
-    if (ctx.select_all) {
-      output_schema = &ctx.table_info->schema;
-      executor = std::move(scan);
-    } else {
-      auto proj = std::make_unique<ProjectionExecutor>(nullptr, std::move(scan),
-                                                       &ctx.table_info->schema,
-                                                       ctx.column_indices);
-      output_schema = &proj->output_schema();
-      executor = std::move(proj);
-    }
+    std::unique_ptr<Executor> executor = std::move(scan);
+    const Schema *input_schema = &ctx.table_info->schema;
 
-    // Add ORDER BY if specified
+    // Apply ORDER BY before projection. Sort keys are resolved against the full
+    // table (input) schema, so ORDER BY can reference a column that is not in
+    // the SELECT list. Resolving against the post-projection schema instead
+    // would silently drop such keys and leave the output unsorted.
     if (!stmt->order_by.empty()) {
       std::vector<SortKey> sort_keys;
+      sort_keys.reserve(stmt->order_by.size());
       for (const auto &item : stmt->order_by) {
-        // Find column index by name
-        for (size_t i = 0; i < output_schema->column_count(); i++) {
-          if (output_schema->column(i).name() == item.column_name) {
+        bool found = false;
+        for (size_t i = 0; i < input_schema->column_count(); i++) {
+          if (input_schema->column(i).name() == item.column_name) {
             sort_keys.emplace_back(i, item.ascending);
+            found = true;
             break;
           }
         }
+        if (!found) {
+          return Result(Status::InvalidArgument("ORDER BY column not found: " +
+                                                item.column_name));
+        }
       }
-      if (!sort_keys.empty()) {
-        executor = std::make_unique<SortExecutor>(
-            nullptr, std::move(executor), output_schema, std::move(sort_keys));
-      }
+      executor = std::make_unique<SortExecutor>(
+          nullptr, std::move(executor), input_schema, std::move(sort_keys));
+    }
+
+    // If not SELECT *, create projection (after ORDER BY, which may reference
+    // columns that are not projected).
+    const Schema *output_schema;
+    if (ctx.select_all) {
+      output_schema = input_schema;
+    } else {
+      auto proj = std::make_unique<ProjectionExecutor>(
+          nullptr, std::move(executor), input_schema, ctx.column_indices);
+      output_schema = &proj->output_schema();
+      executor = std::move(proj);
     }
 
     // Add LIMIT/OFFSET if specified
