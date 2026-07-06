@@ -123,11 +123,17 @@ std::vector<char> TupleValue::to_bytes(TypeId type) const {
         }
         case TypeId::VARCHAR: {
             const std::string& str = as_string();
-            // Length prefix (2 bytes) + string data
-            result.resize(2 + str.size());
-            uint16_t len = static_cast<uint16_t>(str.size());
-            std::memcpy(result.data(), &len, sizeof(len));
-            std::memcpy(result.data() + 2, str.data(), str.size());
+            const uint16_t len = static_cast<uint16_t>(str.size());
+            // Layout: 2-byte little-endian length prefix followed by the raw
+            // bytes. Writing the prefix byte-wise (rather than memcpy over
+            // result.data()) avoids a spurious -Wnull-dereference on GCC and is
+            // explicit about endianness.
+            result.resize(sizeof(len) + str.size());
+            result[0] = static_cast<char>(len & 0xFFu);
+            result[1] = static_cast<char>((len >> 8) & 0xFFu);
+            if (!str.empty()) {
+                std::memcpy(result.data() + sizeof(len), str.data(), str.size());
+            }
             break;
         }
         default:
