@@ -346,6 +346,91 @@ TEST_F(ParserTest, ParseError) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Numeric literal overflow / malformed handling (issue #28)
+//
+// Overflowing or malformed numeric literals must be reported through the
+// Status-based error path, never crash the process with an uncaught
+// std::out_of_range / std::invalid_argument.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST_F(ParserTest, LimitLiteralOverflow) {
+  Parser parser("SELECT * FROM t LIMIT 99999999999999999999999");
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  EXPECT_FALSE(status.ok());
+}
+
+TEST_F(ParserTest, OffsetLiteralOverflow) {
+  Parser parser("SELECT * FROM t LIMIT 10 OFFSET 99999999999999999999999");
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  EXPECT_FALSE(status.ok());
+}
+
+TEST_F(ParserTest, WhereIntLiteralOverflow) {
+  Parser parser("SELECT * FROM t WHERE id = 99999999999999999999999");
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  EXPECT_FALSE(status.ok());
+}
+
+TEST_F(ParserTest, WhereNegativeIntLiteralOverflow) {
+  Parser parser("SELECT * FROM t WHERE id = -99999999999999999999999");
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  EXPECT_FALSE(status.ok());
+}
+
+TEST_F(ParserTest, WhereFloatLiteralOverflow) {
+  // A float literal far beyond the range of double (~1.8e308). The lexer has
+  // no exponent notation, so the magnitude comes from the digit count.
+  std::string big_float = std::string(400, '9') + ".0";
+  Parser parser("SELECT * FROM t WHERE x = " + big_float);
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  EXPECT_FALSE(status.ok());
+}
+
+TEST_F(ParserTest, InsertIntLiteralOverflow) {
+  Parser parser("INSERT INTO t VALUES (99999999999999999999999)");
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  EXPECT_FALSE(status.ok());
+}
+
+TEST_F(ParserTest, InsertFloatLiteralOverflow) {
+  std::string big_float = std::string(400, '9') + ".0";
+  Parser parser("INSERT INTO t VALUES (" + big_float + ")");
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  EXPECT_FALSE(status.ok());
+}
+
+TEST_F(ParserTest, VarcharLengthOverflow) {
+  Parser parser("CREATE TABLE t (a VARCHAR(99999999999999999999999))");
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  EXPECT_FALSE(status.ok());
+}
+
+// A valid boundary literal must still parse cleanly.
+TEST_F(ParserTest, MaxInt64LiteralParses) {
+  Parser parser("SELECT * FROM t WHERE id = 9223372036854775807");
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  EXPECT_TRUE(status.ok());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Expression Evaluation Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
