@@ -11,6 +11,9 @@ out/
 *~
 .DS_Store
 
+# clangd / editor cache
+.cache/
+
 # Compiled files
 *.o
 *.a
