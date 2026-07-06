@@ -15,13 +15,9 @@ void FilterExecutor::init() {
 
 std::optional<Tuple> FilterExecutor::next() {
   while (auto tuple = child_->next()) {
-    // Evaluate predicate
+    // Return the tuple only when the predicate evaluates to boolean true.
     TupleValue result = predicate_->evaluate(*tuple, *schema_);
-
-    // Return tuple if predicate is true. A non-boolean or NULL predicate value
-    // is treated as false (matches NestedLoopJoinExecutor) rather than throwing
-    // bad_variant_access from as_bool().
-    if (result.is_bool() && result.as_bool()) {
+    if (predicate_is_true(result)) {
       return tuple;
     }
   }
