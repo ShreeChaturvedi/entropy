@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(entropy
-    VERSION 0.1.0
+    VERSION 0.1.1
     DESCRIPTION "High-performance relational database engine"
     LANGUAGES CXX
 )
@@ -69,6 +69,15 @@ endif()
 
 # Public headers
 set(ENTROPY_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
+
+# Generated headers (e.g. version.hpp derived from PROJECT_VERSION)
+set(ENTROPY_GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
+
+configure_file(
+    "${ENTROPY_INCLUDE_DIR}/entropy/version.hpp.in"
+    "${ENTROPY_GENERATED_INCLUDE_DIR}/entropy/version.hpp"
+    @ONLY
+)
 
 # Add source directory
 add_subdirectory(src)
