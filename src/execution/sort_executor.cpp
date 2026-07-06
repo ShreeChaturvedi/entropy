@@ -2,7 +2,7 @@
  * @file sort_executor.cpp
  * @brief Sort Executor implementation
  *
- * Uses std::sort with a custom comparator for multi-column ordering.
+ * Uses std::stable_sort with a custom comparator for multi-column ordering.
  * Handles NULL values: NULLs sort first in ASC, last in DESC (SQL standard).
  */
 
@@ -29,10 +29,13 @@ void SortExecutor::init() {
     sorted_tuples_.push_back(std::move(*tuple));
   }
 
-  // Sort using custom comparator
+  // Sort using custom comparator. std::stable_sort preserves the input order of
+  // rows that compare equal on all sort keys, honoring the stability guarantee
+  // documented in sort_executor.hpp.
   if (!sort_keys_.empty()) {
-    std::sort(sorted_tuples_.begin(), sorted_tuples_.end(),
-              [this](const Tuple &a, const Tuple &b) { return compare(a, b); });
+    std::stable_sort(
+        sorted_tuples_.begin(), sorted_tuples_.end(),
+        [this](const Tuple &a, const Tuple &b) { return compare(a, b); });
   }
 }
 

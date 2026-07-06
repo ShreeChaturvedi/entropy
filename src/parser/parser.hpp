@@ -107,6 +107,14 @@ private:
   // Error handling
   void set_error(const std::string &message);
 
+  // Numeric literal conversion. Each guards std::sto* against overflow /
+  // malformed input: on success writes *out and returns true; on failure
+  // reports a parse error via set_error and returns false, so no exception
+  // ever escapes parse().
+  bool to_int64(const std::string &text, int64_t *out);
+  bool to_uint64(const std::string &text, uint64_t *out);
+  bool to_double(const std::string &text, double *out);
+
   // Type parsing
   TypeId parse_data_type(size_t *length_out = nullptr);
 

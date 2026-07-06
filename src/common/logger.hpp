@@ -20,11 +20,17 @@ class Logger {
 public:
     /**
      * @brief Initialize the logging system
+     *
+     * Logs are written to stderr (not stdout) so they never interleave with
+     * a shell's or tool's stdout query output, and default to WARN so
+     * routine lifecycle messages (e.g. "Opening/Closing database") are
+     * quiet unless the caller opts into more verbosity.
+     *
      * @param name Logger name
      * @param level Log level (trace, debug, info, warn, error, critical)
      */
     static void init(const std::string& name = "entropy",
-                     spdlog::level::level_enum level = spdlog::level::info);
+                     spdlog::level::level_enum level = spdlog::level::warn);
 
     /**
      * @brief Get the logger instance

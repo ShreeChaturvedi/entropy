@@ -198,6 +198,7 @@ add_library(entropy STATIC
 target_include_directories(entropy
     PUBLIC
         ${ENTROPY_INCLUDE_DIR}
+        ${ENTROPY_GENERATED_INCLUDE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}
 )
 

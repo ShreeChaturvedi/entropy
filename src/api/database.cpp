@@ -417,10 +417,18 @@ public:
       return Value();
     if (tv.is_bool())
       return Value(tv.as_bool());
+    // Narrow integer types widen to the public Value's int32 representation.
+    if (tv.is_tinyint())
+      return Value(static_cast<int32_t>(tv.as_tinyint()));
+    if (tv.is_smallint())
+      return Value(static_cast<int32_t>(tv.as_smallint()));
     if (tv.is_integer())
       return Value(tv.as_integer());
     if (tv.is_bigint())
       return Value(tv.as_bigint());
+    // FLOAT widens to the public Value's double representation.
+    if (tv.is_float())
+      return Value(static_cast<double>(tv.as_float()));
     if (tv.is_double())
       return Value(tv.as_double());
     if (tv.is_string())
