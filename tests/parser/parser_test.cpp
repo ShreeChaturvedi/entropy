@@ -754,5 +754,72 @@ TEST_F(BinderTest, BindDelete) {
   EXPECT_NE(context.predicate, nullptr);
 }
 
+// Regression tests for #29: the binder must descend into the children of
+// AND/OR/NOT so that unknown columns under a logical operator are rejected.
+TEST_F(BinderTest, BindSelectUnknownColumnUnderAnd) {
+  Parser parser("SELECT * FROM users WHERE bogus_col = 1 AND age = 2");
+  std::unique_ptr<Statement> stmt;
+  ASSERT_TRUE(parser.parse(&stmt).ok());
+
+  auto *select = dynamic_cast<SelectStatement *>(stmt.get());
+  BoundSelectContext context;
+  auto status = binder_->bind_select(select, &context);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.code(), StatusCode::kNotFound);
+}
+
+TEST_F(BinderTest, BindSelectUnknownColumnUnderOr) {
+  Parser parser("SELECT * FROM users WHERE age = 1 OR bogus_col = 2");
+  std::unique_ptr<Statement> stmt;
+  ASSERT_TRUE(parser.parse(&stmt).ok());
+
+  auto *select = dynamic_cast<SelectStatement *>(stmt.get());
+  BoundSelectContext context;
+  auto status = binder_->bind_select(select, &context);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.code(), StatusCode::kNotFound);
+}
+
+TEST_F(BinderTest, BindSelectUnknownColumnUnderNot) {
+  Parser parser("SELECT * FROM users WHERE NOT (bogus_col = 1)");
+  std::unique_ptr<Statement> stmt;
+  ASSERT_TRUE(parser.parse(&stmt).ok());
+
+  auto *select = dynamic_cast<SelectStatement *>(stmt.get());
+  BoundSelectContext context;
+  auto status = binder_->bind_select(select, &context);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.code(), StatusCode::kNotFound);
+}
+
+TEST_F(BinderTest, BindSelectValidColumnsUnderLogical) {
+  Parser parser("SELECT * FROM users WHERE age = 1 AND id = 2");
+  std::unique_ptr<Statement> stmt;
+  ASSERT_TRUE(parser.parse(&stmt).ok());
+
+  auto *select = dynamic_cast<SelectStatement *>(stmt.get());
+  BoundSelectContext context;
+  auto status = binder_->bind_select(select, &context);
+  EXPECT_TRUE(status.ok()) << status.to_string();
+  ASSERT_NE(context.predicate, nullptr);
+
+  // Column indices under the logical operator must be resolved by the binder.
+  auto *logical = dynamic_cast<LogicalExpression *>(context.predicate.get());
+  ASSERT_NE(logical, nullptr);
+  EXPECT_EQ(logical->op(), LogicalOpType::AND);
+
+  auto *lhs = dynamic_cast<const ComparisonExpression *>(logical->left());
+  ASSERT_NE(lhs, nullptr);
+  auto *lhs_col = dynamic_cast<const ColumnRefExpression *>(lhs->left());
+  ASSERT_NE(lhs_col, nullptr);
+  EXPECT_EQ(lhs_col->column_index(), 2u); // age is index 2
+
+  auto *rhs = dynamic_cast<const ComparisonExpression *>(logical->right());
+  ASSERT_NE(rhs, nullptr);
+  auto *rhs_col = dynamic_cast<const ColumnRefExpression *>(rhs->left());
+  ASSERT_NE(rhs_col, nullptr);
+  EXPECT_EQ(rhs_col->column_index(), 0u); // id is index 0
+}
+
 } // namespace
 } // namespace entropy
