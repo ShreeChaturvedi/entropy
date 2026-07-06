@@ -102,7 +102,8 @@ Result::Result(Status status) : status_(std::move(status)) {}
 Result::Result(std::vector<Row> rows, std::vector<std::string> column_names)
     : status_(Status::Ok()),
       rows_(std::move(rows)),
-      column_names_(std::move(column_names)) {}
+      column_names_(std::move(column_names)),
+      is_query_(true) {}
 
 Result::Result(size_t affected_rows)
     : status_(Status::Ok()), affected_rows_(affected_rows) {}
