@@ -50,9 +50,18 @@ std::optional<Tuple> UpdateExecutor::next() {
     return std::nullopt;
   }
 
-  // Update all tuples from child
+  // Phase 1: materialize matching tuples (and their RIDs) before mutating the
+  // heap. Grow-updates delete+reinsert onto a later page; if we updated while
+  // the child SeqScan was still walking the same heap, those relocated rows
+  // would be re-encountered and updated again (Halloween problem).
+  std::vector<Tuple> to_update;
   while (auto tuple = child_->next()) {
-    RID rid = tuple->rid();
+    to_update.push_back(std::move(*tuple));
+  }
+
+  // Phase 2: apply SET expressions to the snapshotted rows only.
+  for (const auto &tuple : to_update) {
+    RID rid = tuple.rid();
 
     // Build new tuple values
     std::vector<TupleValue> new_values;
@@ -61,13 +70,13 @@ std::optional<Tuple> UpdateExecutor::next() {
     // Start with original values
     for (size_t i = 0; i < schema_->column_count(); i++) {
       new_values.push_back(
-          tuple->get_value(*schema_, static_cast<uint32_t>(i)));
+          tuple.get_value(*schema_, static_cast<uint32_t>(i)));
     }
 
     // Apply updates from SET clause with type conversion
     for (size_t i = 0; i < column_indices_.size(); i++) {
       size_t col_idx = column_indices_[i];
-      TupleValue new_val = values_[i]->evaluate(*tuple, *schema_);
+      TupleValue new_val = values_[i]->evaluate(tuple, *schema_);
       TypeId target_type = schema_->column(col_idx).type();
       new_values[col_idx] = convert_to_type(new_val, target_type);
     }
