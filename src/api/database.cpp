@@ -103,9 +103,8 @@ public:
                                                            ctx.predicate.get());
 
     if (selection.use_index) {
-      // Get index info
-      auto *index_info = catalog_->get_index_for_column(
-          ctx.table_info->oid, static_cast<column_id_t>(selection.index_oid));
+      // Resolve by index OID — never cast OID to column_id_t
+      auto *index_info = catalog_->get_index_by_oid(selection.index_oid);
 
       if (index_info && index_info->index) {
         // Use IndexScan
