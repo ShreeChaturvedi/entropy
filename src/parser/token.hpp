@@ -60,6 +60,7 @@ enum class TokenType {
   // Keywords - Other
   AS,
   ORDER,
+  GROUP,
   BY,
   ASC,
   DESC,

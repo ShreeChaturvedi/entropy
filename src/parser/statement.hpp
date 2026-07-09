@@ -134,8 +134,11 @@ struct JoinClause {
 
 /**
  * @brief SELECT statement with optional JOIN support
- * SELECT columns FROM table [JOIN table ON cond]* [WHERE expr] [ORDER BY]
- * [LIMIT n]
+ * SELECT columns FROM table [JOIN table ON cond]* [WHERE expr]
+ * [GROUP BY ...] [ORDER BY] [LIMIT n]
+ *
+ * group_by is parsed into the AST so GROUP BY is not silently dropped as an
+ * alias. Full aggregation execution is tracked separately (issue #16).
  */
 class SelectStatement : public Statement {
 public:
@@ -145,6 +148,7 @@ public:
   TableRef table;                // Primary table in FROM
   std::vector<JoinClause> joins; // Optional JOINs
   std::unique_ptr<Expression> where_clause;
+  std::vector<std::string> group_by; // GROUP BY column names
   std::vector<OrderByItem> order_by;
   std::optional<size_t> limit;
   std::optional<size_t> offset;

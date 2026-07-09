@@ -250,4 +250,30 @@ private:
   std::unique_ptr<Expression> right_; // nullptr for NOT
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// IS NULL Expression
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * @brief NULL test: expr IS [NOT] NULL
+ */
+class IsNullExpression : public Expression {
+public:
+  IsNullExpression(std::unique_ptr<Expression> operand, bool negated);
+
+  [[nodiscard]] TupleValue evaluate(const Tuple &tuple,
+                                    const Schema &schema) const override;
+  [[nodiscard]] TypeId result_type() const override;
+  [[nodiscard]] std::unique_ptr<Expression> clone() const override;
+
+  [[nodiscard]] const Expression *operand() const noexcept {
+    return operand_.get();
+  }
+  [[nodiscard]] bool negated() const noexcept { return negated_; }
+
+private:
+  std::unique_ptr<Expression> operand_;
+  bool negated_; // true => IS NOT NULL
+};
+
 } // namespace entropy

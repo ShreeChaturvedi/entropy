@@ -89,6 +89,11 @@ public:
   // ─────────────────────────────────────────────────────────────────────────
 
   Result execute_select(SelectStatement *stmt) {
+    if (!stmt->group_by.empty()) {
+      return Result(Status::NotSupported(
+          "GROUP BY is not yet supported for execution"));
+    }
+
     BoundSelectContext ctx;
     Status status = binder_->bind_select(stmt, &ctx);
     if (!status.ok()) {
