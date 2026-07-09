@@ -309,34 +309,20 @@ public:
      * @brief Deserialize a log record from a byte buffer
      * @param data Buffer containing serialized record
      * @return Deserialized log record
+     *
+     * Prefer try_deserialize for untrusted input (WAL recovery).
      */
-    static LogRecord deserialize(const char* data, [[maybe_unused]] uint32_t size) {
+    static LogRecord deserialize(const char* data, uint32_t size) {
         LogRecord record;
-
-        // Read header
-        std::memcpy(&record.header_, data, LOG_RECORD_HEADER_SIZE);
-        data += LOG_RECORD_HEADER_SIZE;
-
-        // Read payload based on type
-        switch (record.header_.type) {
-            case LogRecordType::INSERT:
-                record.deserialize_insert(data);
-                break;
-            case LogRecordType::DELETE:
-                record.deserialize_delete(data);
-                break;
-            case LogRecordType::UPDATE:
-                record.deserialize_update(data);
-                break;
-            case LogRecordType::CHECKPOINT:
-                record.deserialize_checkpoint(data);
-                break;
-            default:
-                break;
-        }
-
+        (void)try_deserialize(data, size, record);
         return record;
     }
+
+    /**
+     * @brief Safely deserialize a log record from a bounded buffer
+     * @return false if lengths/counts are inconsistent or out of bounds
+     */
+    static bool try_deserialize(const char* data, uint32_t size, LogRecord& out);
 
 private:
     /**
@@ -376,7 +362,12 @@ private:
         std::memcpy(ptr, new_tuple_data_.data(), tuple_size);
     }
 
-    void deserialize_insert(const char* ptr) {
+    [[nodiscard]] bool deserialize_insert(const char* ptr, uint32_t remaining) {
+        constexpr uint32_t kFixed = sizeof(table_oid_) + sizeof(rid_) + sizeof(uint32_t);
+        if (remaining < kFixed) {
+            return false;
+        }
+
         std::memcpy(&table_oid_, ptr, sizeof(table_oid_));
         ptr += sizeof(table_oid_);
 
@@ -386,9 +377,14 @@ private:
         uint32_t tuple_size;
         std::memcpy(&tuple_size, ptr, sizeof(tuple_size));
         ptr += sizeof(tuple_size);
+        remaining -= kFixed;
 
-        new_tuple_data_.resize(tuple_size);
-        std::memcpy(new_tuple_data_.data(), ptr, tuple_size);
+        if (tuple_size > remaining) {
+            return false;
+        }
+
+        new_tuple_data_.assign(ptr, ptr + tuple_size);
+        return true;
     }
 
     void serialize_delete(char* ptr) const {
@@ -405,7 +401,12 @@ private:
         std::memcpy(ptr, old_tuple_data_.data(), tuple_size);
     }
 
-    void deserialize_delete(const char* ptr) {
+    [[nodiscard]] bool deserialize_delete(const char* ptr, uint32_t remaining) {
+        constexpr uint32_t kFixed = sizeof(table_oid_) + sizeof(rid_) + sizeof(uint32_t);
+        if (remaining < kFixed) {
+            return false;
+        }
+
         std::memcpy(&table_oid_, ptr, sizeof(table_oid_));
         ptr += sizeof(table_oid_);
 
@@ -415,9 +416,14 @@ private:
         uint32_t tuple_size;
         std::memcpy(&tuple_size, ptr, sizeof(tuple_size));
         ptr += sizeof(tuple_size);
+        remaining -= kFixed;
 
-        old_tuple_data_.resize(tuple_size);
-        std::memcpy(old_tuple_data_.data(), ptr, tuple_size);
+        if (tuple_size > remaining) {
+            return false;
+        }
+
+        old_tuple_data_.assign(ptr, ptr + tuple_size);
+        return true;
     }
 
     void serialize_update(char* ptr) const {
@@ -441,7 +447,12 @@ private:
         std::memcpy(ptr, new_tuple_data_.data(), new_size);
     }
 
-    void deserialize_update(const char* ptr) {
+    [[nodiscard]] bool deserialize_update(const char* ptr, uint32_t remaining) {
+        constexpr uint32_t kPrefix = sizeof(table_oid_) + sizeof(rid_) + sizeof(uint32_t);
+        if (remaining < kPrefix) {
+            return false;
+        }
+
         std::memcpy(&table_oid_, ptr, sizeof(table_oid_));
         ptr += sizeof(table_oid_);
 
@@ -451,17 +462,28 @@ private:
         uint32_t old_size;
         std::memcpy(&old_size, ptr, sizeof(old_size));
         ptr += sizeof(old_size);
+        remaining -= kPrefix;
 
-        old_tuple_data_.resize(old_size);
-        std::memcpy(old_tuple_data_.data(), ptr, old_size);
+        if (old_size > remaining) {
+            return false;
+        }
+        old_tuple_data_.assign(ptr, ptr + old_size);
         ptr += old_size;
+        remaining -= old_size;
 
+        if (remaining < sizeof(uint32_t)) {
+            return false;
+        }
         uint32_t new_size;
         std::memcpy(&new_size, ptr, sizeof(new_size));
         ptr += sizeof(new_size);
+        remaining -= static_cast<uint32_t>(sizeof(uint32_t));
 
-        new_tuple_data_.resize(new_size);
-        std::memcpy(new_tuple_data_.data(), ptr, new_size);
+        if (new_size > remaining) {
+            return false;
+        }
+        new_tuple_data_.assign(ptr, ptr + new_size);
+        return true;
     }
 
     void serialize_checkpoint(char* ptr) const {
@@ -475,16 +497,28 @@ private:
         }
     }
 
-    void deserialize_checkpoint(const char* ptr) {
+    [[nodiscard]] bool deserialize_checkpoint(const char* ptr, uint32_t remaining) {
+        if (remaining < sizeof(uint32_t)) {
+            return false;
+        }
+
         uint32_t count;
         std::memcpy(&count, ptr, sizeof(count));
         ptr += sizeof(count);
+        remaining -= static_cast<uint32_t>(sizeof(uint32_t));
+
+        const uint64_t bytes_needed =
+            static_cast<uint64_t>(count) * sizeof(txn_id_t);
+        if (bytes_needed > remaining) {
+            return false;
+        }
 
         active_txns_.resize(count);
         for (uint32_t i = 0; i < count; ++i) {
             std::memcpy(&active_txns_[i], ptr, sizeof(txn_id_t));
             ptr += sizeof(txn_id_t);
         }
+        return true;
     }
 
     // Header

@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -414,6 +415,129 @@ TEST_F(WALTest, ReopenExistingWAL) {
     EXPECT_EQ(wal.next_lsn(), last_lsn + 1);
     EXPECT_EQ(wal.flushed_lsn(), last_lsn);
   }
+}
+
+TEST_F(WALTest, FlushInvokesDurableSync) {
+  int sync_count = 0;
+  WALManager wal(wal_file_.string());
+  wal.set_sync_hook_for_testing([&]() -> Status {
+    ++sync_count;
+    return Status::Ok();
+  });
+
+  auto record = LogRecord::make_begin(1);
+  ASSERT_NE(wal.append_log(record), INVALID_LSN);
+  ASSERT_TRUE(wal.flush().ok());
+
+  EXPECT_GE(sync_count, 1);
+}
+
+TEST_F(WALTest, FlushPropagatesSyncFailure) {
+  WALManager wal(wal_file_.string());
+  wal.set_sync_hook_for_testing(
+      []() -> Status { return Status::IOError("injected sync failure"); });
+
+  auto record = LogRecord::make_begin(1);
+  ASSERT_NE(wal.append_log(record), INVALID_LSN);
+
+  Status status = wal.flush();
+  EXPECT_FALSE(status.ok());
+  EXPECT_TRUE(status.is_io_error());
+}
+
+TEST_F(WALTest, AppendLogReturnsInvalidLsnWhenFlushFails) {
+  WALManager wal(wal_file_.string());
+  wal.set_sync_hook_for_testing(
+      []() -> Status { return Status::IOError("injected sync failure"); });
+
+  // Fill the buffer so the next append must flush first.
+  std::vector<char> big_tuple(WAL_BUFFER_SIZE / 2, 'x');
+  auto first = LogRecord::make_insert(1, INVALID_LSN, 1, RID(1, 0), big_tuple);
+  ASSERT_NE(wal.append_log(first), INVALID_LSN);
+
+  auto second = LogRecord::make_insert(1, 1, 1, RID(1, 1), big_tuple);
+  EXPECT_EQ(wal.append_log(second), INVALID_LSN);
+}
+
+TEST_F(WALTest, ReadLogRejectsOversizedHeaderSize) {
+  {
+    WALManager wal(wal_file_.string());
+    auto record = LogRecord::make_begin(1);
+    ASSERT_NE(wal.append_log(record), INVALID_LSN);
+    ASSERT_TRUE(wal.flush().ok());
+  }
+
+  // Corrupt size just above the max and pad the file so a missing upper-bound
+  // check would allocate and successfully read a full (bogus) record.
+  const uint32_t corrupt_size = WAL_MAX_RECORD_SIZE + 1024;
+  {
+    std::fstream file(wal_file_, std::ios::in | std::ios::out | std::ios::binary);
+    ASSERT_TRUE(file.is_open());
+    LogRecordHeader header{};
+    file.read(reinterpret_cast<char*>(&header), LOG_RECORD_HEADER_SIZE);
+    ASSERT_EQ(file.gcount(), static_cast<std::streamsize>(LOG_RECORD_HEADER_SIZE));
+    header.size = corrupt_size;
+    file.seekp(0);
+    file.write(reinterpret_cast<const char*>(&header), LOG_RECORD_HEADER_SIZE);
+    file.seekp(0, std::ios::end);
+    const auto current = static_cast<uint32_t>(file.tellp());
+    ASSERT_LT(current, corrupt_size);
+    std::vector<char> pad(corrupt_size - current, 0);
+    file.write(pad.data(), static_cast<std::streamsize>(pad.size()));
+    ASSERT_TRUE(file.good());
+  }
+
+  WALManager wal(wal_file_.string());
+  auto records = wal.read_log();
+  // Without an upper bound, read_log would accept the padded bogus record.
+  EXPECT_TRUE(records.empty());
+}
+
+TEST(LogRecordTest, DeserializeInsertRejectsOversizedTuple) {
+  // Minimal INSERT payload with a huge embedded tuple_size.
+  constexpr uint32_t kClaimedTupleSize = 0x0FFFFFFFu;
+  constexpr uint32_t kPayload = 4 + 8 + 4;  // oid + rid + tuple_size (no data)
+  constexpr uint32_t kSize = LOG_RECORD_HEADER_SIZE + kPayload;
+  std::vector<char> buffer(kSize, 0);
+
+  LogRecordHeader header{};
+  header.lsn = 1;
+  header.txn_id = 1;
+  header.prev_lsn = INVALID_LSN;
+  header.size = kSize;
+  header.type = LogRecordType::INSERT;
+  std::memcpy(buffer.data(), &header, LOG_RECORD_HEADER_SIZE);
+
+  char* ptr = buffer.data() + LOG_RECORD_HEADER_SIZE;
+  oid_t table_oid = 10;
+  RID rid(1, 0);
+  std::memcpy(ptr, &table_oid, sizeof(table_oid));
+  ptr += sizeof(table_oid);
+  std::memcpy(ptr, &rid, sizeof(rid));
+  ptr += sizeof(rid);
+  std::memcpy(ptr, &kClaimedTupleSize, sizeof(kClaimedTupleSize));
+
+  LogRecord out;
+  EXPECT_FALSE(LogRecord::try_deserialize(buffer.data(), kSize, out));
+}
+
+TEST(LogRecordTest, DeserializeCheckpointRejectsOversizedCount) {
+  constexpr uint32_t kClaimedCount = 0x0FFFFFFFu;
+  constexpr uint32_t kPayload = 4;  // count only, no txn ids
+  constexpr uint32_t kSize = LOG_RECORD_HEADER_SIZE + kPayload;
+  std::vector<char> buffer(kSize, 0);
+
+  LogRecordHeader header{};
+  header.lsn = 1;
+  header.txn_id = INVALID_TXN_ID;
+  header.prev_lsn = INVALID_LSN;
+  header.size = kSize;
+  header.type = LogRecordType::CHECKPOINT;
+  std::memcpy(buffer.data(), &header, LOG_RECORD_HEADER_SIZE);
+  std::memcpy(buffer.data() + LOG_RECORD_HEADER_SIZE, &kClaimedCount, sizeof(kClaimedCount));
+
+  LogRecord out;
+  EXPECT_FALSE(LogRecord::try_deserialize(buffer.data(), kSize, out));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
