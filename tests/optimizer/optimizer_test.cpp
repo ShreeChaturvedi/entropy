@@ -23,7 +23,7 @@ namespace entropy {
 class OptimizerTest : public ::testing::Test {
 protected:
   void SetUp() override {
-    disk_manager_ = std::make_shared<DiskManager>("optimizer_test.db");
+    disk_manager_ = std::make_shared<FileDiskManager>("optimizer_test.db");
     buffer_pool_ = std::make_shared<BufferPoolManager>(32, disk_manager_);
     catalog_ = std::make_shared<Catalog>(buffer_pool_);
     statistics_ = std::make_shared<Statistics>(catalog_);
