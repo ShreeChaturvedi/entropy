@@ -71,6 +71,7 @@ add_executable(transaction_tests
 target_link_libraries(transaction_tests
     PRIVATE
         entropy_transaction
+        entropy_catalog
         test_utils
         GTest::gtest
         GTest::gtest_main
