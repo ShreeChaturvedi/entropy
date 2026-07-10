@@ -84,6 +84,41 @@ std::optional<slot_id_t> TablePage::insert_record(const char* data, uint16_t siz
     return slot_id;
 }
 
+bool TablePage::insert_record_at(slot_id_t slot_id, const char* data, uint16_t size) {
+    if (data == nullptr || size == 0) {
+        return false;
+    }
+    if (slot_id >= get_slot_count()) {
+        return false;
+    }
+
+    Slot* slot = get_slot(slot_id);
+    if (!slot->is_empty()) {
+        return false;  // Slot already occupied
+    }
+
+    if (get_free_space() < size) {
+        compact();
+        if (get_free_space() < size) {
+            return false;
+        }
+    }
+
+    auto* header = page_->header();
+    uint16_t record_offset = header->free_space_end - size;
+    if (record_offset < header->free_space_offset) {
+        return false;
+    }
+
+    std::memcpy(page_->data() + record_offset, data, size);
+    slot->offset = record_offset;
+    slot->length = size;
+    header->free_space_end = record_offset;
+
+    page_->set_dirty(true);
+    return true;
+}
+
 bool TablePage::delete_record(slot_id_t slot_id) {
     if (slot_id >= get_slot_count()) {
         return false;

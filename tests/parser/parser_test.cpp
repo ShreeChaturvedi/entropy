@@ -821,5 +821,131 @@ TEST_F(BinderTest, BindSelectValidColumnsUnderLogical) {
   EXPECT_EQ(rhs_col->column_index(), 0u); // id is index 0
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Trailing tokens / GROUP BY / IS NULL (issue #32)
+//
+// Silent wrong SQL is worse than errors: unconsumed tokens after a statement
+// must fail, GROUP BY must not be swallowed as a table alias, and IS [NOT]
+// NULL must produce a real expression node.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST_F(ParserTest, TrailingJunkAfterSelectIsError) {
+  Parser parser("SELECT * FROM users WHERE id = 1 EXTRA");
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  EXPECT_FALSE(status.ok());
+}
+
+TEST_F(ParserTest, TrailingSecondStatementIsError) {
+  Parser parser("SELECT * FROM users; DROP TABLE users;");
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  EXPECT_FALSE(status.ok());
+}
+
+TEST_F(ParserTest, GroupByIsNotTableAlias) {
+  Parser parser("SELECT * FROM users GROUP BY id");
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  ASSERT_TRUE(status.ok()) << status.to_string();
+
+  auto *select = dynamic_cast<SelectStatement *>(stmt.get());
+  ASSERT_NE(select, nullptr);
+  EXPECT_TRUE(select->table.alias.empty());
+  ASSERT_EQ(select->group_by.size(), 1u);
+  EXPECT_EQ(select->group_by[0], "id");
+}
+
+TEST_F(ParserTest, GroupByMultipleColumns) {
+  Parser parser("SELECT * FROM users GROUP BY id, name");
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  ASSERT_TRUE(status.ok()) << status.to_string();
+
+  auto *select = dynamic_cast<SelectStatement *>(stmt.get());
+  ASSERT_NE(select, nullptr);
+  ASSERT_EQ(select->group_by.size(), 2u);
+  EXPECT_EQ(select->group_by[0], "id");
+  EXPECT_EQ(select->group_by[1], "name");
+}
+
+TEST_F(ParserTest, ParseIsNull) {
+  Parser parser("SELECT * FROM users WHERE name IS NULL");
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  ASSERT_TRUE(status.ok()) << status.to_string();
+
+  auto *select = dynamic_cast<SelectStatement *>(stmt.get());
+  ASSERT_NE(select, nullptr);
+  ASSERT_NE(select->where_clause, nullptr);
+  EXPECT_EQ(select->where_clause->expr_type(), ExpressionType::IS_NULL);
+
+  auto *is_null = dynamic_cast<IsNullExpression *>(select->where_clause.get());
+  ASSERT_NE(is_null, nullptr);
+  EXPECT_FALSE(is_null->negated());
+}
+
+TEST_F(ParserTest, ParseIsNotNull) {
+  Parser parser("SELECT * FROM users WHERE name IS NOT NULL");
+  std::unique_ptr<Statement> stmt;
+
+  Status status = parser.parse(&stmt);
+  ASSERT_TRUE(status.ok()) << status.to_string();
+
+  auto *select = dynamic_cast<SelectStatement *>(stmt.get());
+  ASSERT_NE(select, nullptr);
+  ASSERT_NE(select->where_clause, nullptr);
+  EXPECT_EQ(select->where_clause->expr_type(), ExpressionType::IS_NULL);
+
+  auto *is_null = dynamic_cast<IsNullExpression *>(select->where_clause.get());
+  ASSERT_NE(is_null, nullptr);
+  EXPECT_TRUE(is_null->negated());
+}
+
+TEST_F(ExpressionTest, IsNullOnNullValue) {
+  auto operand = std::make_unique<ConstantExpression>(TupleValue::null());
+  auto expr = std::make_unique<IsNullExpression>(std::move(operand), false);
+
+  TupleValue result = expr->evaluate(tuple_, schema_);
+  EXPECT_TRUE(result.is_bool());
+  EXPECT_TRUE(result.as_bool());
+}
+
+TEST_F(ExpressionTest, IsNullOnNonNullValue) {
+  auto operand = std::make_unique<ConstantExpression>(
+      TupleValue(static_cast<int64_t>(1)));
+  auto expr = std::make_unique<IsNullExpression>(std::move(operand), false);
+
+  TupleValue result = expr->evaluate(tuple_, schema_);
+  EXPECT_TRUE(result.is_bool());
+  EXPECT_FALSE(result.as_bool());
+}
+
+TEST_F(ExpressionTest, IsNotNullOnNullValue) {
+  auto operand = std::make_unique<ConstantExpression>(TupleValue::null());
+  auto expr = std::make_unique<IsNullExpression>(std::move(operand), true);
+
+  TupleValue result = expr->evaluate(tuple_, schema_);
+  EXPECT_TRUE(result.is_bool());
+  EXPECT_FALSE(result.as_bool());
+}
+
+TEST_F(BinderTest, BindIsNullUnknownColumn) {
+  Parser parser("SELECT * FROM users WHERE bogus_col IS NULL");
+  std::unique_ptr<Statement> stmt;
+  ASSERT_TRUE(parser.parse(&stmt).ok());
+
+  auto *select = dynamic_cast<SelectStatement *>(stmt.get());
+  BoundSelectContext context;
+  auto status = binder_->bind_select(select, &context);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.code(), StatusCode::kNotFound);
+}
+
 } // namespace
 } // namespace entropy

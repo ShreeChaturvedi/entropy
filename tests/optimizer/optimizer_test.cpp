@@ -8,6 +8,7 @@
 #include "catalog/catalog.hpp"
 #include "catalog/column.hpp"
 #include "catalog/schema.hpp"
+#include "execution/index_scan_executor.hpp"
 #include "optimizer/cost_model.hpp"
 #include "optimizer/index_selector.hpp"
 #include "optimizer/plan_node.hpp"
@@ -217,6 +218,57 @@ TEST_F(OptimizerTest, SelectAccessMethodWithIndex) {
   // - For small tables, optimizer may still choose SeqScan
   // - Just verify costs are reasonable
   EXPECT_GT(selection.seq_scan_cost, 0);
+}
+
+// Regression for issue #4: IndexSelector returns an index OID, but execute_select
+// used to cast that OID to column_id_t and call get_index_for_column. When the
+// OID numerically aliases another column's position, the wrong index is used
+// and wrong rows are returned.
+TEST_F(OptimizerTest, IndexScanResolvesByOidNotColumnId) {
+  // Table oid=1. First index (id, col 0) gets oid=2; second (age, col 2) oid=3.
+  // Casting id-index oid 2 to column_id looks up key_column==2 → age index.
+  ASSERT_TRUE(catalog_->create_index("idx_users_id", "users", "id").ok());
+  ASSERT_TRUE(catalog_->create_index("idx_users_age", "users", "age").ok());
+
+  IndexInfo *id_index = catalog_->get_index("idx_users_id");
+  IndexInfo *age_index = catalog_->get_index("idx_users_age");
+  ASSERT_NE(id_index, nullptr);
+  ASSERT_NE(age_index, nullptr);
+  ASSERT_EQ(id_index->oid, 2u);
+  ASSERT_EQ(id_index->key_column, 0);
+  ASSERT_EQ(age_index->key_column, 2);
+
+  // Bug pattern from database.cpp: OID cast to column_id selects age index.
+  IndexInfo *aliased =
+      catalog_->get_index_for_column(table_info_->oid,
+                                     static_cast<column_id_t>(id_index->oid));
+  ASSERT_NE(aliased, nullptr);
+  EXPECT_EQ(aliased, age_index) << "OID→column_id alias must hit age index";
+
+  // Correct resolution: look up by OID.
+  IndexInfo *resolved = catalog_->get_index_by_oid(id_index->oid);
+  ASSERT_NE(resolved, nullptr);
+  EXPECT_EQ(resolved, id_index);
+
+  // Point lookup key=42 via the correct (id) index returns the id=42 row.
+  IndexScanExecutor correct_scan(nullptr, resolved->index.get(),
+                                 table_info_->table_heap.get(),
+                                 &output_schema_, /*key=*/42);
+  correct_scan.init();
+  auto correct_row = correct_scan.next();
+  ASSERT_TRUE(correct_row.has_value());
+  EXPECT_EQ(correct_row->get_value(output_schema_, 0).as_integer(), 42);
+  EXPECT_FALSE(correct_scan.next().has_value());
+
+  // Same key via the aliased (age) index returns a different row (age=42 → id=22).
+  IndexScanExecutor wrong_scan(nullptr, aliased->index.get(),
+                               table_info_->table_heap.get(), &output_schema_,
+                               /*key=*/42);
+  wrong_scan.init();
+  auto wrong_row = wrong_scan.next();
+  ASSERT_TRUE(wrong_row.has_value());
+  EXPECT_NE(wrong_row->get_value(output_schema_, 0).as_integer(), 42);
+  EXPECT_EQ(wrong_row->get_value(output_schema_, 2).as_integer(), 42);
 }
 
 // PlanNode Tests

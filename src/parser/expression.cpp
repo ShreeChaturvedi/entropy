@@ -362,4 +362,26 @@ std::unique_ptr<Expression> LogicalExpression::clone() const {
                                              right_->clone());
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// IsNullExpression
+// ─────────────────────────────────────────────────────────────────────────────
+
+IsNullExpression::IsNullExpression(std::unique_ptr<Expression> operand,
+                                   bool negated)
+    : Expression(ExpressionType::IS_NULL), operand_(std::move(operand)),
+      negated_(negated) {}
+
+TupleValue IsNullExpression::evaluate(const Tuple &tuple,
+                                      const Schema &schema) const {
+  TupleValue val = operand_->evaluate(tuple, schema);
+  bool is_null = val.is_null();
+  return TupleValue(negated_ ? !is_null : is_null);
+}
+
+TypeId IsNullExpression::result_type() const { return TypeId::BOOLEAN; }
+
+std::unique_ptr<Expression> IsNullExpression::clone() const {
+  return std::make_unique<IsNullExpression>(operand_->clone(), negated_);
+}
+
 } // namespace entropy

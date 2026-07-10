@@ -7,6 +7,7 @@
 #include <iostream>
 #include <string>
 
+#include "api/shell_utils.hpp"
 #include "entropy/entropy.hpp"
 
 namespace entropy {
@@ -135,7 +136,7 @@ void run_shell(Database &db) {
     query += line;
     query += " ";
 
-    if (!query.empty() && query.find(';') != std::string::npos) {
+    if (!query.empty() && sql_has_complete_statement(query)) {
       auto result = db.execute(query);
       if (result.ok()) {
         if (result.is_query()) {
