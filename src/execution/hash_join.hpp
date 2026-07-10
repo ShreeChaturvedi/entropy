@@ -36,6 +36,8 @@ enum class JoinType;
  * 2. Probe: Stream the "probe" (larger) table, looking up matches
  *
  * Uses multi-map for handling multiple matches per key.
+ * Hash table values are indices into build_tuples_ so duplicate keys and
+ * LEFT unmatched emission can track per-tuple match state.
  */
 class HashJoinExecutor : public Executor {
 public:
@@ -73,7 +75,7 @@ private:
   };
 
   /**
-   * @brief Equality for join keys
+   * @brief Equality for join keys (NULL never equals NULL)
    */
   struct KeyEqual {
     bool operator()(const TupleValue &a, const TupleValue &b) const noexcept;
@@ -93,10 +95,11 @@ private:
   size_t right_key_index_;
   JoinType join_type_;
 
-  // Hash table: key -> list of matching tuples from build side
+  // Hash table: key -> indices into build_tuples_
   using HashTable =
-      std::unordered_multimap<TupleValue, Tuple, KeyHash, KeyEqual>;
+      std::unordered_multimap<TupleValue, size_t, KeyHash, KeyEqual>;
   HashTable hash_table_;
+  std::vector<Tuple> build_tuples_;
 
   // Probe state
   std::optional<Tuple> current_probe_;
@@ -104,11 +107,10 @@ private:
   HashTable::iterator match_end_;
   bool probe_had_match_ = false;
 
-  // For RIGHT JOIN: track which build tuples matched
+  // For LEFT JOIN: track which build tuples matched, then emit unmatched
   std::vector<bool> build_matched_;
-  std::vector<Tuple> build_tuples_; // For RIGHT JOIN unmatched emission
-  size_t right_phase_index_ = 0;
-  bool in_right_phase_ = false;
+  size_t unmatched_build_index_ = 0;
+  bool in_unmatched_build_phase_ = false;
 
   bool initialized_ = false;
 };

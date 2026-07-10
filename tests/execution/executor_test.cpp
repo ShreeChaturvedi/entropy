@@ -1003,12 +1003,300 @@ TEST_F(JoinTest, HashJoinLeft) {
   hash_join.init();
 
   int count = 0;
-  while (hash_join.next().has_value()) {
+  bool found_charlie = false;
+  while (auto tuple = hash_join.next()) {
+    std::string name = tuple->get_value(output_schema_, 1).as_string();
+    if (name == "Charlie") {
+      // Charlie has no orders — right side must be NULL-filled
+      EXPECT_TRUE(tuple->get_value(output_schema_, 2).is_null());
+      EXPECT_TRUE(tuple->get_value(output_schema_, 3).is_null());
+      EXPECT_TRUE(tuple->get_value(output_schema_, 4).is_null());
+      found_charlie = true;
+    } else {
+      // Matched rows: users.user_id == orders.user_id
+      EXPECT_EQ(tuple->get_value(output_schema_, 0).as_integer(),
+                tuple->get_value(output_schema_, 3).as_integer());
+    }
     count++;
   }
 
   // Alice:2 + Bob:1 + Charlie:1(null) = 4 rows
   EXPECT_EQ(count, 4);
+  EXPECT_TRUE(found_charlie);
+}
+
+TEST_F(JoinTest, HashJoinRight) {
+  auto left = std::make_unique<SeqScanExecutor>(
+      nullptr, users_info_->table_heap, &users_schema_);
+  auto right = std::make_unique<SeqScanExecutor>(
+      nullptr, orders_info_->table_heap, &orders_schema_);
+
+  HashJoinExecutor hash_join(nullptr, std::move(left), std::move(right),
+                             &users_schema_, &orders_schema_, &output_schema_,
+                             0, 1, JoinType::RIGHT);
+  hash_join.init();
+
+  int count = 0;
+  bool found_orphan_order = false;
+  bool found_charlie = false;
+  while (auto tuple = hash_join.next()) {
+    TupleValue name = tuple->get_value(output_schema_, 1);
+    TupleValue order_id = tuple->get_value(output_schema_, 2);
+    if (!order_id.is_null() && order_id.as_integer() == 104) {
+      // Order 104 has no matching user — left side must be NULL-filled
+      EXPECT_TRUE(tuple->get_value(output_schema_, 0).is_null());
+      EXPECT_TRUE(name.is_null());
+      EXPECT_EQ(tuple->get_value(output_schema_, 3).as_integer(), 99);
+      found_orphan_order = true;
+    }
+    if (!name.is_null() && name.as_string() == "Charlie") {
+      found_charlie = true;
+    }
+    count++;
+  }
+
+  // Alice:2 + Bob:1 + orphan order 104 = 4 rows; Charlie must not appear
+  EXPECT_EQ(count, 4);
+  EXPECT_TRUE(found_orphan_order);
+  EXPECT_FALSE(found_charlie);
+}
+
+TEST_F(JoinTest, HashJoinNullKeysDoNotMatch) {
+  // Left: (NULL, "NullUser"), (1, "Alice")
+  // Right: (10, NULL, 5), (20, 1, 50)
+  // INNER on left.user_id = right.user_id must not treat NULL=NULL as a match
+  Schema left_schema({
+      Column("user_id", TypeId::INTEGER),
+      Column("name", TypeId::VARCHAR, 100),
+  });
+  Schema right_schema({
+      Column("order_id", TypeId::INTEGER),
+      Column("user_id", TypeId::INTEGER),
+      Column("amount", TypeId::INTEGER),
+  });
+  Schema out_schema({
+      Column("user_id", TypeId::INTEGER),
+      Column("name", TypeId::VARCHAR, 100),
+      Column("order_id", TypeId::INTEGER),
+      Column("order_user_id", TypeId::INTEGER),
+      Column("amount", TypeId::INTEGER),
+  });
+
+  ASSERT_TRUE(catalog_->create_table("null_users", left_schema).ok());
+  ASSERT_TRUE(catalog_->create_table("null_orders", right_schema).ok());
+  auto *null_users = catalog_->get_table("null_users");
+  auto *null_orders = catalog_->get_table("null_orders");
+
+  {
+    std::vector<Tuple> tuples;
+    tuples.emplace_back(
+        std::vector<TupleValue>{TupleValue::null(),
+                                TupleValue(std::string("NullUser"))},
+        left_schema);
+    tuples.emplace_back(
+        std::vector<TupleValue>{TupleValue(1),
+                                TupleValue(std::string("Alice"))},
+        left_schema);
+    InsertExecutor insert(nullptr, null_users->table_heap, std::move(tuples));
+    insert.init();
+    [[maybe_unused]] auto inserted = insert.next();
+  }
+  {
+    std::vector<Tuple> tuples;
+    tuples.emplace_back(
+        std::vector<TupleValue>{TupleValue(10), TupleValue::null(),
+                                TupleValue(5)},
+        right_schema);
+    tuples.emplace_back(
+        std::vector<TupleValue>{TupleValue(20), TupleValue(1), TupleValue(50)},
+        right_schema);
+    InsertExecutor insert(nullptr, null_orders->table_heap, std::move(tuples));
+    insert.init();
+    [[maybe_unused]] auto inserted = insert.next();
+  }
+
+  auto left = std::make_unique<SeqScanExecutor>(
+      nullptr, null_users->table_heap, &left_schema);
+  auto right = std::make_unique<SeqScanExecutor>(
+      nullptr, null_orders->table_heap, &right_schema);
+
+  HashJoinExecutor hash_join(nullptr, std::move(left), std::move(right),
+                             &left_schema, &right_schema, &out_schema, 0, 1,
+                             JoinType::INNER);
+  hash_join.init();
+
+  int count = 0;
+  while (auto tuple = hash_join.next()) {
+    EXPECT_FALSE(tuple->get_value(out_schema, 0).is_null());
+    EXPECT_EQ(tuple->get_value(out_schema, 0).as_integer(), 1);
+    EXPECT_EQ(tuple->get_value(out_schema, 1).as_string(), "Alice");
+    EXPECT_EQ(tuple->get_value(out_schema, 2).as_integer(), 20);
+    count++;
+  }
+  EXPECT_EQ(count, 1);
+}
+
+TEST_F(JoinTest, HashJoinRightDuplicateBuildKeys) {
+  // Two build rows share key 1; one probe matches both. Match tracking must
+  // mark every matching build tuple — not only the first — so neither is
+  // re-emitted as unmatched on the RIGHT outer phase.
+  Schema left_schema({
+      Column("user_id", TypeId::INTEGER),
+      Column("name", TypeId::VARCHAR, 100),
+  });
+  Schema right_schema({
+      Column("order_id", TypeId::INTEGER),
+      Column("user_id", TypeId::INTEGER),
+      Column("amount", TypeId::INTEGER),
+  });
+  Schema out_schema({
+      Column("user_id", TypeId::INTEGER),
+      Column("name", TypeId::VARCHAR, 100),
+      Column("order_id", TypeId::INTEGER),
+      Column("order_user_id", TypeId::INTEGER),
+      Column("amount", TypeId::INTEGER),
+  });
+
+  ASSERT_TRUE(catalog_->create_table("dup_users_r", left_schema).ok());
+  ASSERT_TRUE(catalog_->create_table("dup_orders_r", right_schema).ok());
+  auto *dup_users = catalog_->get_table("dup_users_r");
+  auto *dup_orders = catalog_->get_table("dup_orders_r");
+
+  {
+    std::vector<Tuple> tuples;
+    tuples.emplace_back(
+        std::vector<TupleValue>{TupleValue(1),
+                                TupleValue(std::string("AliceA"))},
+        left_schema);
+    tuples.emplace_back(
+        std::vector<TupleValue>{TupleValue(1),
+                                TupleValue(std::string("AliceB"))},
+        left_schema);
+    InsertExecutor insert(nullptr, dup_users->table_heap, std::move(tuples));
+    insert.init();
+    [[maybe_unused]] auto inserted = insert.next();
+  }
+  {
+    std::vector<Tuple> tuples;
+    tuples.emplace_back(
+        std::vector<TupleValue>{TupleValue(100), TupleValue(1),
+                                TupleValue(50)},
+        right_schema);
+    InsertExecutor insert(nullptr, dup_orders->table_heap, std::move(tuples));
+    insert.init();
+    [[maybe_unused]] auto inserted = insert.next();
+  }
+
+  auto left = std::make_unique<SeqScanExecutor>(
+      nullptr, dup_users->table_heap, &left_schema);
+  auto right = std::make_unique<SeqScanExecutor>(
+      nullptr, dup_orders->table_heap, &right_schema);
+
+  HashJoinExecutor hash_join(nullptr, std::move(left), std::move(right),
+                             &left_schema, &right_schema, &out_schema, 0, 1,
+                             JoinType::RIGHT);
+  hash_join.init();
+
+  int count = 0;
+  int unmatched_left = 0;
+  while (auto tuple = hash_join.next()) {
+    if (tuple->get_value(out_schema, 0).is_null()) {
+      unmatched_left++;
+    } else {
+      EXPECT_EQ(tuple->get_value(out_schema, 0).as_integer(), 1);
+      EXPECT_EQ(tuple->get_value(out_schema, 2).as_integer(), 100);
+    }
+    count++;
+  }
+
+  // Both duplicates match; no unmatched probe → exactly 2 rows
+  EXPECT_EQ(count, 2);
+  EXPECT_EQ(unmatched_left, 0);
+}
+
+TEST_F(JoinTest, HashJoinLeftDuplicateBuildKeysAndUnmatched) {
+  // Duplicate build key 1 plus unmatched Charlie. LEFT must emit both
+  // matched duplicates and exactly one NULL-padded Charlie — never a
+  // spurious unmatched duplicate.
+  Schema left_schema({
+      Column("user_id", TypeId::INTEGER),
+      Column("name", TypeId::VARCHAR, 100),
+  });
+  Schema right_schema({
+      Column("order_id", TypeId::INTEGER),
+      Column("user_id", TypeId::INTEGER),
+      Column("amount", TypeId::INTEGER),
+  });
+  Schema out_schema({
+      Column("user_id", TypeId::INTEGER),
+      Column("name", TypeId::VARCHAR, 100),
+      Column("order_id", TypeId::INTEGER),
+      Column("order_user_id", TypeId::INTEGER),
+      Column("amount", TypeId::INTEGER),
+  });
+
+  ASSERT_TRUE(catalog_->create_table("dup_users_l", left_schema).ok());
+  ASSERT_TRUE(catalog_->create_table("dup_orders_l", right_schema).ok());
+  auto *dup_users = catalog_->get_table("dup_users_l");
+  auto *dup_orders = catalog_->get_table("dup_orders_l");
+
+  {
+    std::vector<Tuple> tuples;
+    tuples.emplace_back(
+        std::vector<TupleValue>{TupleValue(1),
+                                TupleValue(std::string("AliceA"))},
+        left_schema);
+    tuples.emplace_back(
+        std::vector<TupleValue>{TupleValue(1),
+                                TupleValue(std::string("AliceB"))},
+        left_schema);
+    tuples.emplace_back(
+        std::vector<TupleValue>{TupleValue(3),
+                                TupleValue(std::string("Charlie"))},
+        left_schema);
+    InsertExecutor insert(nullptr, dup_users->table_heap, std::move(tuples));
+    insert.init();
+    [[maybe_unused]] auto inserted = insert.next();
+  }
+  {
+    std::vector<Tuple> tuples;
+    tuples.emplace_back(
+        std::vector<TupleValue>{TupleValue(100), TupleValue(1),
+                                TupleValue(50)},
+        right_schema);
+    InsertExecutor insert(nullptr, dup_orders->table_heap, std::move(tuples));
+    insert.init();
+    [[maybe_unused]] auto inserted = insert.next();
+  }
+
+  auto left = std::make_unique<SeqScanExecutor>(
+      nullptr, dup_users->table_heap, &left_schema);
+  auto right = std::make_unique<SeqScanExecutor>(
+      nullptr, dup_orders->table_heap, &right_schema);
+
+  HashJoinExecutor hash_join(nullptr, std::move(left), std::move(right),
+                             &left_schema, &right_schema, &out_schema, 0, 1,
+                             JoinType::LEFT);
+  hash_join.init();
+
+  int count = 0;
+  int unmatched = 0;
+  bool found_charlie = false;
+  while (auto tuple = hash_join.next()) {
+    if (tuple->get_value(out_schema, 2).is_null()) {
+      unmatched++;
+      EXPECT_EQ(tuple->get_value(out_schema, 1).as_string(), "Charlie");
+      found_charlie = true;
+    } else {
+      EXPECT_EQ(tuple->get_value(out_schema, 0).as_integer(), 1);
+      EXPECT_EQ(tuple->get_value(out_schema, 2).as_integer(), 100);
+    }
+    count++;
+  }
+
+  EXPECT_EQ(count, 3);
+  EXPECT_EQ(unmatched, 1);
+  EXPECT_TRUE(found_charlie);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
