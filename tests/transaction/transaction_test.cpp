@@ -1820,6 +1820,116 @@ TEST_F(RecoveryTest, RedoIsIdempotentAcrossRepeatedRecovery) {
   EXPECT_EQ(after_first, after_second);
 }
 
+TEST_F(RecoveryTest, UndoOfStolenPageSurvivesSecondCrash) {
+  // Crash-safety of undo without CLRs. Scenario: loser T inserts row R and the
+  // page is stolen (flushed pre-crash with page_lsn = the INSERT's LSN), so
+  // redo is LSN-gated and only undo removes R. If the ABORT became durable
+  // while the compensated page was only dirty in the pool, a second crash
+  // would leave R on disk forever: T is no longer a loser and redo stays
+  // gated. Recovery must therefore flush the undone page BEFORE the ABORT.
+  lsn_t insert_lsn = INVALID_LSN;
+  {
+    WALManager wal(wal_file_.string());
+    auto begin = LogRecord::make_begin(7);
+    [[maybe_unused]] lsn_t lsn = wal.append_log(begin);
+    auto insert =
+        LogRecord::make_insert(7, begin.lsn(), 10, RID(0, 0), bytes("loser-row"));
+    insert_lsn = wal.append_log(insert);
+    ASSERT_NE(insert_lsn, INVALID_LSN);
+    // No commit - crash simulation.
+    (void)wal.flush();
+  }
+
+  // Steal: the page holding the uncommitted row reached disk pre-crash with
+  // its LSN advanced to the INSERT's LSN.
+  {
+    auto setup_pool = make_buffer_pool();
+    Page *page = setup_pool->fetch_page(0);
+    ASSERT_NE(page, nullptr);
+    TablePage table_page(page);
+    table_page.init();
+    const std::vector<char> row = bytes("loser-row");
+    auto slot = table_page.insert_record(row.data(), static_cast<uint16_t>(row.size()));
+    ASSERT_TRUE(slot.has_value());
+    ASSERT_EQ(*slot, 0u);
+    page->set_lsn(insert_lsn);
+    setup_pool->unpin_page(0, true);
+    ASSERT_TRUE(setup_pool->flush_page(0));
+  }
+
+  // Crash 1 -> first recovery: redo is gated, undo removes R and must make the
+  // compensation durable before the ABORT it appends.
+  auto pool1 = make_buffer_pool();
+  auto wal1 = std::make_shared<WALManager>(wal_file_.string());
+  RecoveryManager recovery1(pool1, wal1, disk_manager_);
+  ASSERT_TRUE(recovery1.recover().ok());
+  EXPECT_EQ(recovery1.redo_count(), 0u);
+  EXPECT_EQ(recovery1.undo_count(), 1u);
+
+  // Crash 2 before pool1 flushes anything further: read the on-disk state
+  // through a fresh buffer pool while pool1 is still alive (its cached pages
+  // never reach disk). The durable ABORT means T is no longer a loser, so
+  // only the pre-ABORT page flush can have removed R.
+  auto pool2 = make_buffer_pool();
+  auto wal2 = std::make_shared<WALManager>(wal_file_.string());
+  auto records = wal2->read_log();
+  ASSERT_FALSE(records.empty());
+  EXPECT_EQ(records.back().type(), LogRecordType::ABORT);
+
+  RecoveryManager recovery2(pool2, wal2, disk_manager_);
+  ASSERT_TRUE(recovery2.recover().ok());
+  EXPECT_TRUE(recovery2.active_txn_table().empty());
+  EXPECT_EQ(recovery2.redo_count(), 0u);
+  EXPECT_EQ(recovery2.undo_count(), 0u);
+  EXPECT_FALSE(record_at(*pool2, RID(0, 0)).has_value());
+}
+
+TEST_F(RecoveryTest, UndoSkipsSlotReusedByCommittedTransaction) {
+  // Loser T1 inserts and deletes (0,0); committed T2 then reuses the slot.
+  // A blind undo of T1's INSERT would delete T2's committed row; the
+  // state-checked undo must leave it untouched.
+  {
+    WALManager wal(wal_file_.string());
+
+    auto begin1 = LogRecord::make_begin(1);
+    [[maybe_unused]] lsn_t lsn = wal.append_log(begin1);
+    auto insert1 =
+        LogRecord::make_insert(1, begin1.lsn(), 10, RID(0, 0), bytes("AAAA"));
+    lsn = wal.append_log(insert1);
+    auto delete1 =
+        LogRecord::make_delete(1, insert1.lsn(), 10, RID(0, 0), bytes("AAAA"));
+    lsn = wal.append_log(delete1);
+    // No commit for T1 - loser.
+
+    auto begin2 = LogRecord::make_begin(2);
+    lsn = wal.append_log(begin2);
+    auto insert2 =
+        LogRecord::make_insert(2, begin2.lsn(), 10, RID(0, 0), bytes("BBBB"));
+    lsn = wal.append_log(insert2);
+    auto commit2 = LogRecord::make_commit(2, insert2.lsn());
+    lsn = wal.append_log(commit2);
+
+    (void)wal.flush();
+  }
+
+  auto pool = make_buffer_pool();
+  auto wal = std::make_shared<WALManager>(wal_file_.string());
+  RecoveryManager recovery(pool, wal, disk_manager_);
+
+  ASSERT_TRUE(recovery.recover().ok());
+
+  // T1 is the only loser, but both of its undo ops must skip: the slot is
+  // occupied by T2's bytes (undo-DELETE needs an empty slot; undo-INSERT
+  // needs the slot to still hold T1's bytes).
+  EXPECT_TRUE(recovery.active_txn_table().count(1) > 0);
+  EXPECT_TRUE(recovery.committed_txns().count(2) > 0);
+  EXPECT_EQ(recovery.undo_count(), 0u);
+
+  auto r = record_at(*pool, RID(0, 0));
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(*r, bytes("BBBB"));
+}
+
 TEST_F(RecoveryTest, CheckpointRecovery) {
   // Create WAL with checkpoint
   {
