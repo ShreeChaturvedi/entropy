@@ -55,6 +55,10 @@ Status DiskManager::read_page(page_id_t page_id, char* page_data) {
         return Status::InvalidArgument("Invalid page ID");
     }
 
+    // A prior short/beyond-EOF read leaves failbit set; clear so this I/O
+    // is not spuriously rejected (and so we do not latch all later I/O off).
+    db_io_.clear();
+
     const auto offset = static_cast<std::streamoff>(page_id) *
                         static_cast<std::streamoff>(page_size());
     db_io_.seekg(offset, std::ios::beg);
@@ -69,7 +73,8 @@ Status DiskManager::read_page(page_id_t page_id, char* page_data) {
         return Status::IOError("Failed to read page");
     }
 
-    // Handle reading beyond file (return zeroed page)
+    // Handle reading beyond file (return zeroed page). Short reads set
+    // failbit; clear it so subsequent operations on this fstream succeed.
     const auto bytes_read = db_io_.gcount();
     if (bytes_read < 0) {
         return Status::IOError("Failed to read page");
@@ -78,6 +83,7 @@ Status DiskManager::read_page(page_id_t page_id, char* page_data) {
     if (bytes_read_size < page_size()) {
         std::memset(page_data + bytes_read_size, 0,
                     page_size() - bytes_read_size);
+        db_io_.clear();
     }
 
     return Status::Ok();
@@ -89,6 +95,9 @@ Status DiskManager::write_page(page_id_t page_id, const char* page_data) {
     if (page_id < 0) {
         return Status::InvalidArgument("Invalid page ID");
     }
+
+    // Clear any leftover failbit/eofbit from a prior short read.
+    db_io_.clear();
 
     const auto offset = static_cast<std::streamoff>(page_id) *
                         static_cast<std::streamoff>(page_size());
