@@ -5,6 +5,7 @@
  * @brief Buffer Pool Manager
  */
 
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -95,9 +96,29 @@ public:
      */
     [[nodiscard]] size_t free_list_size() const;
 
+    /**
+     * @brief Install a hook run immediately before any dirty page is written
+     *
+     * The hook is invoked with the page's LSN just before every disk
+     * write_page (eviction, flush_page, flush_all_pages). It is the seam used
+     * to enforce the WAL-before-page (steal) rule: flush the log up to the
+     * page's LSN before the page reaches disk. If the hook returns a non-ok
+     * Status the page write is skipped entirely and the error propagated —
+     * a failed log flush must never be followed by writing the dirty page.
+     * This is a mechanism only; the hook is empty until an owner installs one.
+     *
+     * The hook runs while the buffer pool mutex is held, including during
+     * destruction (the destructor flushes all pages). It must not re-enter
+     * the BufferPoolManager and must outlive the pool.
+     */
+    void set_wal_flush_hook(std::function<Status(lsn_t)> hook);
+
 private:
     /// Find a frame to use (evict if necessary)
     [[nodiscard]] frame_id_t find_victim_frame();
+
+    /// Write a page to disk, running the WAL flush hook first.
+    [[nodiscard]] Status write_page_to_disk(Page* page);
 
     size_t pool_size_;
     std::shared_ptr<DiskManager> disk_manager_;
@@ -105,6 +126,7 @@ private:
     std::unique_ptr<LRUReplacer> replacer_;
     std::unordered_map<page_id_t, frame_id_t> page_table_;
     std::vector<frame_id_t> free_list_;
+    std::function<Status(lsn_t)> wal_flush_hook_;
     mutable std::mutex mutex_;
 };
 

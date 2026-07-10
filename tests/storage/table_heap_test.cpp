@@ -26,7 +26,7 @@ protected:
     void SetUp() override {
         // Create temp file
         db_file_ = "/tmp/table_heap_test_" + std::to_string(rand());
-        disk_manager_ = std::make_shared<DiskManager>(db_file_);
+        disk_manager_ = std::make_shared<FileDiskManager>(db_file_);
         buffer_pool_ = std::make_shared<BufferPoolManager>(10, disk_manager_);
         table_heap_ = std::make_unique<TableHeap>(buffer_pool_);
 

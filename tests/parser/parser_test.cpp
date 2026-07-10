@@ -607,7 +607,7 @@ class BinderTest : public ::testing::Test {
 protected:
   void SetUp() override {
     temp_file_ = std::make_unique<test::TempFile>("binder_test_");
-    disk_manager_ = std::make_shared<DiskManager>(temp_file_->string());
+    disk_manager_ = std::make_shared<FileDiskManager>(temp_file_->string());
     buffer_pool_ = std::make_shared<BufferPoolManager>(10, disk_manager_);
     catalog_ = std::make_unique<Catalog>(buffer_pool_);
     binder_ = std::make_unique<Binder>(catalog_.get());
