@@ -363,6 +363,103 @@ TEST_F(ExecutorTest, UpdateTuples) {
   EXPECT_TRUE(found_bob);
 }
 
+// Regression for issue #18 (Halloween problem): a growing UPDATE that relocates
+// a tuple onto a later heap page must not be re-visited by the same SeqScan
+// and updated again.
+TEST_F(ExecutorTest, UpdateGrowingTupleDoesNotRevisitRelocatedRow) {
+  // Target row is inserted first so the scan encounters it before fillers.
+  // Fillers pack the first page so the grow-update must delete+reinsert onto
+  // a later page ahead of the scan cursor.
+  const std::string short_name = "x";
+  std::vector<Tuple> seed;
+  seed.emplace_back(
+      std::vector<TupleValue>{TupleValue(1), TupleValue(short_name),
+                              TupleValue(10)},
+      schema_);
+
+  // Pack the remainder of the first page with non-matching filler rows.
+  const std::string filler_name(200, 'F');
+  for (int i = 0; i < 30; ++i) {
+    seed.emplace_back(
+        std::vector<TupleValue>{TupleValue(1000 + i), TupleValue(filler_name),
+                                TupleValue(0)},
+        schema_);
+  }
+
+  InsertExecutor insert(nullptr, table_info_->table_heap, std::move(seed));
+  insert.init();
+  (void)insert.next();
+
+  // Confirm the target still lives on the first heap page before the update.
+  RID target_rid;
+  {
+    SeqScanExecutor locate(nullptr, table_info_->table_heap, &schema_);
+    locate.init();
+    bool found = false;
+    while (auto tuple = locate.next()) {
+      if (tuple->get_value(schema_, 0).as_integer() == 1) {
+        target_rid = tuple->rid();
+        found = true;
+        break;
+      }
+    }
+    ASSERT_TRUE(found);
+  }
+  const page_id_t first_page = table_info_->table_heap->first_page_id();
+  ASSERT_EQ(target_rid.page_id, first_page);
+
+  // SET name = <long string that cannot fit in-place>, age = age + 1
+  // WHERE id = 1
+  auto id_col = std::make_unique<ColumnRefExpression>("id");
+  id_col->set_column_index(0);
+  id_col->set_type(TypeId::INTEGER);
+  auto const_id = std::make_unique<ConstantExpression>(TupleValue(1));
+  auto predicate = std::make_unique<ComparisonExpression>(
+      ComparisonType::EQUAL, std::move(id_col), std::move(const_id));
+
+  auto child = std::make_unique<SeqScanExecutor>(
+      nullptr, table_info_->table_heap, &schema_, std::move(predicate));
+
+  const std::string long_name(800, 'L');
+  auto age_col = std::make_unique<ColumnRefExpression>("age");
+  age_col->set_column_index(2);
+  age_col->set_type(TypeId::INTEGER);
+  auto one = std::make_unique<ConstantExpression>(TupleValue(1));
+  auto age_plus_one = std::make_unique<BinaryOpExpression>(
+      BinaryOpType::ADD, std::move(age_col), std::move(one));
+
+  std::vector<size_t> col_indices = {1, 2}; // name, age
+  std::vector<std::unique_ptr<Expression>> values;
+  values.push_back(
+      std::make_unique<ConstantExpression>(TupleValue(long_name)));
+  values.push_back(std::move(age_plus_one));
+
+  UpdateExecutor update(nullptr, std::move(child), table_info_->table_heap,
+                        &schema_, std::move(col_indices), std::move(values));
+  update.init();
+  (void)update.next();
+
+  // Halloween bug: relocated row is scanned again → rows_updated > 1 and
+  // age becomes 12 (or higher). Correct behavior updates exactly once.
+  EXPECT_EQ(update.rows_updated(), 1);
+
+  int matching_rows = 0;
+  int age = -1;
+  std::string name;
+  SeqScanExecutor scan(nullptr, table_info_->table_heap, &schema_);
+  scan.init();
+  while (auto tuple = scan.next()) {
+    if (tuple->get_value(schema_, 0).as_integer() == 1) {
+      matching_rows++;
+      name = tuple->get_value(schema_, 1).as_string();
+      age = tuple->get_value(schema_, 2).as_integer();
+    }
+  }
+  EXPECT_EQ(matching_rows, 1);
+  EXPECT_EQ(name, long_name);
+  EXPECT_EQ(age, 11);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Nested Loop Join Tests
 // ─────────────────────────────────────────────────────────────────────────────
