@@ -5,6 +5,7 @@
 
 #include "storage/disk_manager.hpp"
 
+#include <algorithm>
 #include <filesystem>
 
 #include "common/logger.hpp"
@@ -152,10 +153,32 @@ page_id_t FileDiskManager::allocate_page() {
 void FileDiskManager::deallocate_page(page_id_t page_id) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // Ignore ids that were never allocated.
+    // Reject ids that were never allocated.
     if (page_id < 0 || page_id >= num_pages_) {
+        LOG_WARN("Ignoring deallocation of out-of-range page {}", page_id);
         return;
     }
+
+    // Reject double-frees: the id is already available for reuse.
+    if (std::find(free_list_.begin(), free_list_.end(), page_id) !=
+        free_list_.end()) {
+        LOG_WARN("Ignoring double deallocation of page {}", page_id);
+        return;
+    }
+
+    // Zero the page on disk so a reused id reads back like a fresh page.
+    db_io_.clear();
+    const auto offset = static_cast<std::streamoff>(page_id) *
+                        static_cast<std::streamoff>(page_size());
+    db_io_.seekp(offset, std::ios::beg);
+    const std::vector<char> zeros(page_size(), 0);
+    db_io_.write(zeros.data(), static_cast<std::streamsize>(page_size()));
+    if (db_io_.bad()) {
+        // Leak the page rather than risk resurfacing stale bytes on reuse.
+        LOG_ERROR("Failed to zero deallocated page {}; id not reused", page_id);
+        return;
+    }
+    db_io_.flush();
 
     free_list_.push_back(page_id);
 }
