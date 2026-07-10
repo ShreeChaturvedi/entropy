@@ -464,6 +464,47 @@ TEST_F(WALTest, AppendLogReturnsInvalidLsnWhenFlushFails) {
   EXPECT_EQ(wal.append_log(second), INVALID_LSN);
 }
 
+TEST_F(WALTest, FlushRetryAfterSyncFailureDoesNotDuplicateRecords) {
+  // A failed sync leaves the records' bytes already handed to the log file, so
+  // a retry must only re-drive the sync. Re-appending would write duplicate
+  // records (same LSNs twice) into the log.
+  bool fail_next_sync = true;
+  lsn_t last_lsn = INVALID_LSN;
+  {
+    WALManager wal(wal_file_.string());
+    wal.set_sync_hook_for_testing([&]() -> Status {
+      if (fail_next_sync) {
+        fail_next_sync = false;
+        return Status::IOError("injected transient sync failure");
+      }
+      return Status::Ok();
+    });
+
+    auto r1 = LogRecord::make_begin(1);
+    ASSERT_NE(wal.append_log(r1), INVALID_LSN);
+    auto r2 = LogRecord::make_begin(2);
+    last_lsn = wal.append_log(r2);
+    ASSERT_NE(last_lsn, INVALID_LSN);
+
+    // First flush: bytes reach the file, the sync fails, nothing is durable.
+    EXPECT_FALSE(wal.flush().ok());
+    EXPECT_LT(wal.flushed_lsn(), last_lsn);
+
+    // Retry: only the sync runs; the records are not appended a second time.
+    ASSERT_TRUE(wal.flush().ok());
+    EXPECT_EQ(wal.flushed_lsn(), last_lsn);
+  }
+
+  // The log contains each record exactly once.
+  WALManager wal(wal_file_.string());
+  auto records = wal.read_log();
+  ASSERT_EQ(records.size(), 2u);
+  EXPECT_EQ(records[0].lsn(), 1u);
+  EXPECT_EQ(records[0].txn_id(), 1u);
+  EXPECT_EQ(records[1].lsn(), 2u);
+  EXPECT_EQ(records[1].txn_id(), 2u);
+}
+
 TEST_F(WALTest, BufferBoundaryCommitIsDurable) {
   // Regression for the flushed_lsn accounting bug: when a COMMIT append
   // overflows the buffer, the overflow flush writes only the *prior* records

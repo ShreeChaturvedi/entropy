@@ -192,10 +192,8 @@ void WALManager::init_after_open() {
 }
 
 WALManager::~WALManager() {
-    // Flush any remaining buffered records
-    if (buffer_offset_ > 0) {
-        (void)flush();
-    }
+    // Flush any buffered or appended-but-unsynced records.
+    (void)flush();
 }
 
 void WALManager::set_sync_hook_for_testing(std::function<Status()> hook) {
@@ -258,6 +256,9 @@ lsn_t WALManager::append_log(LogRecord& record) {
             record.set_lsn(INVALID_LSN);
             return INVALID_LSN;
         }
+        // Only track the LSN once durable: on sync failure it is rolled back
+        // and reused, so it must not linger as an appended watermark.
+        appended_max_lsn_ = lsn;
         flushed_lsn_.store(lsn);
     } else {
         // Copy to buffer
@@ -277,38 +278,37 @@ Status WALManager::flush() {
 }
 
 Status WALManager::flush_internal() {
-    if (buffer_offset_ == 0) {
-        return Status::Ok();
+    // Stage 1: hand buffered bytes to the store exactly once. append() is
+    // atomic on write failure (the store is left unchanged), so on error the
+    // kept buffer is safely re-appended by a retry.
+    if (buffer_offset_ > 0) {
+        Status write_status =
+            log_store_->append(std::span<const char>(buffer_.data(), buffer_offset_));
+        if (!write_status.ok()) {
+            return write_status;
+        }
+
+        // Track the highest LSN handed to the store. Using next_lsn_ - 1 here
+        // would wrongly cover a record that append_log has assigned an LSN to
+        // but not yet copied into the buffer (e.g. the record that triggered
+        // an overflow flush), silently skipping its later fsync.
+        if (buffered_max_lsn_ > appended_max_lsn_) {
+            appended_max_lsn_ = buffered_max_lsn_;
+        }
+        buffer_offset_ = 0;
+        buffered_max_lsn_ = INVALID_LSN;
     }
 
-    // append() is atomic on write failure: it leaves the store unchanged and we
-    // keep the buffer so a retry rewrites the same bytes.
-    Status write_status =
-        log_store_->append(std::span<const char>(buffer_.data(), buffer_offset_));
-    if (!write_status.ok()) {
-        return write_status;
+    // Stage 2: make appended bytes durable. On sync failure the bytes stay in
+    // the store and a retry only re-drives the sync — never a second append —
+    // so a transient sync failure cannot duplicate records or LSNs in the log.
+    if (appended_max_lsn_ > flushed_lsn_.load()) {
+        Status sync_status = log_store_->sync();
+        if (!sync_status.ok()) {
+            return sync_status;
+        }
+        flushed_lsn_.store(appended_max_lsn_);
     }
-
-    Status sync_status = log_store_->sync();
-    if (!sync_status.ok()) {
-        // Bytes were appended but are not durable; keep the buffer so a retry
-        // re-drives the sync (a duplicate re-append is harmless: same LSNs,
-        // page-LSN-gated redo is idempotent).
-        return sync_status;
-    }
-
-    // Advance flushed LSN only to the highest LSN that was actually contained
-    // in the bytes we just wrote and synced. Using next_lsn_ - 1 here would
-    // wrongly mark a record that append_log has assigned an LSN to but not yet
-    // copied into the buffer (e.g. the record that triggered this overflow
-    // flush) as durable, silently skipping its later fsync.
-    if (buffered_max_lsn_ > flushed_lsn_.load()) {
-        flushed_lsn_.store(buffered_max_lsn_);
-    }
-
-    // Reset buffer
-    buffer_offset_ = 0;
-    buffered_max_lsn_ = INVALID_LSN;
 
     return Status::Ok();
 }
