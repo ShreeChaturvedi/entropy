@@ -1470,13 +1470,53 @@ protected:
         std::filesystem::temp_directory_path() / "entropy_recovery_test";
     std::filesystem::create_directories(test_dir_);
     wal_file_ = test_dir_ / "test.wal";
+    db_file_ = test_dir_ / "test.db";
     std::filesystem::remove(wal_file_);
+    std::filesystem::remove(db_file_);
   }
 
   void TearDown() override { std::filesystem::remove_all(test_dir_); }
 
+  // Build a page store backed by this test's database file.
+  std::shared_ptr<BufferPoolManager> make_buffer_pool() {
+    disk_manager_ = std::make_shared<DiskManager>(db_file_.string());
+    return std::make_shared<BufferPoolManager>(16, disk_manager_);
+  }
+
+  static std::vector<char> bytes(const std::string &s) {
+    return std::vector<char>(s.begin(), s.end());
+  }
+
+  // Read the record bytes stored at rid, or nullopt if the slot is empty.
+  std::optional<std::vector<char>> record_at(BufferPoolManager &pool,
+                                             const RID &rid) {
+    Page *page = pool.fetch_page(rid.page_id);
+    if (page == nullptr) {
+      return std::nullopt;
+    }
+    TablePage table_page(page);
+    std::span<const char> rec = table_page.get_record(rid.slot_id);
+    std::optional<std::vector<char>> out;
+    if (!rec.empty()) {
+      out = std::vector<char>(rec.begin(), rec.end());
+    }
+    pool.unpin_page(rid.page_id, false);
+    return out;
+  }
+
+  // Snapshot the raw bytes of a page (for idempotency comparisons).
+  std::vector<char> page_snapshot(BufferPoolManager &pool, page_id_t page_id) {
+    Page *page = pool.fetch_page(page_id);
+    EXPECT_NE(page, nullptr);
+    std::vector<char> snap(page->data(), page->data() + Page::kPageSize);
+    pool.unpin_page(page_id, false);
+    return snap;
+  }
+
   std::filesystem::path test_dir_;
   std::filesystem::path wal_file_;
+  std::filesystem::path db_file_;
+  std::shared_ptr<DiskManager> disk_manager_;
 };
 
 TEST_F(RecoveryTest, EmptyLogRecovery) {
@@ -1546,95 +1586,99 @@ TEST_F(RecoveryTest, AnalysisIdentifiesUncommittedTransaction) {
 }
 
 TEST_F(RecoveryTest, RedoCommittedTransaction) {
-  // Create WAL with committed transaction
+  // A committed transaction's inserts must be replayed onto real pages at their
+  // exact RIDs.
   {
     WALManager wal(wal_file_.string());
     auto begin = LogRecord::make_begin(1);
     [[maybe_unused]] lsn_t lsn = wal.append_log(begin);
 
-    std::vector<char> data = {'d', 'a', 't', 'a'};
-    auto insert1 = LogRecord::make_insert(1, begin.lsn(), 10, RID(1, 0), data);
+    auto insert1 =
+        LogRecord::make_insert(1, begin.lsn(), 10, RID(0, 0), bytes("data0"));
     lsn = wal.append_log(insert1);
-
     auto insert2 =
-        LogRecord::make_insert(1, insert1.lsn(), 10, RID(1, 1), data);
+        LogRecord::make_insert(1, insert1.lsn(), 10, RID(0, 1), bytes("data1"));
     lsn = wal.append_log(insert2);
-
     auto commit = LogRecord::make_commit(1, insert2.lsn());
     lsn = wal.append_log(commit);
     (void)wal.flush();
   }
 
+  auto pool = make_buffer_pool();
   auto wal = std::make_shared<WALManager>(wal_file_.string());
-  RecoveryManager recovery(nullptr, wal, nullptr);
+  RecoveryManager recovery(pool, wal, disk_manager_);
 
-  auto status = recovery.recover();
-  EXPECT_TRUE(status.ok());
+  ASSERT_TRUE(recovery.recover().ok());
 
-  // Should have redone 2 insert operations
-  EXPECT_EQ(recovery.redo_count(), 2);
-  // No undo needed - transaction committed
-  EXPECT_EQ(recovery.undo_count(), 0);
+  // Both tuples are present at their exact RIDs after redo.
+  auto r00 = record_at(*pool, RID(0, 0));
+  ASSERT_TRUE(r00.has_value());
+  EXPECT_EQ(*r00, bytes("data0"));
+  auto r01 = record_at(*pool, RID(0, 1));
+  ASSERT_TRUE(r01.has_value());
+  EXPECT_EQ(*r01, bytes("data1"));
+
+  EXPECT_TRUE(recovery.committed_txns().count(1) > 0);
+  EXPECT_TRUE(recovery.active_txn_table().empty());
 }
 
 TEST_F(RecoveryTest, UndoUncommittedTransaction) {
-  // Create WAL with uncommitted transaction
+  // An uncommitted insert+update on the same RID must be fully rolled back,
+  // leaving no surviving tuple.
   {
     WALManager wal(wal_file_.string());
     auto begin = LogRecord::make_begin(42);
     [[maybe_unused]] lsn_t lsn = wal.append_log(begin);
 
-    std::vector<char> data = {'t', 'e', 's', 't'};
-    auto insert = LogRecord::make_insert(42, begin.lsn(), 10, RID(5, 0), data);
+    auto insert =
+        LogRecord::make_insert(42, begin.lsn(), 10, RID(0, 0), bytes("orig"));
     lsn = wal.append_log(insert);
-
-    auto update_old = std::vector<char>{'o', 'l', 'd'};
-    auto update_new = std::vector<char>{'n', 'e', 'w'};
-    auto update = LogRecord::make_update(42, insert.lsn(), 10, RID(5, 1),
-                                         update_old, update_new);
+    auto update = LogRecord::make_update(42, insert.lsn(), 10, RID(0, 0),
+                                         bytes("orig"), bytes("updated"));
     lsn = wal.append_log(update);
-
-    // No commit - crash simulation
+    // No commit - crash simulation.
     (void)wal.flush();
   }
 
+  auto pool = make_buffer_pool();
   auto wal = std::make_shared<WALManager>(wal_file_.string());
-  RecoveryManager recovery(nullptr, wal, nullptr);
+  RecoveryManager recovery(pool, wal, disk_manager_);
 
-  auto status = recovery.recover();
-  EXPECT_TRUE(status.ok());
+  ASSERT_TRUE(recovery.recover().ok());
 
-  // Should have redone both operations
-  EXPECT_EQ(recovery.redo_count(), 2);
-  // Should have undone both operations (reverse order via prevLSN)
-  EXPECT_EQ(recovery.undo_count(), 2);
+  // Loser transaction identified, and undo left no trace of its row.
+  EXPECT_TRUE(recovery.active_txn_table().count(42) > 0);
+  EXPECT_TRUE(recovery.committed_txns().empty());
+  EXPECT_FALSE(record_at(*pool, RID(0, 0)).has_value());
 }
 
 TEST_F(RecoveryTest, MixedCommittedAndUncommittedTransactions) {
-  // Create WAL with multiple transactions - some committed, some not
+  // Two committed transactions survive; the uncommitted one is rolled back.
   {
     WALManager wal(wal_file_.string());
 
-    // Transaction 1: committed
+    // Transaction 1: committed insert on page 0.
     auto begin1 = LogRecord::make_begin(1);
     [[maybe_unused]] lsn_t lsn = wal.append_log(begin1);
-    std::vector<char> data = {'a'};
-    auto insert1 = LogRecord::make_insert(1, begin1.lsn(), 10, RID(1, 0), data);
+    auto insert1 =
+        LogRecord::make_insert(1, begin1.lsn(), 10, RID(0, 0), bytes("aaa"));
     lsn = wal.append_log(insert1);
     auto commit1 = LogRecord::make_commit(1, insert1.lsn());
     lsn = wal.append_log(commit1);
 
-    // Transaction 2: uncommitted
+    // Transaction 2: uncommitted insert on page 1.
     auto begin2 = LogRecord::make_begin(2);
     lsn = wal.append_log(begin2);
-    auto insert2 = LogRecord::make_insert(2, begin2.lsn(), 20, RID(2, 0), data);
+    auto insert2 =
+        LogRecord::make_insert(2, begin2.lsn(), 20, RID(1, 0), bytes("bbb"));
     lsn = wal.append_log(insert2);
-    // No commit
+    // No commit.
 
-    // Transaction 3: committed
+    // Transaction 3: committed insert on page 2.
     auto begin3 = LogRecord::make_begin(3);
     lsn = wal.append_log(begin3);
-    auto insert3 = LogRecord::make_insert(3, begin3.lsn(), 30, RID(3, 0), data);
+    auto insert3 =
+        LogRecord::make_insert(3, begin3.lsn(), 30, RID(2, 0), bytes("ccc"));
     lsn = wal.append_log(insert3);
     auto commit3 = LogRecord::make_commit(3, insert3.lsn());
     lsn = wal.append_log(commit3);
@@ -1642,23 +1686,62 @@ TEST_F(RecoveryTest, MixedCommittedAndUncommittedTransactions) {
     (void)wal.flush();
   }
 
+  auto pool = make_buffer_pool();
   auto wal = std::make_shared<WALManager>(wal_file_.string());
-  RecoveryManager recovery(nullptr, wal, nullptr);
+  RecoveryManager recovery(pool, wal, disk_manager_);
 
-  auto status = recovery.recover();
-  EXPECT_TRUE(status.ok());
+  ASSERT_TRUE(recovery.recover().ok());
 
-  // Check analysis results
-  EXPECT_EQ(recovery.active_txn_table().size(), 1); // Only txn 2
+  // Analysis: only txn 2 is a loser; txns 1 and 3 committed.
+  EXPECT_EQ(recovery.active_txn_table().size(), 1);
   EXPECT_TRUE(recovery.active_txn_table().count(2) > 0);
-  EXPECT_EQ(recovery.committed_txns().size(), 2); // Txns 1 and 3
+  EXPECT_EQ(recovery.committed_txns().size(), 2);
   EXPECT_TRUE(recovery.committed_txns().count(1) > 0);
   EXPECT_TRUE(recovery.committed_txns().count(3) > 0);
 
-  // 3 inserts redone
-  EXPECT_EQ(recovery.redo_count(), 3);
-  // 1 insert undone (txn 2)
-  EXPECT_EQ(recovery.undo_count(), 1);
+  // Committed rows survive; the uncommitted row is gone.
+  auto r1 = record_at(*pool, RID(0, 0));
+  ASSERT_TRUE(r1.has_value());
+  EXPECT_EQ(*r1, bytes("aaa"));
+  auto r3 = record_at(*pool, RID(2, 0));
+  ASSERT_TRUE(r3.has_value());
+  EXPECT_EQ(*r3, bytes("ccc"));
+  EXPECT_FALSE(record_at(*pool, RID(1, 0)).has_value());
+}
+
+TEST_F(RecoveryTest, RedoIsIdempotentAcrossRepeatedRecovery) {
+  // Two committed inserts. Recovering a second time over the already-recovered
+  // page must apply nothing and leave the page byte-for-byte identical.
+  {
+    WALManager wal(wal_file_.string());
+    auto begin = LogRecord::make_begin(1);
+    [[maybe_unused]] lsn_t lsn = wal.append_log(begin);
+    auto insert1 =
+        LogRecord::make_insert(1, begin.lsn(), 10, RID(0, 0), bytes("aa"));
+    lsn = wal.append_log(insert1);
+    auto insert2 =
+        LogRecord::make_insert(1, insert1.lsn(), 10, RID(0, 1), bytes("bb"));
+    lsn = wal.append_log(insert2);
+    auto commit = LogRecord::make_commit(1, insert2.lsn());
+    lsn = wal.append_log(commit);
+    (void)wal.flush();
+  }
+
+  auto pool = make_buffer_pool();
+  auto wal = std::make_shared<WALManager>(wal_file_.string());
+  RecoveryManager recovery(pool, wal, disk_manager_);
+
+  // First recovery applies both inserts.
+  ASSERT_TRUE(recovery.recover().ok());
+  EXPECT_EQ(recovery.redo_count(), 2u);
+  std::vector<char> after_first = page_snapshot(*pool, 0);
+
+  // Second recovery applies nothing (page LSN already covers both records).
+  ASSERT_TRUE(recovery.recover().ok());
+  EXPECT_EQ(recovery.redo_count(), 0u);
+  std::vector<char> after_second = page_snapshot(*pool, 0);
+
+  EXPECT_EQ(after_first, after_second);
 }
 
 TEST_F(RecoveryTest, CheckpointRecovery) {

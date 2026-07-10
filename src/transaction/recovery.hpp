@@ -105,14 +105,29 @@ public:
   }
 
   /**
-   * @brief Get count of redo operations performed
+   * @brief Get count of redo operations actually applied to pages
+   *
+   * A record whose change is already reflected on its page (page LSN >= record
+   * LSN) is skipped and not counted, so a second recover() over an already
+   * recovered database reports zero.
    */
   [[nodiscard]] size_t redo_count() const noexcept { return redo_count_; }
 
   /**
-   * @brief Get count of undo operations performed
+   * @brief Get count of undo operations actually applied to pages
    */
   [[nodiscard]] size_t undo_count() const noexcept { return undo_count_; }
+
+  /**
+   * @brief Next transaction id to hand out after recovery
+   *
+   * Recovered as max(highest txn id seen in the log, checkpoint high-water) + 1
+   * so post-restart transactions cannot alias recovered ones. The
+   * TransactionManager consumes this on startup.
+   */
+  [[nodiscard]] txn_id_t next_txn_id() const noexcept {
+    return recovered_next_txn_id_;
+  }
 
 private:
   // ─────────────────────────────────────────────────────────────────────────
@@ -175,6 +190,13 @@ private:
 
   // Set of committed transaction IDs
   std::unordered_set<txn_id_t> committed_txns_;
+
+  // LSN at which the redo scan starts (checkpoint begin_lsn, else 0). Records
+  // before this point are guaranteed durable on their pages.
+  lsn_t redo_start_lsn_ = INVALID_LSN;
+
+  // Next transaction id to hand out after recovery = max(seen, checkpoint) + 1.
+  txn_id_t recovered_next_txn_id_ = 1;
 
   // Statistics for testing/debugging
   size_t redo_count_ = 0;
