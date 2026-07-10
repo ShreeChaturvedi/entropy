@@ -5,14 +5,24 @@
 
 #include "catalog/catalog_manifest.hpp"
 
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #include "catalog/column.hpp"
 
@@ -200,6 +210,39 @@ Status CatalogManifest::save(const std::string &path) const {
   const std::vector<char> bytes = serialize();
   const std::string tmp = path + ".tmp";
 
+#ifdef _WIN32
+  const HANDLE handle =
+      ::CreateFileA(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (handle == INVALID_HANDLE_VALUE) {
+    return Status::IOError("Failed to open temp manifest: " + tmp);
+  }
+
+  size_t written = 0;
+  while (written < bytes.size()) {
+    DWORD chunk = 0;
+    if (!::WriteFile(handle, bytes.data() + written,
+                     static_cast<DWORD>(bytes.size() - written), &chunk,
+                     nullptr)) {
+      ::CloseHandle(handle);
+      return Status::IOError("Failed to write manifest");
+    }
+    written += chunk;
+  }
+
+  if (!::FlushFileBuffers(handle)) {
+    ::CloseHandle(handle);
+    return Status::IOError("Failed to flush manifest to disk");
+  }
+  ::CloseHandle(handle);
+
+  // rename() fails on Windows when the destination exists; MoveFileEx with
+  // MOVEFILE_REPLACE_EXISTING is the atomic-replace primitive there.
+  if (!::MoveFileExA(tmp.c_str(), path.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    return Status::IOError("Failed to move manifest into place");
+  }
+#else
   int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd < 0) {
     return Status::IOError("Failed to open temp manifest: " + tmp);
@@ -230,7 +273,7 @@ Status CatalogManifest::save(const std::string &path) const {
     return Status::IOError("Failed to rename manifest into place");
   }
 
-  // fsync the directory so the rename survives a crash.
+  // fsync the directory so the rename survives a crash (POSIX-only concept).
   std::string dir = std::filesystem::path(path).parent_path().string();
   if (dir.empty()) {
     dir = ".";
@@ -240,6 +283,7 @@ Status CatalogManifest::save(const std::string &path) const {
     (void)::fsync(dfd);
     ::close(dfd);
   }
+#endif
 
   return Status::Ok();
 }
