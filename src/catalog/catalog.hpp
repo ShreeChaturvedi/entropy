@@ -85,7 +85,7 @@ public:
    */
   explicit Catalog(std::shared_ptr<BufferPoolManager> buffer_pool,
                    std::string manifest_path = "");
-  ~Catalog() = default;
+  ~Catalog();
 
   // ─────────────────────────────────────────────────────────────────────────
   // Table Management
@@ -201,6 +201,8 @@ private:
   [[nodiscard]] Status persist() const;
   /// Load the manifest during construction and rebuild heaps/indexes.
   void load_from_manifest();
+  /// Keep the manifest's root_page_id current when an index root moves.
+  void register_root_listener(const std::shared_ptr<IndexInfo> &info);
 
   std::shared_ptr<BufferPoolManager> buffer_pool_;
   std::string manifest_path_; ///< Durable manifest path ("" = in-memory only)

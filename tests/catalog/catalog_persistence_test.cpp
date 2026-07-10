@@ -12,13 +12,13 @@
 
 #include <gtest/gtest.h>
 
-#include <atomic>
 #include <set>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "catalog/catalog.hpp"
+#include "catalog/catalog_manifest.hpp"
 #include "storage/b_plus_tree.hpp"
 #include "storage/buffer_pool.hpp"
 #include "storage/disk_manager.hpp"
@@ -194,6 +194,172 @@ TEST(CatalogPersistence, SharedHandleSurvivesDrop) {
   EXPECT_EQ(handle->name, "temp");
   EXPECT_EQ(handle->oid, handle_oid);
   EXPECT_EQ(handle->schema.column_count(), 2u);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Crash image: manifest fsync'd but referenced pages never reached disk
+//
+// Simulates kill -9 between the manifest write and the page flush. The pages
+// the manifest references read back zeroed (next link 0), so a naive chain
+// walk would loop forever. The open must complete and the table must be
+// usable (or fail cleanly) — never hang.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(CatalogPersistence, CrashImageWithUnflushedPagesDoesNotHang) {
+  test::TempDir dir("cat_crash_");
+  const std::string db_path = (dir.path() / "x.db").string();
+  const std::string manifest_path = (dir.path() / "x.catalog").string();
+
+  const Schema schema = make_users_schema();
+
+  // Hand-craft the crash image: a durable manifest whose page references
+  // point beyond the end of an empty db file.
+  CatalogManifest manifest;
+  manifest.next_oid = 3;
+  ManifestTable t;
+  t.oid = 1;
+  t.name = "users";
+  t.schema = schema;
+  t.first_page_id = 3; // never written
+  manifest.tables.push_back(t);
+  ManifestIndex mi;
+  mi.oid = 2;
+  mi.name = "idx_id";
+  mi.table_oid = 1;
+  mi.key_column = 0;
+  mi.root_page_id = 7; // never written
+  manifest.indexes.push_back(mi);
+  ASSERT_TRUE(manifest.save(manifest_path).ok());
+
+  auto disk = std::make_shared<DiskManager>(db_path); // empty file
+  auto buffer_pool = std::make_shared<BufferPoolManager>(64, disk);
+  Catalog catalog(buffer_pool, manifest_path); // must not hang
+
+  // Metadata survived and the table self-healed to an empty, usable heap.
+  ASSERT_TRUE(catalog.table_exists("users"));
+  auto info = catalog.get_table_shared("users");
+  ASSERT_NE(info, nullptr);
+
+  int rows = 0;
+  for (auto it = info->table_heap->begin(); it != info->table_heap->end();
+       ++it) {
+    ++rows;
+  }
+  EXPECT_EQ(rows, 0);
+
+  std::vector<TupleValue> values = {TupleValue(1),
+                                    TupleValue(std::string("alice"))};
+  Tuple tuple(values, schema);
+  RID rid;
+  ASSERT_TRUE(info->table_heap->insert_tuple(tuple, &rid).ok());
+  Tuple back;
+  EXPECT_TRUE(info->table_heap->get_tuple(rid, &back).ok());
+
+  // The index whose root never reached disk degrades to an empty tree.
+  auto idx = catalog.get_index_shared("idx_id");
+  ASSERT_NE(idx, nullptr);
+  EXPECT_FALSE(idx->index->find(1).has_value());
+
+  // Reclamation over the damaged chain terminates too.
+  EXPECT_TRUE(catalog.drop_table("users").ok());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A post-DDL index root change is tracked by the manifest
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(CatalogPersistence, IndexRootChangeSurvivesReopen) {
+  test::TempDir dir("cat_root_");
+  const std::string db_path = (dir.path() / "r.db").string();
+  const std::string manifest_path = (dir.path() / "r.catalog").string();
+
+  {
+    auto disk = std::make_shared<DiskManager>(db_path);
+    auto buffer_pool = std::make_shared<BufferPoolManager>(64, disk);
+    Catalog catalog(buffer_pool, manifest_path);
+
+    ASSERT_TRUE(
+        catalog.create_table("events", Schema({Column("id", TypeId::INTEGER)}))
+            .ok());
+    ASSERT_TRUE(catalog.create_index("idx_ev", "events", "id").ok());
+
+    auto idx = catalog.get_index_shared("idx_ev");
+    ASSERT_NE(idx, nullptr);
+    const page_id_t root_before = idx->index->root_page_id();
+
+    // Insert enough keys directly into the tree to force root changes
+    // (creation, then a split) after create_index already persisted.
+    for (int i = 0; i < 600; ++i) {
+      ASSERT_TRUE(
+          idx->index
+              ->insert(i, RID(1, static_cast<slot_id_t>(i % 100)))
+              .ok());
+    }
+    ASSERT_NE(idx->index->root_page_id(), root_before);
+
+    buffer_pool->flush_all_pages();
+  }
+
+  {
+    auto disk = std::make_shared<DiskManager>(db_path);
+    auto buffer_pool = std::make_shared<BufferPoolManager>(64, disk);
+    Catalog catalog(buffer_pool, manifest_path);
+
+    // Lookups only work if the manifest tracked the moved root.
+    auto idx = catalog.get_index_shared("idx_ev");
+    ASSERT_NE(idx, nullptr);
+    for (int key : {0, 251, 599}) {
+      EXPECT_TRUE(idx->index->find(key).has_value()) << "missing key " << key;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dropping a table drops its indexes with it
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(CatalogPersistence, DropTableDropsIndexes) {
+  test::TempDir dir("cat_dropidx_");
+  const std::string db_path = (dir.path() / "i.db").string();
+  const std::string manifest_path = (dir.path() / "i.catalog").string();
+
+  {
+    auto disk = std::make_shared<DiskManager>(db_path);
+    auto buffer_pool = std::make_shared<BufferPoolManager>(64, disk);
+    Catalog catalog(buffer_pool, manifest_path);
+
+    Schema schema({Column("a", TypeId::INTEGER), Column("b", TypeId::INTEGER)});
+    ASSERT_TRUE(catalog.create_table("pairs", schema).ok());
+    const oid_t table_oid = catalog.get_table_oid("pairs");
+
+    auto info = catalog.get_table_shared("pairs");
+    for (int i = 0; i < 3; ++i) {
+      std::vector<TupleValue> values = {TupleValue(i), TupleValue(i * 10)};
+      Tuple tuple(values, schema);
+      RID rid;
+      ASSERT_TRUE(info->table_heap->insert_tuple(tuple, &rid).ok());
+    }
+    info.reset();
+
+    ASSERT_TRUE(catalog.create_index("idx_a", "pairs", "a").ok());
+    ASSERT_TRUE(catalog.create_index("idx_b", "pairs", "b").ok());
+
+    ASSERT_TRUE(catalog.drop_table("pairs").ok());
+    EXPECT_EQ(catalog.get_index_shared("idx_a"), nullptr);
+    EXPECT_EQ(catalog.get_index_shared("idx_b"), nullptr);
+    EXPECT_TRUE(catalog.get_table_indexes(table_oid).empty());
+  }
+
+  // The drop is durable: nothing comes back after a reopen.
+  {
+    auto disk = std::make_shared<DiskManager>(db_path);
+    auto buffer_pool = std::make_shared<BufferPoolManager>(64, disk);
+    Catalog catalog(buffer_pool, manifest_path);
+
+    EXPECT_FALSE(catalog.table_exists("pairs"));
+    EXPECT_EQ(catalog.get_index_shared("idx_a"), nullptr);
+    EXPECT_EQ(catalog.get_index_shared("idx_b"), nullptr);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
