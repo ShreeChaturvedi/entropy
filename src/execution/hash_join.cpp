@@ -7,6 +7,12 @@
  * 2. Probe phase: stream right (probe) side, look up matches
  *
  * Performance: O(n + m) for n build tuples, m probe tuples
+ *
+ * Outer-join semantics (ANSI / matching NestedLoopJoinExecutor):
+ * - LEFT: preserve all build (left) rows; NULL-fill probe columns when unmatched
+ * - RIGHT: preserve all probe (right) rows; NULL-fill build columns when unmatched
+ *
+ * NULL join keys never participate in equality matches (SQL three-valued logic).
  */
 
 #include "execution/hash_join.hpp"
@@ -47,6 +53,9 @@ HashJoinExecutor::KeyHash::operator()(const TupleValue &key) const noexcept {
 
 bool HashJoinExecutor::KeyEqual::operator()(
     const TupleValue &a, const TupleValue &b) const noexcept {
+  // SQL: NULL never equals NULL (or any other value) in join predicates
+  if (a.is_null() || b.is_null())
+    return false;
   return a == b;
 }
 
@@ -75,23 +84,26 @@ void HashJoinExecutor::init() {
   build_tuples_.clear();
   current_probe_ = std::nullopt;
   probe_had_match_ = false;
-  right_phase_index_ = 0;
-  in_right_phase_ = false;
+  unmatched_build_index_ = 0;
+  in_unmatched_build_phase_ = false;
   initialized_ = true;
 
   left_child_->init();
   right_child_->init();
 
-  // Build phase: hash all tuples from left (build) side
+  // Build phase: materialize left (build) side; hash non-NULL keys
   while (auto tuple = left_child_->next()) {
+    size_t idx = build_tuples_.size();
+    build_tuples_.push_back(*tuple);
+
+    if (join_type_ == JoinType::LEFT) {
+      build_matched_.push_back(false);
+    }
+
     TupleValue key =
         tuple->get_value(*left_schema_, static_cast<uint32_t>(left_key_index_));
-    hash_table_.emplace(key, *tuple);
-
-    // For RIGHT JOIN: track if this build tuple matched
-    if (join_type_ == JoinType::RIGHT) {
-      build_tuples_.push_back(*tuple);
-      build_matched_.push_back(false);
+    if (!key.is_null()) {
+      hash_table_.emplace(key, idx);
     }
   }
 }
@@ -104,10 +116,10 @@ std::optional<Tuple> HashJoinExecutor::next() {
   if (!initialized_)
     return std::nullopt;
 
-  // RIGHT JOIN: second phase - emit unmatched build tuples
-  if (in_right_phase_) {
-    while (right_phase_index_ < build_tuples_.size()) {
-      size_t idx = right_phase_index_++;
+  // LEFT JOIN: second phase - emit unmatched build tuples (NULL-filled right)
+  if (in_unmatched_build_phase_) {
+    while (unmatched_build_index_ < build_tuples_.size()) {
+      size_t idx = unmatched_build_index_++;
       if (!build_matched_[idx]) {
         return combine_tuples(&build_tuples_[idx], nullptr);
       }
@@ -118,31 +130,21 @@ std::optional<Tuple> HashJoinExecutor::next() {
   while (true) {
     // If we have remaining matches for current probe tuple, emit them
     if (current_probe_.has_value() && match_begin_ != match_end_) {
-      const Tuple &left_tuple = match_begin_->second;
+      size_t build_idx = match_begin_->second;
 
-      // Track match for RIGHT JOIN
-      if (join_type_ == JoinType::RIGHT) {
-        // Find index - simplified approach
-        for (size_t i = 0; i < build_tuples_.size(); i++) {
-          TupleValue build_key = build_tuples_[i].get_value(
-              *left_schema_, static_cast<uint32_t>(left_key_index_));
-          TupleValue match_key = left_tuple.get_value(
-              *left_schema_, static_cast<uint32_t>(left_key_index_));
-          if (build_key == match_key) {
-            build_matched_[i] = true;
-            break;
-          }
-        }
+      if (join_type_ == JoinType::LEFT) {
+        build_matched_[build_idx] = true;
       }
 
       probe_had_match_ = true;
-      auto result = combine_tuples(&left_tuple, &*current_probe_);
+      auto result =
+          combine_tuples(&build_tuples_[build_idx], &*current_probe_);
       ++match_begin_;
       return result;
     }
 
-    // LEFT JOIN: emit probe tuple with NULL left if no matches
-    if (join_type_ == JoinType::LEFT && current_probe_.has_value() &&
+    // RIGHT JOIN: emit probe tuple with NULL left if no matches
+    if (join_type_ == JoinType::RIGHT && current_probe_.has_value() &&
         !probe_had_match_) {
       auto result = combine_tuples(nullptr, &*current_probe_);
       current_probe_ = std::nullopt;
@@ -153,23 +155,27 @@ std::optional<Tuple> HashJoinExecutor::next() {
     current_probe_ = right_child_->next();
     if (!current_probe_.has_value()) {
       // No more probe tuples
-      if (join_type_ == JoinType::RIGHT) {
-        in_right_phase_ = true;
-        right_phase_index_ = 0;
-        return next(); // Recurse to handle right phase
+      if (join_type_ == JoinType::LEFT) {
+        in_unmatched_build_phase_ = true;
+        unmatched_build_index_ = 0;
+        return next(); // Recurse to handle unmatched build phase
       }
       return std::nullopt;
     }
 
-    // Look up in hash table
+    // Look up in hash table (NULL probe keys never match)
     probe_had_match_ = false;
     TupleValue probe_key = current_probe_->get_value(
         *right_schema_, static_cast<uint32_t>(right_key_index_));
-    auto range = hash_table_.equal_range(probe_key);
-    match_begin_ = range.first;
-    match_end_ = range.second;
+    if (probe_key.is_null()) {
+      match_begin_ = hash_table_.end();
+      match_end_ = hash_table_.end();
+    } else {
+      auto range = hash_table_.equal_range(probe_key);
+      match_begin_ = range.first;
+      match_end_ = range.second;
+    }
 
-    // CROSS JOIN doesn't use hash join (wrong executor)
     // For INNER join with no matches, just continue to next probe tuple
     if (join_type_ == JoinType::INNER && match_begin_ == match_end_) {
       current_probe_ = std::nullopt;

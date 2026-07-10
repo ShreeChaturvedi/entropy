@@ -106,5 +106,42 @@ TEST_F(DiskManagerTest, Persistence) {
     EXPECT_EQ(std::memcmp(read_data, write_data, config::kDefaultPageSize), 0);
 }
 
+// Regression for issue #2: a beyond-EOF (short) read must not latch the
+// fstream into a permanent fail state that breaks all subsequent I/O.
+TEST_F(DiskManagerTest, BeyondEofReadDoesNotLatchSubsequentIo) {
+    char write_data[config::kDefaultPageSize];
+    char read_data[config::kDefaultPageSize];
+    std::memset(write_data, 'A', config::kDefaultPageSize);
+
+    page_id_t page_id = disk_manager_->allocate_page();
+    auto status = disk_manager_->write_page(page_id, write_data);
+    ASSERT_TRUE(status.ok()) << status.to_string();
+
+    // Beyond-EOF read is intentional (zero-fill); must succeed.
+    char beyond_eof[config::kDefaultPageSize];
+    std::memset(beyond_eof, 0xFF, config::kDefaultPageSize);
+    status = disk_manager_->read_page(/*page_id=*/100, beyond_eof);
+    ASSERT_TRUE(status.ok()) << status.to_string();
+    for (size_t i = 0; i < config::kDefaultPageSize; ++i) {
+        EXPECT_EQ(beyond_eof[i], '\0') << "byte " << i;
+    }
+
+    // Subsequent read of an existing page must still work.
+    status = disk_manager_->read_page(page_id, read_data);
+    ASSERT_TRUE(status.ok()) << status.to_string();
+    EXPECT_EQ(std::memcmp(write_data, read_data, config::kDefaultPageSize), 0);
+
+    // Subsequent write must also work (same fstream failbit latch).
+    char write_data2[config::kDefaultPageSize];
+    std::memset(write_data2, 'B', config::kDefaultPageSize);
+    page_id_t page_id2 = disk_manager_->allocate_page();
+    status = disk_manager_->write_page(page_id2, write_data2);
+    ASSERT_TRUE(status.ok()) << status.to_string();
+
+    status = disk_manager_->read_page(page_id2, read_data);
+    ASSERT_TRUE(status.ok()) << status.to_string();
+    EXPECT_EQ(std::memcmp(write_data2, read_data, config::kDefaultPageSize), 0);
+}
+
 }  // namespace
 }  // namespace entropy
