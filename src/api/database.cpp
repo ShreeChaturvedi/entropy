@@ -119,9 +119,8 @@ public:
                                                            ctx.predicate.get());
 
     if (selection.use_index) {
-      // Get index info
-      auto *index_info = catalog_->get_index_for_column(
-          ctx.table_info->oid, static_cast<column_id_t>(selection.index_oid));
+      // Resolve by index OID — never cast OID to column_id_t
+      auto *index_info = catalog_->get_index_by_oid(selection.index_oid);
 
       if (index_info && index_info->index) {
         // Use IndexScan
@@ -527,6 +526,9 @@ public:
   bool is_open() const noexcept { return is_open_; }
   std::string_view path() const noexcept { return path_; }
 
+  // Test-only seam: hands out the internal Catalog pointer (see header).
+  Catalog *catalog_for_testing() noexcept { return catalog_.get(); }
+
 private:
   std::string path_;
   bool is_open_ = false;
@@ -571,5 +573,9 @@ void Database::close() { impl_->close(); }
 bool Database::is_open() const noexcept { return impl_->is_open(); }
 
 std::string_view Database::path() const noexcept { return impl_->path(); }
+
+Catalog *Database::catalog_for_testing() noexcept {
+  return impl_->catalog_for_testing();
+}
 
 } // namespace entropy
