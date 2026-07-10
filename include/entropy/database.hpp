@@ -16,6 +16,7 @@ namespace entropy {
 
 // Forward declarations
 class DatabaseImpl;
+class Catalog;
 
 /**
  * @brief Configuration options for opening a database
@@ -120,6 +121,10 @@ public:
      * @brief Get the path to the database file
      */
     [[nodiscard]] std::string_view path() const noexcept;
+
+    /// Test-only seam: exposes the internal Catalog so tests can create indexes
+    /// (CREATE INDEX is not yet parseable). Not part of the stable public API.
+    [[nodiscard]] Catalog* catalog_for_testing() noexcept;
 
 private:
     std::unique_ptr<DatabaseImpl> impl_;

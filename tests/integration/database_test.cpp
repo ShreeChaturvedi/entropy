@@ -5,6 +5,9 @@
 
 #include <gtest/gtest.h>
 
+#include <string>
+
+#include "catalog/catalog.hpp"
 #include "entropy/entropy.hpp"
 #include "test_utils.hpp"
 
@@ -345,6 +348,83 @@ TEST_F(DatabaseTest, SelectNarrowNumericTypes) {
   EXPECT_EQ(row[0].as_int32(), 5);
   EXPECT_EQ(row[1].as_int32(), 7);
   EXPECT_DOUBLE_EQ(row[2].as_double(), 2.5);
+}
+
+// End-to-end regression test for #4: DatabaseImpl::execute_select must resolve
+// the optimizer-chosen index by OID (get_index_by_oid), never by casting the
+// index OID to a column_id_t and calling get_index_for_column. This drives the
+// real SELECT path (parse -> bind -> optimize -> index scan). Reverting the
+// one-line fix in execute_select makes this test fail: the point lookup then
+// resolves to the wrong index and returns the wrong row.
+TEST_F(DatabaseTest, IndexScanResolvesIndexByOidEndToEnd) {
+  Database db(temp_file_->string());
+
+  // Three columns so an index OID can numerically alias a column position:
+  // a=col0, pad=col1, c=col2.
+  ASSERT_TRUE(
+      db.execute("CREATE TABLE t (a INTEGER, pad INTEGER, c INTEGER)").ok());
+
+  // Enough rows that the optimizer prefers an index scan over a seq scan for a
+  // point lookup. a_i = i is unique; c_i = N+1-i is a reversal (also unique and
+  // never equal to a_i for even N), so the row with a=V and the row with c=V
+  // are distinct rows.
+  constexpr int kN = 2000;
+  constexpr int kV = 42;
+  for (int base = 1; base <= kN; base += 200) {
+    std::string sql = "INSERT INTO t VALUES ";
+    for (int i = base; i < base + 200 && i <= kN; ++i) {
+      if (i != base) {
+        sql += ", ";
+      }
+      sql += "(" + std::to_string(i) + ", " + std::to_string(i) + ", " +
+             std::to_string(kN + 1 - i) + ")";
+    }
+    ASSERT_TRUE(db.execute(sql).ok()) << "insert batch starting at " << base;
+  }
+
+  // Create the two indexes through the test seam (CREATE INDEX is not yet
+  // parseable). Order reproduces the bug: table oid=1, idx_a gets oid=2
+  // (key_column 0), idx_c gets oid=3 (key_column 2). Casting idx_a's OID (2) to
+  // a column_id selects the index whose key_column==2 — idx_c — the wrong one.
+  Catalog *catalog = db.catalog_for_testing();
+  ASSERT_NE(catalog, nullptr);
+  ASSERT_TRUE(catalog->create_index("idx_a", "t", "a").ok());
+  ASSERT_TRUE(catalog->create_index("idx_c", "t", "c").ok());
+
+  IndexInfo *idx_a = catalog->get_index("idx_a");
+  IndexInfo *idx_c = catalog->get_index("idx_c");
+  ASSERT_NE(idx_a, nullptr);
+  ASSERT_NE(idx_c, nullptr);
+  ASSERT_NE(idx_a->oid, idx_c->oid);
+  // Precondition for the bug to bite: idx_a's OID, cast to a column id, lands on
+  // idx_c's key column. If this ever stops holding, the test no longer guards
+  // the regression and should be revisited.
+  ASSERT_EQ(static_cast<column_id_t>(idx_a->oid), idx_c->key_column)
+      << "test no longer reproduces the OID/column_id aliasing";
+
+  // The optimizer must actually choose an index scan here, otherwise the SELECT
+  // below would never reach the index-resolution line.
+  auto explain = db.execute("EXPLAIN SELECT * FROM t WHERE a = 42");
+  ASSERT_TRUE(explain.ok()) << explain.status().to_string();
+  bool used_index = false;
+  for (const auto &r : explain.rows()) {
+    if (r[0].as_string().find("Index Scan") != std::string::npos) {
+      used_index = true;
+    }
+  }
+  ASSERT_TRUE(used_index) << "optimizer did not choose an index scan";
+
+  // The real query. Correct resolution (get_index_by_oid) uses idx_a and
+  // returns exactly the row with a=42. The old bug resolves to idx_c and does a
+  // point lookup for c=42, returning the row (a=1959, c=42) instead.
+  auto result = db.execute("SELECT * FROM t WHERE a = 42");
+  ASSERT_TRUE(result.ok()) << result.status().to_string();
+  ASSERT_EQ(result.row_count(), 1u);
+  const auto &row = result.rows()[0];
+  ASSERT_EQ(row.size(), 3u);
+  EXPECT_EQ(row[0].as_int32(), kV)
+      << "wrong index resolved: OID was cast to a column_id";
+  EXPECT_EQ(row[2].as_int32(), kN + 1 - kV);
 }
 
 } // namespace
