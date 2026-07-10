@@ -227,6 +227,11 @@ bool BufferPoolManager::delete_page(page_id_t page_id) {
     return true;
 }
 
+size_t BufferPoolManager::free_list_size() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return free_list_.size();
+}
+
 void BufferPoolManager::flush_all_pages() {
     std::lock_guard<std::mutex> lock(mutex_);
 
