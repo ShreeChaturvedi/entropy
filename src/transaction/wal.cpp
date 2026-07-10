@@ -7,9 +7,21 @@
 
 #include <cerrno>
 #include <cstring>
-#include <fcntl.h>
 #include <filesystem>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <io.h>
+#include <windows.h>
+#else
+#include <fcntl.h>
 #include <unistd.h>
+#endif
 
 #include "common/logger.hpp"
 
@@ -72,6 +84,27 @@ Status WALManager::sync_file() {
         return sync_hook_();
     }
 
+#ifdef _WIN32
+    // Re-open by path to obtain a HANDLE and flush its buffers to disk. This
+    // mirrors the POSIX path below without relying on the stream's descriptor.
+    const HANDLE handle =
+        ::CreateFileA(log_file_.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                      nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return Status::IOError("Failed to open WAL file for flush: " + log_file_);
+    }
+
+    const BOOL ok = ::FlushFileBuffers(handle);
+    const DWORD err = ::GetLastError();
+    ::CloseHandle(handle);
+
+    if (!ok) {
+        return Status::IOError("FlushFileBuffers failed on WAL file: " + log_file_ +
+                               " (error=" + std::to_string(err) + ")");
+    }
+
+    return Status::Ok();
+#else
     // Re-open by path to obtain a file descriptor for fsync. This is portable
     // across standard library implementations that do not expose fileno().
     const int fd = ::open(log_file_.c_str(), O_RDWR);
@@ -89,6 +122,7 @@ Status WALManager::sync_file() {
     }
 
     return Status::Ok();
+#endif
 }
 
 lsn_t WALManager::append_log(LogRecord& record) {
