@@ -48,11 +48,13 @@ gtest_discover_tests(storage_tests)
 
 add_executable(catalog_tests
     catalog/catalog_test.cpp
+    catalog/catalog_persistence_test.cpp
 )
 
 target_link_libraries(catalog_tests
     PRIVATE
         entropy_catalog
+        entropy_storage
         test_utils
         GTest::gtest
         GTest::gtest_main
