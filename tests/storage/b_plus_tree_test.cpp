@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "storage/b_plus_tree.hpp"
+#include "storage/b_plus_tree_page.hpp"
 #include "storage/buffer_pool.hpp"
 #include "storage/disk_manager.hpp"
 
@@ -540,6 +541,154 @@ TEST_F(BPlusTreeTest, SingleElementOperations) {
     // Iterate empty
     it = tree.begin();
     EXPECT_TRUE(it.is_end());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Delete-path correctness (issue #3): left-merge reclaim + internal underflow
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+/// Walk every reachable node and assert non-root nodes meet min fill factor.
+void AssertNoUnderflow(BPlusTree& tree) {
+    page_id_t root = tree.root_page_id();
+    if (root == INVALID_PAGE_ID) {
+        return;
+    }
+
+    auto bpm = tree.buffer_pool();
+    std::vector<page_id_t> queue;
+    queue.push_back(root);
+
+    while (!queue.empty()) {
+        page_id_t pid = queue.back();
+        queue.pop_back();
+
+        Page* page = bpm->fetch_page(pid);
+        ASSERT_NE(page, nullptr) << "Failed to fetch page " << pid;
+        BPTreePage node(page);
+
+        if (!node.is_root()) {
+            EXPECT_FALSE(node.is_underflow())
+                << "Node " << pid << " underflows with " << node.num_keys()
+                << " keys (min " << node.min_size() << ")";
+        }
+
+        if (!node.is_leaf()) {
+            BPTreeInternalPage internal(page);
+            for (uint32_t i = 0; i <= internal.num_keys(); ++i) {
+                page_id_t child = internal.child_at(i);
+                ASSERT_NE(child, INVALID_PAGE_ID);
+                queue.push_back(child);
+
+                Page* child_page = bpm->fetch_page(child);
+                ASSERT_NE(child_page, nullptr);
+                BPTreePage child_node(child_page);
+                EXPECT_EQ(child_node.parent_page_id(), pid)
+                    << "Child " << child << " has wrong parent";
+                bpm->unpin_page(child, false);
+            }
+        }
+
+        bpm->unpin_page(pid, false);
+    }
+}
+
+}  // namespace
+
+TEST_F(BPlusTreeTest, LeftMergeReclaimsMergedLeafPage) {
+    // Small fanout so deletes reliably force leaf merges.
+    // Deleting high→low hits the rightmost leaf, which only has a left sibling
+    // and therefore takes the left-merge path that previously leaked the page.
+    constexpr uint32_t kLeafMax = 4;
+    constexpr uint32_t kInternalMax = 4;
+    BPlusTree tree(buffer_pool_, INVALID_PAGE_ID, kLeafMax, kInternalMax);
+
+    const size_t free_at_start = buffer_pool_->free_list_size();
+    const int N = 24;
+
+    for (int i = 0; i < N; ++i) {
+        ASSERT_TRUE(tree.insert(i, RID(i, 0)).ok());
+    }
+
+    const size_t free_after_insert = buffer_pool_->free_list_size();
+    ASSERT_LT(free_after_insert, free_at_start);
+
+    // Delete high→low to force rightmost-leaf left-merges.
+    for (int i = N - 1; i >= 0; --i) {
+        ASSERT_TRUE(tree.remove(i).ok()) << "Failed to remove " << i;
+    }
+
+    EXPECT_TRUE(tree.is_empty());
+    // Every page allocated for the tree must be back on the free list.
+    EXPECT_EQ(buffer_pool_->free_list_size(), free_at_start)
+        << "Left-merge (or root collapse) failed to reclaim pages";
+}
+
+TEST_F(BPlusTreeTest, InternalUnderflowRebalancesAfterDeletes) {
+    // Tiny fanout builds a multi-level tree quickly; sustained deletes must
+    // rebalance/merge internal nodes (not leave them underfull).
+    constexpr uint32_t kLeafMax = 4;
+    constexpr uint32_t kInternalMax = 4;
+    BPlusTree tree(buffer_pool_, INVALID_PAGE_ID, kLeafMax, kInternalMax);
+
+    const int N = 80;
+    for (int i = 0; i < N; ++i) {
+        ASSERT_TRUE(tree.insert(i, RID(i, 0)).ok());
+    }
+
+    // Delete most keys, leaving a sparse but non-empty tree.
+    for (int i = 0; i < N; ++i) {
+        if (i % 3 != 0) {
+            ASSERT_TRUE(tree.remove(i).ok()) << "Failed to remove " << i;
+        }
+    }
+
+    // Surviving keys must still be findable.
+    for (int i = 0; i < N; i += 3) {
+        auto result = tree.find(i);
+        ASSERT_TRUE(result.has_value()) << "Key " << i << " missing after rebalance";
+        EXPECT_EQ(result->page_id, static_cast<page_id_t>(i));
+    }
+    for (int i = 0; i < N; ++i) {
+        if (i % 3 != 0) {
+            EXPECT_FALSE(tree.find(i).has_value());
+        }
+    }
+
+    AssertNoUnderflow(tree);
+
+    // Finish deleting; pages should fully reclaim.
+    const size_t free_before_final = buffer_pool_->free_list_size();
+    for (int i = 0; i < N; i += 3) {
+        ASSERT_TRUE(tree.remove(i).ok());
+    }
+    EXPECT_TRUE(tree.is_empty());
+    EXPECT_GT(buffer_pool_->free_list_size(), free_before_final);
+    EXPECT_EQ(buffer_pool_->free_list_size(),
+              buffer_pool_->pool_size());
+}
+
+TEST_F(BPlusTreeTest, RightmostLeafLeftMergePreservesRangeScan) {
+    constexpr uint32_t kLeafMax = 4;
+    constexpr uint32_t kInternalMax = 4;
+    BPlusTree tree(buffer_pool_, INVALID_PAGE_ID, kLeafMax, kInternalMax);
+
+    for (int i = 0; i < 16; ++i) {
+        ASSERT_TRUE(tree.insert(i, RID(i, 0)).ok());
+    }
+
+    // Remove keys from the high end until several left-merges occur.
+    for (int i = 15; i >= 8; --i) {
+        ASSERT_TRUE(tree.remove(i).ok());
+    }
+
+    auto results = tree.range_scan(0, 100);
+    ASSERT_EQ(results.size(), 8u);
+    for (int i = 0; i < 8; ++i) {
+        EXPECT_EQ(results[static_cast<size_t>(i)].first, i);
+    }
+    AssertNoUnderflow(tree);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
