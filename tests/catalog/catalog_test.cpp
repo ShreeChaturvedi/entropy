@@ -156,5 +156,33 @@ TEST_F(CatalogTest, GetTableNames) {
   EXPECT_TRUE(name_set.count("table3") > 0);
 }
 
+// Regression for issue #4: index OIDs and column ids are distinct namespaces.
+TEST_F(CatalogTest, GetIndexByOid) {
+  Schema schema({
+      Column("id", TypeId::INTEGER),
+      Column("name", TypeId::VARCHAR, 50),
+      Column("age", TypeId::INTEGER),
+  });
+  ASSERT_TRUE(catalog_->create_table("users", schema).ok());
+  ASSERT_TRUE(catalog_->create_index("idx_id", "users", "id").ok());
+  ASSERT_TRUE(catalog_->create_index("idx_age", "users", "age").ok());
+
+  IndexInfo *by_name = catalog_->get_index("idx_id");
+  ASSERT_NE(by_name, nullptr);
+
+  IndexInfo *by_oid = catalog_->get_index_by_oid(by_name->oid);
+  ASSERT_NE(by_oid, nullptr);
+  EXPECT_EQ(by_oid, by_name);
+  EXPECT_EQ(by_oid->name, "idx_id");
+  EXPECT_EQ(by_oid->key_column, 0);
+
+  IndexInfo *age = catalog_->get_index("idx_age");
+  ASSERT_NE(age, nullptr);
+  EXPECT_NE(age->oid, by_name->oid);
+  EXPECT_EQ(catalog_->get_index_by_oid(age->oid), age);
+
+  EXPECT_EQ(catalog_->get_index_by_oid(9999), nullptr);
+}
+
 } // namespace
 } // namespace entropy
