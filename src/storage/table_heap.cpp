@@ -42,6 +42,48 @@ TableHeap::TableHeap(std::shared_ptr<BufferPoolManager> buffer_pool,
   }
 }
 
+Status TableHeap::ensure_first_page() {
+  std::unique_lock lock(mutex_); // Exclusive lock for write
+
+  if (first_page_id_ != INVALID_PAGE_ID) {
+    return Status::Ok();
+  }
+
+  page_id_t page_id = create_new_page();
+  if (page_id == INVALID_PAGE_ID) {
+    return Status::OutOfMemory("Failed to allocate first heap page");
+  }
+
+  return Status::Ok();
+}
+
+Status TableHeap::reclaim_all_pages() {
+  std::unique_lock lock(mutex_); // Exclusive lock for write
+
+  page_id_t current_id = first_page_id_;
+  while (current_id != INVALID_PAGE_ID) {
+    page_id_t next_id = INVALID_PAGE_ID;
+
+    // Fetch to read the forward link before we free the page.
+    Page *page = buffer_pool_->fetch_page(current_id);
+    if (page != nullptr) {
+      TablePage table_page(page);
+      next_id = table_page.get_next_page_id();
+      buffer_pool_->unpin_page(current_id, false);
+      // delete_page forwards to DiskManager::deallocate_page so the page can
+      // be reused by a later allocation.
+      buffer_pool_->delete_page(current_id);
+    }
+
+    current_id = next_id;
+  }
+
+  first_page_id_ = INVALID_PAGE_ID;
+  last_page_id_ = INVALID_PAGE_ID;
+
+  return Status::Ok();
+}
+
 Status TableHeap::insert_tuple(const Tuple &tuple, RID *rid) {
   std::unique_lock lock(mutex_); // Exclusive lock for write
 
