@@ -519,33 +519,50 @@ private:
 
     [[nodiscard]] bool deserialize_checkpoint(const char* ptr, uint32_t remaining) {
         constexpr uint32_t kFixed = sizeof(lsn_t) + sizeof(txn_id_t) + sizeof(uint32_t);
-        if (remaining < kFixed) {
-            return false;
+        constexpr uint32_t kLegacyFixed = sizeof(uint32_t);
+
+        // Current layout: begin_lsn(8) + next_txn_id(8) + count(4) + ids.
+        // Legacy layout (pre begin_lsn/next_txn_id): count(4) + ids. Both are
+        // written with exact sizes, so the layout is identified by whichever
+        // count field makes the payload size match exactly.
+        uint32_t count = 0;
+        if (remaining >= kFixed) {
+            std::memcpy(&count, ptr + sizeof(lsn_t) + sizeof(txn_id_t), sizeof(count));
+            if (kFixed + static_cast<uint64_t>(count) * sizeof(txn_id_t) == remaining) {
+                lsn_t begin_lsn = INVALID_LSN;
+                std::memcpy(&begin_lsn, ptr, sizeof(begin_lsn));
+                // Disambiguation guard: a genuine redo anchor can never exceed
+                // the checkpoint record's own LSN. A legacy payload whose id
+                // bytes happen to size-match the current layout produces a
+                // garbage anchor here and falls through to the legacy parse.
+                if (begin_lsn == INVALID_LSN || begin_lsn <= header_.lsn) {
+                    checkpoint_begin_lsn_ = begin_lsn;
+                    std::memcpy(&checkpoint_next_txn_id_, ptr + sizeof(lsn_t),
+                                sizeof(checkpoint_next_txn_id_));
+                    read_active_txns(ptr + kFixed, count);
+                    return true;
+                }
+            }
         }
-
-        std::memcpy(&checkpoint_begin_lsn_, ptr, sizeof(checkpoint_begin_lsn_));
-        ptr += sizeof(checkpoint_begin_lsn_);
-
-        std::memcpy(&checkpoint_next_txn_id_, ptr, sizeof(checkpoint_next_txn_id_));
-        ptr += sizeof(checkpoint_next_txn_id_);
-
-        uint32_t count;
-        std::memcpy(&count, ptr, sizeof(count));
-        ptr += sizeof(count);
-        remaining -= kFixed;
-
-        const uint64_t bytes_needed =
-            static_cast<uint64_t>(count) * sizeof(txn_id_t);
-        if (bytes_needed > remaining) {
-            return false;
+        if (remaining >= kLegacyFixed) {
+            std::memcpy(&count, ptr, sizeof(count));
+            if (kLegacyFixed + static_cast<uint64_t>(count) * sizeof(txn_id_t) ==
+                remaining) {
+                checkpoint_begin_lsn_ = INVALID_LSN;
+                checkpoint_next_txn_id_ = INVALID_TXN_ID;
+                read_active_txns(ptr + kLegacyFixed, count);
+                return true;
+            }
         }
+        return false;
+    }
 
+    void read_active_txns(const char* ptr, uint32_t count) {
         active_txns_.resize(count);
         for (uint32_t i = 0; i < count; ++i) {
             std::memcpy(&active_txns_[i], ptr, sizeof(txn_id_t));
             ptr += sizeof(txn_id_t);
         }
-        return true;
     }
 
     // Header
