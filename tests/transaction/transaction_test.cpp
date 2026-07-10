@@ -1931,6 +1931,72 @@ TEST_F(RecoveryTest, UndoSkipsSlotReusedByCommittedTransaction) {
   EXPECT_EQ(*r, bytes("BBBB"));
 }
 
+TEST_F(RecoveryTest, RedoReinsertsIntoReusedSlot) {
+  // Delete then re-insert at the same RID pre-crash: redo must reproduce the
+  // slot reuse exactly (insert_record_at into the emptied slot), leaving the
+  // re-inserted bytes at the original RID.
+  {
+    WALManager wal(wal_file_.string());
+    auto begin = LogRecord::make_begin(1);
+    [[maybe_unused]] lsn_t lsn = wal.append_log(begin);
+    auto insert1 =
+        LogRecord::make_insert(1, begin.lsn(), 10, RID(0, 0), bytes("first"));
+    lsn = wal.append_log(insert1);
+    auto del =
+        LogRecord::make_delete(1, insert1.lsn(), 10, RID(0, 0), bytes("first"));
+    lsn = wal.append_log(del);
+    auto insert2 =
+        LogRecord::make_insert(1, del.lsn(), 10, RID(0, 0), bytes("second"));
+    lsn = wal.append_log(insert2);
+    auto commit = LogRecord::make_commit(1, insert2.lsn());
+    lsn = wal.append_log(commit);
+    (void)wal.flush();
+  }
+
+  auto pool = make_buffer_pool();
+  auto wal = std::make_shared<WALManager>(wal_file_.string());
+  RecoveryManager recovery(pool, wal, disk_manager_);
+
+  ASSERT_TRUE(recovery.recover().ok());
+  EXPECT_EQ(recovery.redo_count(), 3u);
+
+  auto r = record_at(*pool, RID(0, 0));
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(*r, bytes("second"));
+}
+
+TEST_F(RecoveryTest, RedoAppliesGrownUpdate) {
+  // An UPDATE whose tuple grew relocates the record within the page (the slot
+  // is repointed at fresh bytes). Redo must reproduce the grown after-image at
+  // the same RID.
+  const std::vector<char> small = bytes("aa");
+  const std::vector<char> grown = bytes("a-much-longer-tuple-value");
+  {
+    WALManager wal(wal_file_.string());
+    auto begin = LogRecord::make_begin(1);
+    [[maybe_unused]] lsn_t lsn = wal.append_log(begin);
+    auto insert = LogRecord::make_insert(1, begin.lsn(), 10, RID(0, 0), small);
+    lsn = wal.append_log(insert);
+    auto update =
+        LogRecord::make_update(1, insert.lsn(), 10, RID(0, 0), small, grown);
+    lsn = wal.append_log(update);
+    auto commit = LogRecord::make_commit(1, update.lsn());
+    lsn = wal.append_log(commit);
+    (void)wal.flush();
+  }
+
+  auto pool = make_buffer_pool();
+  auto wal = std::make_shared<WALManager>(wal_file_.string());
+  RecoveryManager recovery(pool, wal, disk_manager_);
+
+  ASSERT_TRUE(recovery.recover().ok());
+  EXPECT_EQ(recovery.redo_count(), 2u);
+
+  auto r = record_at(*pool, RID(0, 0));
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(*r, grown);
+}
+
 TEST_F(RecoveryTest, CheckpointAnchorSkipsPreCheckpointRedo) {
   // create_checkpoint flushes the WAL and all dirty pages, then records its
   // own LSN as begin_lsn. Recovery must not re-apply records older than the
