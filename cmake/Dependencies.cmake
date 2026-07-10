@@ -12,13 +12,13 @@ set(FETCHCONTENT_BASE_DIR "${CMAKE_BINARY_DIR}/_deps")
 # ─────────────────────────────────────────────────────────────────────────────
 
 # SYSTEM: treat spdlog's (and its bundled fmt's) headers as system headers so
-# their diagnostics do not trip our -Werror. Without this, fmt v9's core.h emits
-# -Wdangling-reference on GCC 13+, which breaks the CI build. Our own code keeps
-# the full warning set.
+# their diagnostics do not trip our -Werror. Our own code keeps the full
+# warning set. v1.15.3 bundles fmt 11, which compiles cleanly on GCC 13+ and
+# Apple clang 17 (the fmt bundled with v1.12.0 fails consteval checks there).
 FetchContent_Declare(
     spdlog
     GIT_REPOSITORY https://github.com/gabime/spdlog.git
-    GIT_TAG        v1.12.0
+    GIT_TAG        v1.15.3
     GIT_SHALLOW    TRUE
     SYSTEM
 )
