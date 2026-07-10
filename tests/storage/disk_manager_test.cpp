@@ -143,5 +143,48 @@ TEST_F(DiskManagerTest, BeyondEofReadDoesNotLatchSubsequentIo) {
     EXPECT_EQ(std::memcmp(write_data2, read_data, config::kDefaultPageSize), 0);
 }
 
+// error_if_exists=true must refuse to open a file that already exists,
+// leaving the manager closed (is_open() == false).
+TEST(FileDiskManagerOptionsTest, ErrorIfExistsFailsOnExistingFile) {
+    test::TempFile temp("dm_exists_");
+
+    // Create the file with a first manager.
+    {
+        FileDiskManager creator(temp.string());
+        ASSERT_TRUE(creator.is_open());
+    }
+
+    FileDiskManager dm(temp.string(), /*create_if_missing=*/true,
+                       /*error_if_exists=*/true);
+    EXPECT_FALSE(dm.is_open());
+}
+
+// create_if_missing=false must refuse to create a file that does not exist,
+// leaving the manager closed (is_open() == false).
+TEST(FileDiskManagerOptionsTest, CreateIfMissingFalseFailsOnMissingFile) {
+    test::TempFile temp("dm_missing_");  // path only; file is not created
+
+    FileDiskManager dm(temp.string(), /*create_if_missing=*/false);
+    EXPECT_FALSE(dm.is_open());
+}
+
+// A deallocated page id is handed back by the next allocate_page before the
+// file is grown.
+TEST_F(DiskManagerTest, DeallocateThenAllocateReusesPageId) {
+    page_id_t p0 = disk_manager_->allocate_page();
+    page_id_t p1 = disk_manager_->allocate_page();
+    page_id_t p2 = disk_manager_->allocate_page();
+
+    disk_manager_->deallocate_page(p1);
+
+    // The freed id is reused before the file grows.
+    page_id_t reused = disk_manager_->allocate_page();
+    EXPECT_EQ(reused, p1);
+
+    // Once the free list is empty, allocation grows the file again.
+    page_id_t grown = disk_manager_->allocate_page();
+    EXPECT_EQ(grown, p2 + 1);
+}
+
 }  // namespace
 }  // namespace entropy

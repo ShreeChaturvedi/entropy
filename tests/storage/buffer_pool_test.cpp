@@ -5,11 +5,63 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <cstring>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 #include "storage/buffer_pool.hpp"
 #include "test_utils.hpp"
 
 namespace entropy {
 namespace {
+
+// In-memory disk manager that records the order of hook and write events so a
+// test can assert the WAL flush hook runs before the page reaches disk.
+class RecordingDiskManager : public DiskManager {
+public:
+    struct Event {
+        std::string kind;  // "hook" or "write"
+        lsn_t lsn;
+    };
+
+    Status read_page(page_id_t page_id, char* page_data) override {
+        auto it = pages_.find(page_id);
+        if (it == pages_.end()) {
+            std::memset(page_data, 0, page_size());
+        } else {
+            std::memcpy(page_data, it->second.data(), page_size());
+        }
+        return Status::Ok();
+    }
+
+    Status write_page(page_id_t page_id, const char* page_data) override {
+        lsn_t lsn = 0;
+        std::memcpy(&lsn, page_data, sizeof(lsn));  // LSN lives at offset 0
+        events.push_back({"write", lsn});
+        std::memcpy(pages_[page_id].data(), page_data, page_size());
+        if (page_id >= num_pages_) {
+            num_pages_ = page_id + 1;
+        }
+        return Status::Ok();
+    }
+
+    page_id_t allocate_page() override { return num_pages_++; }
+    void deallocate_page(page_id_t /*page_id*/) override {}
+    page_id_t num_pages() const noexcept override { return num_pages_; }
+    bool is_open() const noexcept override { return true; }
+    void sync() override {}
+
+    void note_hook(lsn_t lsn) { events.push_back({"hook", lsn}); }
+
+    std::vector<Event> events;
+
+private:
+    std::unordered_map<page_id_t, std::array<char, DiskManager::page_size()>>
+        pages_;
+    page_id_t num_pages_ = 0;
+};
 
 class BufferPoolTest : public ::testing::Test {
 protected:
@@ -96,6 +148,55 @@ TEST_F(BufferPoolTest, PoolEviction) {
 
     // All pages should have been created (with eviction)
     EXPECT_EQ(page_ids.size(), pool_size_ + 5);
+}
+
+// The WAL flush hook must run with the page's LSN immediately before the page
+// is written to disk on an explicit flush_page.
+TEST(BufferPoolWalHookTest, HookRunsWithPageLsnBeforeFlushWrite) {
+    auto dm = std::make_shared<RecordingDiskManager>();
+    BufferPoolManager bpm(4, dm);
+    bpm.set_wal_flush_hook(
+        [rec = dm.get()](lsn_t lsn) { rec->note_hook(lsn); });
+
+    page_id_t page_id;
+    Page* page = bpm.new_page(&page_id);
+    ASSERT_NE(page, nullptr);
+    page->set_lsn(42);
+    page->data()[config::kPageHeaderSize] = 'Z';
+    bpm.unpin_page(page_id, /*is_dirty=*/true);
+
+    ASSERT_TRUE(bpm.flush_page(page_id));
+
+    ASSERT_EQ(dm->events.size(), 2u);
+    EXPECT_EQ(dm->events[0].kind, "hook");
+    EXPECT_EQ(dm->events[0].lsn, 42u);
+    EXPECT_EQ(dm->events[1].kind, "write");
+    EXPECT_EQ(dm->events[1].lsn, 42u);
+}
+
+// The hook must also fire before the write when a dirty page is evicted.
+TEST(BufferPoolWalHookTest, HookRunsBeforeWriteOnEviction) {
+    auto dm = std::make_shared<RecordingDiskManager>();
+    BufferPoolManager bpm(/*pool_size=*/1, dm);
+    bpm.set_wal_flush_hook(
+        [rec = dm.get()](lsn_t lsn) { rec->note_hook(lsn); });
+
+    page_id_t p0;
+    Page* page0 = bpm.new_page(&p0);
+    ASSERT_NE(page0, nullptr);
+    page0->set_lsn(7);
+    bpm.unpin_page(p0, /*is_dirty=*/true);
+
+    // A single-frame pool must evict (and flush) page 0 to admit page 1.
+    page_id_t p1;
+    Page* page1 = bpm.new_page(&p1);
+    ASSERT_NE(page1, nullptr);
+
+    ASSERT_EQ(dm->events.size(), 2u);
+    EXPECT_EQ(dm->events[0].kind, "hook");
+    EXPECT_EQ(dm->events[0].lsn, 7u);
+    EXPECT_EQ(dm->events[1].kind, "write");
+    EXPECT_EQ(dm->events[1].lsn, 7u);
 }
 
 }  // namespace
