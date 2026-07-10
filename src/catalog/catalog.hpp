@@ -10,6 +10,7 @@
  */
 
 #include <memory>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -24,6 +25,7 @@ namespace entropy {
 class BufferPoolManager;
 class TableHeap;
 class BPlusTree;
+struct CatalogManifest;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TableInfo - Complete table metadata
@@ -74,7 +76,15 @@ struct IndexInfo {
  */
 class Catalog {
 public:
-  explicit Catalog(std::shared_ptr<BufferPoolManager> buffer_pool);
+  /**
+   * @brief Construct a catalog
+   * @param buffer_pool Buffer pool used to back table heaps and indexes
+   * @param manifest_path Path to the durable catalog manifest. When non-empty,
+   *        the catalog loads it (if present) on construction and writes +
+   *        fsyncs it on every DDL. When empty, the catalog is in-memory only.
+   */
+  explicit Catalog(std::shared_ptr<BufferPoolManager> buffer_pool,
+                   std::string manifest_path = "");
   ~Catalog() = default;
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -84,6 +94,22 @@ public:
   [[nodiscard]] Status create_table(const std::string &table_name,
                                     const Schema &schema);
   [[nodiscard]] Status drop_table(const std::string &table_name);
+
+  /**
+   * @brief Look up a table, returning a stable owning handle
+   *
+   * The returned shared_ptr keeps the TableInfo alive even if another thread
+   * drops the table concurrently, so callers never dereference freed memory.
+   */
+  [[nodiscard]] std::shared_ptr<TableInfo>
+  get_table_shared(const std::string &table_name) const;
+  [[nodiscard]] std::shared_ptr<TableInfo> get_table_shared(oid_t table_oid)
+      const;
+
+  // Transitional raw-pointer getters: thin wrappers over the shared_ptr
+  // getters. A returned pointer dangles once the table is dropped; the Binder
+  // and executors move to get_table_shared in a later work package, after
+  // which these are removed.
   [[nodiscard]] TableInfo *get_table(const std::string &table_name);
   [[nodiscard]] const TableInfo *get_table(const std::string &table_name) const;
   [[nodiscard]] TableInfo *get_table(oid_t table_oid);
@@ -110,7 +136,17 @@ public:
                                     const std::string &column_name);
 
   /**
+   * @brief Look up an index, returning a stable owning handle
+   */
+  [[nodiscard]] std::shared_ptr<IndexInfo>
+  get_index_shared(const std::string &index_name) const;
+  [[nodiscard]] std::shared_ptr<IndexInfo> get_index_shared(oid_t index_oid)
+      const;
+
+  /**
    * @brief Get index info by name
+   *
+   * Transitional raw getter; see get_table for the migration note.
    */
   [[nodiscard]] IndexInfo *get_index(const std::string &index_name);
   [[nodiscard]] const IndexInfo *get_index(const std::string &index_name) const;
@@ -148,11 +184,33 @@ public:
   }
 
 private:
+  // ─────────────────────────────────────────────────────────────────────────
+  // Internal helpers (callers must hold mutex_)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  [[nodiscard]] std::shared_ptr<TableInfo>
+  find_table(const std::string &table_name) const;
+  [[nodiscard]] std::shared_ptr<TableInfo> find_table(oid_t table_oid) const;
+  [[nodiscard]] std::shared_ptr<IndexInfo>
+  find_index(const std::string &index_name) const;
+  [[nodiscard]] std::shared_ptr<IndexInfo> find_index(oid_t index_oid) const;
+
+  /// Build a serializable snapshot of the current catalog state.
+  [[nodiscard]] CatalogManifest snapshot() const;
+  /// Persist the manifest if a path is configured (no-op otherwise).
+  [[nodiscard]] Status persist() const;
+  /// Load the manifest during construction and rebuild heaps/indexes.
+  void load_from_manifest();
+
   std::shared_ptr<BufferPoolManager> buffer_pool_;
+  std::string manifest_path_; ///< Durable manifest path ("" = in-memory only)
+  mutable std::shared_mutex mutex_; ///< Guards the maps and next_oid_
   std::unordered_map<std::string, oid_t> table_names_; ///< Name -> OID mapping
-  std::unordered_map<oid_t, TableInfo> tables_;        ///< OID -> TableInfo
+  std::unordered_map<oid_t, std::shared_ptr<TableInfo>>
+      tables_; ///< OID -> TableInfo
   std::unordered_map<std::string, oid_t> index_names_; ///< Name -> OID mapping
-  std::unordered_map<oid_t, IndexInfo> indexes_;       ///< OID -> IndexInfo
+  std::unordered_map<oid_t, std::shared_ptr<IndexInfo>>
+      indexes_; ///< OID -> IndexInfo
   oid_t next_oid_ = 1;
 };
 
