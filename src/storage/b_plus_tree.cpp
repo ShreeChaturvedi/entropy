@@ -5,11 +5,20 @@
 
 #include "storage/b_plus_tree.hpp"
 
+#include <unordered_set>
+
 namespace entropy {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BPlusTree Implementation
 // ─────────────────────────────────────────────────────────────────────────────
+
+void BPlusTree::change_root(page_id_t new_root_id) {
+    root_page_id_ = new_root_id;
+    if (root_change_callback_) {
+        root_change_callback_(new_root_id);
+    }
+}
 
 BPlusTree::BPlusTree(std::shared_ptr<BufferPoolManager> buffer_pool,
                      page_id_t root_page_id)
@@ -137,7 +146,7 @@ Status BPlusTree::insert(KeyType key, const ValueType& value) {
             return Status::AlreadyExists("Key already exists");
         }
 
-        root_page_id_ = new_root_id;
+        change_root(new_root_id);
         buffer_pool_->unpin_page(new_root_id, true);
         return Status::Ok();
     }
@@ -271,7 +280,7 @@ Status BPlusTree::insert_into_parent(Page* old_page, KeyType key,
             buffer_pool_->unpin_page(new_page_id, true);
         }
 
-        root_page_id_ = new_root_id;
+        change_root(new_root_id);
         buffer_pool_->unpin_page(new_root_id, true);
         return Status::Ok();
     }
@@ -419,7 +428,7 @@ Status BPlusTree::remove(KeyType key) {
     if (leaf.is_root() && leaf.is_empty()) {
         buffer_pool_->unpin_page(leaf_page_id, true);
         buffer_pool_->delete_page(leaf_page_id);
-        root_page_id_ = INVALID_PAGE_ID;
+        change_root(INVALID_PAGE_ID);
         return Status::Ok();
     }
 
@@ -577,7 +586,7 @@ Status BPlusTree::handle_leaf_underflow(Page* leaf_page,
         }
         buffer_pool_->unpin_page(parent_id, true);
         buffer_pool_->delete_page(parent_id);
-        root_page_id_ = new_root;
+        change_root(new_root);
         return Status::Ok();
     }
 
@@ -734,7 +743,7 @@ Status BPlusTree::handle_internal_underflow(Page* internal_page,
         }
         buffer_pool_->unpin_page(parent_id, true);
         buffer_pool_->delete_page(parent_id);
-        root_page_id_ = new_root;
+        change_root(new_root);
         return Status::Ok();
     }
 
@@ -763,6 +772,53 @@ BPlusTree::range_scan(KeyType start_key, KeyType end_key) {
     }
 
     return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Page Reclamation
+// ─────────────────────────────────────────────────────────────────────────────
+
+Status BPlusTree::reclaim_all_pages() {
+    std::vector<page_id_t> pending;
+    if (root_page_id_ != INVALID_PAGE_ID) {
+        pending.push_back(root_page_id_);
+    }
+
+    // Iterative traversal; the visited set makes the walk terminate even on a
+    // damaged tree (e.g. pages that never reached disk before a crash).
+    std::unordered_set<page_id_t> visited;
+    while (!pending.empty()) {
+        page_id_t page_id = pending.back();
+        pending.pop_back();
+        if (page_id == INVALID_PAGE_ID || visited.contains(page_id)) {
+            continue;
+        }
+        visited.insert(page_id);
+
+        Page* page = buffer_pool_->fetch_page(page_id);
+        if (page == nullptr) {
+            continue;
+        }
+        BPTreePage node(page);
+        if (node.is_internal()) {
+            BPTreeInternalPage internal(page);
+            for (uint32_t i = 0; i <= internal.num_keys(); ++i) {
+                pending.push_back(internal.child_at(i));
+            }
+        } else if (!node.is_leaf()) {
+            // Not an intact index page — never free what we do not own.
+            buffer_pool_->unpin_page(page_id, false);
+            continue;
+        }
+        buffer_pool_->unpin_page(page_id, false);
+        buffer_pool_->delete_page(page_id);
+    }
+
+    // Bypass change_root deliberately: the caller is destroying the tree and
+    // persists the removal itself (firing the callback here could deadlock a
+    // caller that already holds its own lock).
+    root_page_id_ = INVALID_PAGE_ID;
+    return Status::Ok();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
