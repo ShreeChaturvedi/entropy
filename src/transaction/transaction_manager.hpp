@@ -11,6 +11,7 @@
  * 4. Managing transaction IDs
  */
 
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -23,6 +24,8 @@ namespace entropy {
 
 // Forward declarations
 class WALManager;
+class LockManager;
+class TableHeap;
 
 /**
  * @brief Manages transaction lifecycle
@@ -133,8 +136,34 @@ public:
      */
     [[nodiscard]] WALManager* wal_manager() const noexcept { return wal_manager_.get(); }
 
+    /**
+     * @brief Attach a lock manager so commit/abort release locks
+     * @note Not owned; must outlive this TransactionManager
+     */
+    void set_lock_manager(LockManager* lock_manager) noexcept {
+        lock_manager_ = lock_manager;
+    }
+
+    /**
+     * @brief Resolve table OID -> TableHeap for abort undo
+     *
+     * Called for each write-set entry during abort. Returning nullptr skips
+     * physical undo for that entry (logged as a warning).
+     */
+    using TableResolver = std::function<TableHeap*(oid_t table_oid)>;
+    void set_table_resolver(TableResolver resolver) {
+        table_resolver_ = std::move(resolver);
+    }
+
 private:
+    /**
+     * @brief Undo one write-set entry (inverse of the logged operation)
+     */
+    void undo_write_record(const WriteRecord& record);
+
     std::shared_ptr<WALManager> wal_manager_;
+    LockManager* lock_manager_ = nullptr;
+    TableResolver table_resolver_;
     std::unordered_map<txn_id_t, std::unique_ptr<Transaction>> txn_map_;
     txn_id_t next_txn_id_ = 1;
     mutable std::mutex mutex_;

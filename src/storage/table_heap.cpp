@@ -125,6 +125,34 @@ Status TableHeap::delete_tuple(const RID &rid) {
   return Status::Ok();
 }
 
+Status TableHeap::restore_tuple(const RID &rid, const Tuple &tuple) {
+  std::unique_lock lock(mutex_);
+
+  if (!rid.is_valid()) {
+    return Status::InvalidArgument("Invalid RID");
+  }
+  if (tuple.is_empty()) {
+    return Status::InvalidArgument("Cannot restore empty tuple");
+  }
+
+  Page *page = buffer_pool_->fetch_page(rid.page_id);
+  if (page == nullptr) {
+    return Status::NotFound("Page not found");
+  }
+
+  TablePage table_page(page);
+  bool restored = table_page.insert_record_at(
+      rid.slot_id, tuple.data(), static_cast<uint16_t>(tuple.size()));
+
+  buffer_pool_->unpin_page(rid.page_id, restored);
+
+  if (!restored) {
+    return Status::Error("Failed to restore tuple at specified RID");
+  }
+
+  return Status::Ok();
+}
+
 Status TableHeap::update_tuple(const Tuple &tuple, const RID &rid,
                                RID *new_rid) {
   std::unique_lock lock(mutex_); // Exclusive lock for write
