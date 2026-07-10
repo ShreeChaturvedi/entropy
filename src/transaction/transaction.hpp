@@ -12,6 +12,7 @@
  * COMMITTED/ABORTED are terminal states.
  */
 
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <unordered_set>
@@ -117,15 +118,45 @@ public:
     // Non-copyable, movable
     Transaction(const Transaction&) = delete;
     Transaction& operator=(const Transaction&) = delete;
-    Transaction(Transaction&&) = default;
-    Transaction& operator=(Transaction&&) = default;
+
+    // std::atomic is not movable, so the move operations are defined explicitly.
+    // Moving a Transaction happens only at construction time, before the object
+    // is shared across threads, so a relaxed load/store of the state is safe.
+    Transaction(Transaction&& other) noexcept
+        : txn_id_(other.txn_id_),
+          state_(other.state_.load(std::memory_order_relaxed)),
+          isolation_level_(other.isolation_level_),
+          prev_lsn_(other.prev_lsn_),
+          start_ts_(other.start_ts_),
+          commit_ts_(other.commit_ts_),
+          write_set_(std::move(other.write_set_)),
+          page_locks_(std::move(other.page_locks_)),
+          table_locks_(std::move(other.table_locks_)) {}
+
+    Transaction& operator=(Transaction&& other) noexcept {
+        if (this != &other) {
+            txn_id_ = other.txn_id_;
+            state_.store(other.state_.load(std::memory_order_relaxed),
+                         std::memory_order_relaxed);
+            isolation_level_ = other.isolation_level_;
+            prev_lsn_ = other.prev_lsn_;
+            start_ts_ = other.start_ts_;
+            commit_ts_ = other.commit_ts_;
+            write_set_ = std::move(other.write_set_);
+            page_locks_ = std::move(other.page_locks_);
+            table_locks_ = std::move(other.table_locks_);
+        }
+        return *this;
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Accessors
     // ─────────────────────────────────────────────────────────────────────────
 
     [[nodiscard]] txn_id_t txn_id() const noexcept { return txn_id_; }
-    [[nodiscard]] TransactionState state() const noexcept { return state_; }
+    [[nodiscard]] TransactionState state() const noexcept {
+        return state_.load(std::memory_order_acquire);
+    }
     [[nodiscard]] IsolationLevel isolation_level() const noexcept { return isolation_level_; }
 
     /**
@@ -153,7 +184,9 @@ public:
      * @brief Set transaction state
      * @note Should only be called by TransactionManager
      */
-    void set_state(TransactionState state) noexcept { state_ = state; }
+    void set_state(TransactionState state) noexcept {
+        state_.store(state, std::memory_order_release);
+    }
 
     /**
      * @brief Set the previous LSN (last log record for this transaction)
@@ -169,7 +202,8 @@ public:
      * @brief Check if transaction is in a state where it can perform operations
      */
     [[nodiscard]] bool is_active() const noexcept {
-        return state_ == TransactionState::GROWING || state_ == TransactionState::SHRINKING;
+        const TransactionState s = state_.load(std::memory_order_acquire);
+        return s == TransactionState::GROWING || s == TransactionState::SHRINKING;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -235,7 +269,9 @@ public:
 
 private:
     txn_id_t txn_id_;
-    TransactionState state_ = TransactionState::GROWING;
+    // Atomic: read cross-thread by the lock manager's waiter loops while the
+    // owning thread (or a deadlock-victim path) mutates it via set_state().
+    std::atomic<TransactionState> state_{TransactionState::GROWING};
     IsolationLevel isolation_level_;
 
     // WAL linkage
