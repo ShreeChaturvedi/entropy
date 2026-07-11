@@ -6,7 +6,9 @@
 #include "storage/tuple.hpp"
 
 #include <cstring>
+#include <limits>
 #include <stdexcept>
+#include <string>
 
 #include "catalog/schema.hpp"
 #include "common/macros.hpp"
@@ -123,6 +125,18 @@ std::vector<char> TupleValue::to_bytes(TypeId type) const {
         }
         case TypeId::VARCHAR: {
             const std::string& str = as_string();
+            // The on-disk tuple format records a VARCHAR's byte length in a
+            // 2-byte little-endian prefix, so a string longer than 65535 bytes
+            // cannot be represented: truncating to uint16_t would desync the
+            // recorded length from the bytes actually written and silently
+            // corrupt the tuple. Reject it loudly instead. (Higher layers cap
+            // VARCHAR well below this via config::kMaxVarcharLength; this is the
+            // hard limit the format itself can honor.)
+            if (str.size() > std::numeric_limits<uint16_t>::max()) {
+                throw std::length_error(
+                    "VARCHAR value of " + std::to_string(str.size()) +
+                    " bytes exceeds the 65535-byte on-disk length limit");
+            }
             const uint16_t len = static_cast<uint16_t>(str.size());
             // Layout: 2-byte little-endian length prefix followed by the raw
             // bytes. Writing the prefix byte-wise (rather than memcpy over
