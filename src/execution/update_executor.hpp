@@ -37,11 +37,12 @@ public:
   UpdateExecutor(ExecutorContext *ctx, std::unique_ptr<Executor> child,
                  std::shared_ptr<TableHeap> table_heap, const Schema *schema,
                  std::vector<size_t> column_indices,
-                 std::vector<std::unique_ptr<Expression>> values)
+                 std::vector<std::unique_ptr<Expression>> values,
+                 oid_t table_oid = INVALID_OID)
       : Executor(ctx), child_(std::move(child)),
         table_heap_(std::move(table_heap)), schema_(schema),
-        column_indices_(std::move(column_indices)), values_(std::move(values)) {
-  }
+        column_indices_(std::move(column_indices)), values_(std::move(values)),
+        table_oid_(table_oid) {}
 
   /**
    * @brief Initialize the executor
@@ -59,14 +60,21 @@ public:
    */
   [[nodiscard]] size_t rows_updated() const { return rows_updated_; }
 
+  /**
+   * @brief First error encountered (lock failure or write-write conflict)
+   */
+  [[nodiscard]] Status status() const { return status_; }
+
 private:
   std::unique_ptr<Executor> child_;
   std::shared_ptr<TableHeap> table_heap_;
   const Schema *schema_;
   std::vector<size_t> column_indices_;
   std::vector<std::unique_ptr<Expression>> values_;
+  oid_t table_oid_ = INVALID_OID;
   size_t rows_updated_ = 0;
   bool done_ = false;
+  Status status_ = Status::Ok();
 };
 
 } // namespace entropy

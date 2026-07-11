@@ -9,7 +9,9 @@
 #include <cmath>
 #include <cstddef>
 #include <functional>
+#include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -111,9 +113,12 @@ Statistics::Statistics(std::shared_ptr<Catalog> catalog)
     : catalog_(std::move(catalog)) {}
 
 size_t Statistics::table_cardinality(oid_t table_oid) const {
-  auto it = table_stats_.find(table_oid);
-  if (it != table_stats_.end()) {
-    return it->second.row_count;
+  {
+    std::shared_lock lock(mutex_);
+    auto it = table_stats_.find(table_oid);
+    if (it != table_stats_.end()) {
+      return it->second.row_count;
+    }
   }
 
   // If no stats, do a quick count from catalog
@@ -133,6 +138,12 @@ size_t Statistics::table_cardinality(oid_t table_oid) const {
 
 double Statistics::column_selectivity(oid_t table_oid,
                                       column_id_t column_id) const {
+  std::shared_lock lock(mutex_);
+  return column_selectivity_impl(table_oid, column_id);
+}
+
+double Statistics::column_selectivity_impl(oid_t table_oid,
+                                           column_id_t column_id) const {
   auto table_it = table_stats_.find(table_oid);
   if (table_it == table_stats_.end()) {
     return DEFAULT_SELECTIVITY;
@@ -153,6 +164,12 @@ double Statistics::column_selectivity(oid_t table_oid,
 
 double Statistics::estimate_selectivity(oid_t table_oid,
                                         const Expression *predicate) const {
+  std::shared_lock lock(mutex_);
+  return estimate_selectivity_impl(table_oid, predicate);
+}
+
+double Statistics::estimate_selectivity_impl(oid_t table_oid,
+                                             const Expression *predicate) const {
   if (!predicate) {
     return 1.0; // No predicate = all rows
   }
@@ -164,7 +181,7 @@ double Statistics::estimate_selectivity(oid_t table_oid,
     const ColumnRefExpression *col = comparison_column(comp);
     double eq_sel = EQUALITY_SELECTIVITY;
     if (col != nullptr) {
-      eq_sel = column_selectivity(
+      eq_sel = column_selectivity_impl(
           table_oid, static_cast<column_id_t>(col->column_index()));
     }
 
@@ -188,18 +205,18 @@ double Statistics::estimate_selectivity(oid_t table_oid,
   if (auto *logical = dynamic_cast<const LogicalExpression *>(predicate)) {
     switch (logical->op()) {
     case LogicalOpType::AND: {
-      double left_sel = estimate_selectivity(table_oid, logical->left());
-      double right_sel = estimate_selectivity(table_oid, logical->right());
+      double left_sel = estimate_selectivity_impl(table_oid, logical->left());
+      double right_sel = estimate_selectivity_impl(table_oid, logical->right());
       return left_sel * right_sel;
     }
     case LogicalOpType::OR: {
-      double left_sel = estimate_selectivity(table_oid, logical->left());
-      double right_sel = estimate_selectivity(table_oid, logical->right());
+      double left_sel = estimate_selectivity_impl(table_oid, logical->left());
+      double right_sel = estimate_selectivity_impl(table_oid, logical->right());
       return left_sel + right_sel - (left_sel * right_sel);
     }
     case LogicalOpType::NOT:
       // left() holds the sole operand for unary NOT.
-      return 1.0 - estimate_selectivity(table_oid, logical->left());
+      return 1.0 - estimate_selectivity_impl(table_oid, logical->left());
     default:
       return DEFAULT_SELECTIVITY;
     }
@@ -211,8 +228,9 @@ double Statistics::estimate_selectivity(oid_t table_oid,
 double Statistics::range_selectivity(oid_t table_oid, column_id_t column_id,
                                      std::optional<BPTreeKey> lower,
                                      std::optional<BPTreeKey> upper) const {
+  std::shared_lock lock(mutex_);
   // No usable histogram: fall back to the Selinger range default (1/3).
-  const TableStatistics *ts = get_table_stats(table_oid);
+  const TableStatistics *ts = get_table_stats_impl(table_oid);
   if (ts == nullptr) {
     return RANGE_SELECTIVITY;
   }
@@ -307,6 +325,7 @@ void Statistics::collect_statistics(oid_t table_oid) {
   // Estimate page count (rough: 4KB pages, ~100 bytes per row avg)
   stats.page_count = std::max<size_t>(1, (stats.row_count * 100) / 4096);
 
+  std::unique_lock lock(mutex_);
   table_stats_[table_oid] = std::move(stats);
 }
 
@@ -314,10 +333,12 @@ void Statistics::on_table_created(oid_t table_oid) {
   TableStatistics stats;
   stats.row_count = 0;
   stats.page_count = 0;
+  std::unique_lock lock(mutex_);
   table_stats_[table_oid] = std::move(stats);
 }
 
 void Statistics::on_table_dropped(oid_t table_oid) {
+  std::unique_lock lock(mutex_);
   table_stats_.erase(table_oid);
 }
 
@@ -325,6 +346,7 @@ void Statistics::on_rows_inserted(oid_t table_oid, size_t rows) {
   if (rows == 0) {
     return;
   }
+  std::unique_lock lock(mutex_);
   auto &stats = table_stats_[table_oid];
   stats.row_count += rows;
   if (stats.row_count == 0) {
@@ -335,6 +357,7 @@ void Statistics::on_rows_inserted(oid_t table_oid, size_t rows) {
 }
 
 void Statistics::on_rows_deleted(oid_t table_oid, size_t rows) {
+  std::unique_lock lock(mutex_);
   auto it = table_stats_.find(table_oid);
   if (it == table_stats_.end()) {
     return;
@@ -354,6 +377,12 @@ void Statistics::on_rows_deleted(oid_t table_oid, size_t rows) {
 }
 
 const TableStatistics *Statistics::get_table_stats(oid_t table_oid) const {
+  std::shared_lock lock(mutex_);
+  return get_table_stats_impl(table_oid);
+}
+
+const TableStatistics *
+Statistics::get_table_stats_impl(oid_t table_oid) const {
   auto it = table_stats_.find(table_oid);
   return (it != table_stats_.end()) ? &it->second : nullptr;
 }

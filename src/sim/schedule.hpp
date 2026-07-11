@@ -39,6 +39,15 @@ struct Schedule {
   /// its overflow flushes then append without becoming durable, producing a
   /// real unsynced WAL tail for the crash to lose/tear.
   bool arm_wal_sync_failures = false;
+  /// Steal the committed data pages the instant the in-flight loser begins,
+  /// before its writes dirty them further and before arm_wal_sync_failures
+  /// poisons the log. At that point the committed pages' WAL is already durable,
+  /// so the WAL-before-page guard lets them reach disk unsynced; the crash then
+  /// loses them and recovery redoes them from the durable log. This is the only
+  /// point a page steal produces a genuine unsynced-committed-page loss once the
+  /// same run also arms WAL-sync failures (which otherwise, correctly, blocks
+  /// every steal because no page may precede its log to disk).
+  bool steal_committed_at_inflight_begin = false;
 
   // ── Anti-vacuity contract, asserted by the schedule sweep test ────────────
   /// Every fault kind listed here must fire at least once across the sweep's

@@ -5,6 +5,8 @@
 
 #include "transaction/transaction_manager.hpp"
 
+#include <algorithm>
+#include <shared_mutex>
 #include <unordered_set>
 
 #include "common/logger.hpp"
@@ -112,6 +114,26 @@ void TransactionManager::commit(Transaction* txn) {
 
     // Remove from active transactions
     txn_map_.erase(txn->txn_id());
+
+    // Garbage-collect version chains no remaining snapshot can observe. The
+    // bound is the oldest active snapshot, or the current clock value when
+    // idle (every retired version is then unreachable). Versions retired by
+    // THIS commit carry timestamps newer than any currently active snapshot,
+    // so while the bound is pinned by an old transaction a re-run collects
+    // nothing — skip the store-wide walk until the bound actually advances.
+    // Runs under mutex_; the store takes its own latch, and nothing the
+    // store calls ever takes mutex_, so the order is acyclic.
+    if (version_store_ && mvcc_) {
+        uint64_t min_active_start_ts = mvcc_->current_timestamp();
+        for (const auto& [id, active] : txn_map_) {
+            min_active_start_ts =
+                std::min(min_active_start_ts, active->start_ts());
+        }
+        if (min_active_start_ts > last_gc_bound_) {
+            last_gc_bound_ = min_active_start_ts;
+            version_store_->gc(min_active_start_ts);
+        }
+    }
 }
 
 void TransactionManager::abort(Transaction* txn) {
@@ -250,6 +272,13 @@ void TransactionManager::undo_write_record(const WriteRecord& record) {
                          record.rid.page_id, record.rid.slot_id);
                 break;
             }
+            // State-checked: a still-occupied slot means the physical delete
+            // never ran (e.g. a relocation that failed between its version
+            // conversion and the slot free) — nothing to restore.
+            Tuple existing;
+            if (heap->get_tuple(record.rid, &existing).ok()) {
+                break;
+            }
             Tuple restored(record.old_data, record.rid);
             Status status = heap->restore_tuple(record.rid, restored);
             if (!status.ok()) {
@@ -297,18 +326,40 @@ size_t TransactionManager::active_transaction_count() const {
     return txn_map_.size();
 }
 
+void TransactionManager::stamp_page_lsn(RID rid, lsn_t lsn) {
+    if (buffer_pool_ == nullptr || lsn == INVALID_LSN || rid.page_id < 0) {
+        return;
+    }
+    // Record the page's highest applied LSN so the buffer pool's WAL flush hook
+    // can enforce WAL-before-page and recovery can gate idempotent redo. The
+    // executor mutated the page's bytes just before this call, so it is already
+    // dirty; marking it dirty again on unpin is harmless.
+    Page* page = buffer_pool_->fetch_page(rid.page_id);
+    if (page == nullptr) {
+        return;
+    }
+    if (lsn > page->lsn()) {
+        page->set_lsn(lsn);
+    }
+    buffer_pool_->unpin_page(rid.page_id, true);
+}
+
 lsn_t TransactionManager::log_insert(Transaction* txn, oid_t table_oid, RID rid,
                                      const std::vector<char>& tuple_data) {
     if (txn == nullptr) {
         return INVALID_LSN;
     }
 
+    // The checkpoint barrier is held (shared) by the heap write path across the
+    // whole mutate + append + page-LSN stamp, so this method does not take it —
+    // see TableHeap::insert_tuple / checkpoint_barrier().
     lsn_t lsn = INVALID_LSN;
     if (wal_manager_) {
         LogRecord record =
             LogRecord::make_insert(txn->txn_id(), txn->prev_lsn(), table_oid, rid, tuple_data);
         lsn = wal_manager_->append_log(record);
         txn->set_prev_lsn(lsn);
+        stamp_page_lsn(rid, lsn);
     }
 
     // Always track write set for abort undo (even without WAL)
@@ -323,12 +374,14 @@ lsn_t TransactionManager::log_delete(Transaction* txn, oid_t table_oid, RID rid,
         return INVALID_LSN;
     }
 
+    // Barrier held by TableHeap::delete_tuple's logging hook — see log_insert.
     lsn_t lsn = INVALID_LSN;
     if (wal_manager_) {
         LogRecord record =
             LogRecord::make_delete(txn->txn_id(), txn->prev_lsn(), table_oid, rid, tuple_data);
         lsn = wal_manager_->append_log(record);
         txn->set_prev_lsn(lsn);
+        stamp_page_lsn(rid, lsn);
     }
 
     // Always track write set with old data for abort undo
@@ -344,12 +397,15 @@ lsn_t TransactionManager::log_update(Transaction* txn, oid_t table_oid, RID rid,
         return INVALID_LSN;
     }
 
+    // Barrier held by TableHeap::update_tuple_in_place's logging hook — see
+    // log_insert.
     lsn_t lsn = INVALID_LSN;
     if (wal_manager_) {
         LogRecord record = LogRecord::make_update(txn->txn_id(), txn->prev_lsn(), table_oid, rid,
                                                   old_data, new_data);
         lsn = wal_manager_->append_log(record);
         txn->set_prev_lsn(lsn);
+        stamp_page_lsn(rid, lsn);
     }
 
     // Always track write set with old data for abort undo

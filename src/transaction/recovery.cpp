@@ -121,7 +121,8 @@ Status RecoveryManager::recover() {
 }
 
 Status RecoveryManager::create_checkpoint(
-    const std::vector<txn_id_t> &active_txn_ids) {
+    const std::vector<txn_id_t> &active_txn_ids,
+    std::shared_mutex *write_barrier) {
   if (!wal_) {
     return Status::InvalidArgument("No WAL manager provided");
   }
@@ -133,19 +134,33 @@ Status RecoveryManager::create_checkpoint(
   // buffer pool no pages can be flushed, so no anchor is recorded and
   // recovery falls back to a full page-LSN-gated scan.
   //
-  // SINGLE-THREADED ONLY: this ordering assumes no writer runs concurrently
-  // (see the class doc). A writer holding a pre-anchor LSN that dirties its
-  // page after flush_all_pages would be skipped by anchored redo without
-  // being durable. WP7's concurrent wiring must quiesce writers here or
-  // switch to a real dirty-page-table (min recLSN) anchor.
+  // Quiesce writers for the capture+flush window: with the barrier held
+  // exclusively, no logging writer can be mid-append (they take it shared
+  // across append + page-LSN stamp), so every record with LSN < begin_lsn has
+  // already stamped and dirtied its page and is captured by flush_all_pages.
+  // A null barrier keeps the historical single-threaded contract. The lock is
+  // released as soon as the flush window closes: appending the CHECKPOINT
+  // record itself needs no quiesce.
   lsn_t begin_lsn = INVALID_LSN;
-  if (buffer_pool_) {
-    begin_lsn = wal_->next_lsn();
-    Status flush_status = wal_->flush();
-    if (!flush_status.ok()) {
-      return flush_status;
+  {
+    std::unique_lock<std::shared_mutex> quiesce;
+    if (write_barrier != nullptr) {
+      quiesce = std::unique_lock<std::shared_mutex>(*write_barrier);
     }
-    buffer_pool_->flush_all_pages();
+    if (buffer_pool_) {
+      begin_lsn = wal_->next_lsn();
+      Status flush_status = wal_->flush();
+      if (!flush_status.ok()) {
+        return flush_status;
+      }
+      // The anchor is a promise that every pre-anchor effect is on disk; a
+      // page that failed to flush breaks that promise, so surface the error
+      // rather than record an unsound anchor.
+      Status pages_flushed = buffer_pool_->flush_all_pages();
+      if (!pages_flushed.ok()) {
+        return pages_flushed;
+      }
+    }
   }
 
   LogRecord checkpoint = LogRecord::make_checkpoint(active_txn_ids, begin_lsn);
