@@ -34,6 +34,50 @@ jobs:
         run: ctest --test-dir build --output-on-failure -C Release
 
   # ───────────────────────────────────────────────────────────────────────────
+  # Terminal UI (ENTROPY_BUILD_TUI=ON). The TUI is OFF by default, so the
+  # build-test matrix above never compiles it; this job builds it explicitly so
+  # an engine change that breaks the UI — its query console runs real SQL
+  # through the public Database API — fails CI instead of rotting silently.
+  # GitHub Actions sets CI=true, which turns on -Werror tree-wide, so the TUI
+  # sources are held to the same warning bar as the engine (FTXUI itself is
+  # fetched from source and built with warnings suppressed as a vendored dep).
+  #
+  # Linux/GCC only. FTXUI is cross-platform, but building it (and the engine's
+  # strict warning set) under Windows/MSVC /WX and macOS/Apple-clang -Werror is
+  # a separate portability question; gating the UI on Linux is enough to keep it
+  # from bit-rotting against the engine, which is this job's purpose.
+  # ───────────────────────────────────────────────────────────────────────────
+  tui:
+    name: terminal UI build (ubuntu)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure with the TUI enabled
+        run: >-
+          cmake -S . -B build-tui
+          -DENTROPY_BUILD_TUI=ON
+          -DENTROPY_BUILD_TESTS=OFF
+          -DENTROPY_BUILD_EXAMPLES=OFF
+          -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build the TUI
+        run: cmake --build build-tui --target entropy-tui --parallel
+
+      # Headless frame renders (--capture-frame draws one frame to stdout and
+      # exits) prove the binary actually runs, not just links. The console frame
+      # seeds a temp database and runs real SELECTs through the engine, so
+      # asserting a seeded row reached the rendered grid catches a query-path
+      # break at runtime that a compile-only check would miss.
+      - name: Smoke run (headless frame render)
+        run: |
+          ./build-tui/tui/entropy-tui --capture-frame boot --phase 0.5 > /dev/null
+          ./build-tui/tui/entropy-tui --capture-frame dashboard > /dev/null
+          ./build-tui/tui/entropy-tui --capture-frame console | grep -q crash_storm
+
+  # ───────────────────────────────────────────────────────────────────────────
   # AddressSanitizer+UBSan and ThreadSanitizer (Linux). Same pipeline
   # parameterized by the instrumentation flags; RelWithDebInfo so reports carry
   # symbols. The full suite runs serially (parallel ctest collides on shared
