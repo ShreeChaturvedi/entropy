@@ -21,10 +21,11 @@
 ## Project Overview
 
 **Entropy** is a high-performance relational database management system (RDBMS) built from scratch in modern C++20. It demonstrates systems programming expertise through:
-- Custom B+ tree storage engine
-- MVCC-based transaction management
+- Custom slotted-page storage with a latch-crabbing B+ tree and CRC-32 page checksums
+- MVCC-based transaction management (snapshot isolation, first-updater-wins)
 - Cost-based query optimization
-- ACID compliance with WAL
+- ACID compliance with WAL and ARIES-style crash recovery
+- A deterministic, FoundationDB-style crash simulator with seeded fault injection
 
 **Scope Boundaries** (explicitly NOT implementing):
 - Distributed features / replication
@@ -101,6 +102,8 @@ entropy/
 │   │   ├── hash_index.cpp
 │   │   ├── table_heap.hpp      # Table storage (heap file)
 │   │   ├── table_heap.cpp
+│   │   ├── table_page.hpp      # Slotted page for heap records
+│   │   ├── table_page.cpp
 │   │   ├── tuple.hpp           # Row/tuple representation
 │   │   └── tuple.cpp
 │   │
@@ -108,6 +111,8 @@ entropy/
 │   │   ├── CMakeLists.txt
 │   │   ├── catalog.hpp         # System catalog
 │   │   ├── catalog.cpp
+│   │   ├── catalog_manifest.hpp    # Durable, fsync'd catalog manifest
+│   │   ├── catalog_manifest.cpp
 │   │   ├── schema.hpp          # Table schema definition
 │   │   ├── schema.cpp
 │   │   ├── column.hpp          # Column metadata
@@ -119,10 +124,12 @@ entropy/
 │   │   ├── transaction.cpp
 │   │   ├── transaction_manager.hpp   # Transaction lifecycle
 │   │   ├── transaction_manager.cpp
-│   │   ├── lock_manager.hpp    # Lock management (2PL)
+│   │   ├── lock_manager.hpp    # Row-level lock manager, deadlock detection
 │   │   ├── lock_manager.cpp
-│   │   ├── mvcc.hpp            # MVCC implementation
+│   │   ├── mvcc.hpp            # MVCC visibility rules
 │   │   ├── mvcc.cpp
+│   │   ├── version_store.hpp   # Per-RID version chains, conflict detection
+│   │   ├── version_store.cpp
 │   │   ├── wal.hpp             # Write-ahead log
 │   │   ├── wal.cpp
 │   │   ├── log_record.hpp      # WAL record format
@@ -178,11 +185,23 @@ entropy/
 │   │   ├── binder.hpp          # Name resolution
 │   │   └── binder.cpp
 │   │
-│   └── api/                    # Public API implementation
-│       ├── CMakeLists.txt
-│       ├── database.cpp        # Database class impl
-│       ├── result.cpp          # Result set handling
-│       └── shell.cpp           # Interactive SQL shell
+│   ├── api/                    # Public API implementation
+│   │   ├── CMakeLists.txt
+│   │   ├── database.cpp        # Database class impl
+│   │   ├── result.cpp          # Result set handling
+│   │   ├── shell.cpp           # Interactive SQL shell
+│   │   └── shell_utils.cpp     # Shell statement splitting
+│   │
+│   └── sim/                    # Deterministic crash simulator
+│       ├── fault.hpp           # Fault kinds, seeded PRNG streams
+│       ├── schedule.hpp        # Replayable crash schedules
+│       ├── schedule.cpp
+│       ├── sim_disk_manager.hpp    # Fault-injecting page device
+│       ├── sim_disk_manager.cpp
+│       ├── sim_log_store.hpp   # Fault-injecting WAL store
+│       ├── sim_log_store.cpp
+│       ├── workload.hpp        # Workload + oracle + invariant checks
+│       └── workload.cpp
 │
 ├── tests/                      # Test files
 │   ├── CMakeLists.txt
@@ -221,8 +240,12 @@ entropy/
 │   └── transaction_example.cpp
 │
 ├── tools/                      # Development tools
-│   ├── format.sh               # Code formatting script
-│   └── coverage.sh             # Coverage report script
+│   ├── CMakeLists.txt
+│   └── entropy-sim/            # Crash-simulation CLI runner
+│       └── main.cpp
+│
+├── packaging/                  # Downstream packaging checks
+│   └── consumer-smoke/         # Standalone find_package(entropy) consumer
 │
 └── third_party/                # External dependencies (gitignore'd or submodules)
     └── README.md               # Instructions for dependencies
@@ -292,14 +315,16 @@ entropy/
 | BufferPool | ✅ Complete | `buffer_pool.hpp` | `buffer_pool.cpp` | 5 passing |
 | LRUReplacer | ✅ Complete | `lru_replacer.hpp` | `lru_replacer.cpp` | 6 passing |
 | B+Tree | ✅ Complete | `b_plus_tree.hpp` | `b_plus_tree.cpp` | 50 passing |
-| HashIndex | ⭕ Not Started | stub | stub | - |
+| HashIndex | ✅ Complete | `hash_index.hpp` | header-only | `hash_index_test.cpp` (in-memory extendible hash) |
 | TableHeap | ✅ Complete | `table_heap.hpp` | `table_heap.cpp` | 23 passing |
+| TablePage | ✅ Complete | `table_page.hpp` | `table_page.cpp` | `table_page_test.cpp` |
 | Tuple | ✅ Complete | `tuple.hpp` | `tuple.cpp` | 46 passing |
 
 ### Catalog Layer
 | Component | Status | Header | Implementation | Tests |
 |-----------|--------|--------|----------------|-------|
 | Catalog | ✅ Complete | `catalog.hpp` | `catalog.cpp` | 8 passing |
+| CatalogManifest | ✅ Complete | `catalog_manifest.hpp` | `catalog_manifest.cpp` | `catalog_persistence_test.cpp` |
 | Schema | ✅ Complete | `schema.hpp` | `schema.cpp` | included |
 | Column | ✅ Complete | `column.hpp` | `column.cpp` | included |
 
@@ -310,6 +335,7 @@ entropy/
 | TransactionManager | ✅ Complete | `transaction_manager.hpp` | `transaction_manager.cpp` | 11 passing |
 | LockManager | ✅ Complete | `lock_manager.hpp` | `lock_manager.cpp` | 26 passing |
 | MVCC | ✅ Complete | `mvcc.hpp` | `mvcc.cpp` | 11 passing |
+| VersionStore | ✅ Complete | `version_store.hpp` | `version_store.cpp` | `version_store_test.cpp` |
 | WAL | ✅ Complete | `wal.hpp` | `wal.cpp` | 6 passing |
 | LogRecord | ✅ Complete | `log_record.hpp` | `log_record.cpp` | 14 passing |
 | Recovery | ✅ Complete | `recovery.hpp` | `recovery.cpp` | 8 passing |
@@ -343,7 +369,7 @@ entropy/
 ### Optimizer Layer
 | Component | Status | Header | Implementation | Tests |
 |-----------|--------|--------|----------------|-------|
-| Optimizer | 🟡 Partial | `optimizer.hpp` | `optimizer.cpp` | - |
+| Optimizer | ✅ Complete | `optimizer.hpp` | `optimizer.cpp` | `optimizer_test.cpp` |
 | CostModel | ✅ Complete | `cost_model.hpp` | `cost_model.cpp` | - |
 | Statistics | ✅ Complete | `statistics.hpp` | `statistics.cpp` | - |
 | IndexSelector | ✅ Complete | `index_selector.hpp` | `index_selector.cpp` | - |
@@ -354,7 +380,16 @@ entropy/
 |-----------|--------|--------|----------------|-------|
 | Database | ✅ Complete | `database.hpp` | `database.cpp` | 16 passing |
 | Result | ✅ Complete | `result.hpp` | `result.cpp` | included |
-| Shell | 🟡 Partial | - | `shell.cpp` | - |
+| Shell | ✅ Complete | `shell.hpp` | `shell.cpp` | interactive shell with `.help`/`.tables`/`.schema` meta-commands |
+
+### Simulation Layer
+| Component | Status | Header | Implementation | Tests |
+|-----------|--------|--------|----------------|-------|
+| SimDiskManager | ✅ Complete | `sim_disk_manager.hpp` | `sim_disk_manager.cpp` | `sim_test.cpp` |
+| SimLogStore | ✅ Complete | `sim_log_store.hpp` | `sim_log_store.cpp` | `sim_test.cpp` |
+| Schedule/Fault | ✅ Complete | `schedule.hpp`, `fault.hpp` | `schedule.cpp` | `sim_test.cpp` |
+| Workload/Oracle | ✅ Complete | `workload.hpp` | `workload.cpp` | `sim_test.cpp` |
+| entropy-sim CLI | ✅ Complete | - | `tools/entropy-sim/main.cpp` | run in CI |
 
 ---
 
@@ -423,8 +458,8 @@ Leaf Node:
 2. **B+ Tree**: Latch crabbing (hand-over-hand page latches) — concurrent
    readers and range scans; structural writers (insert/delete) are serialized
    and shed ancestor latches once a node is split/merge-safe
-3. **Transaction Manager**: Centralized lock manager with 2PL + MVCC
-4. **WAL**: Single-writer with group commit optimization
+3. **Transaction Manager**: Centralized lock manager with row-level locking + MVCC
+4. **WAL**: Single-writer, fsync'd and forced to the commit LSN on commit
 
 ### Lock Hierarchy (to prevent deadlocks)
 1. Lock Manager mutex
@@ -456,7 +491,10 @@ load). See the design notes in b_plus_tree.cpp for the full argument.
 | Google Test | 1.14+ | Unit testing | FetchContent |
 | Google Benchmark | 1.8+ | Performance benchmarks | FetchContent |
 | spdlog | 1.12+ | Logging | FetchContent |
-| hsql | latest | SQL parsing | FetchContent or submodule |
+| SQLite3 | system | Optional benchmark comparison baseline | `find_package` (opt-in) |
+
+The SQL parser is hand-written (see the Technology Stack table). Entropy takes
+no third-party parsing dependency.
 
 ---
 
@@ -515,13 +553,13 @@ load). See the design notes in b_plus_tree.cpp for the full argument.
 
 #### ADR-002: Index Structure
 - **Context**: Primary index implementation choice
-- **Decision**: B+ tree as primary, hash index for equality (planned)
+- **Decision**: B+ tree as primary, extendible hash index for equality
 - **Consequences**: B+ tree handles range queries, hash for O(1) point lookups
 
 #### ADR-003: Concurrency Control
 - **Context**: How to handle concurrent transactions
-- **Decision**: MVCC with snapshot isolation + 2PL lock manager
-- **Consequences**: Readers don't block writers, requires garbage collection of old versions
+- **Decision**: MVCC snapshot isolation + lock manager (wait-for-graph deadlock detection, wait-die victim selection)
+- **Consequences**: Readers don't block writers. Write-write conflicts resolved first-updater-wins. Old versions need garbage collection.
 
 #### ADR-004: SQL Parser Design
 - **Context**: Whether to use external SQL parser library
@@ -633,6 +671,36 @@ load). See the design notes in b_plus_tree.cpp for the full argument.
   - Three modes: POINT_LOOKUP, RANGE_SCAN, FULL_SCAN
 - **Trade-offs**: Index must exist and be maintained
 
+#### ADR-013: Page Checksums
+- **Context**: Detecting torn writes and silent corruption in the page store
+- **Decision**: CRC-32 (IEEE polynomial 0xEDB88320) stamped into the page header on write, verified on every read, on by default
+- **Rationale**:
+  - The disk manager rejects a mismatching page with an explicit `Status::Corruption` instead of returning garbage
+  - An all-zero page is a valid empty page, so freshly extended files verify cleanly
+  - Checksum lives at a fixed header offset and is excluded from its own computation
+- **Trade-offs**: A CRC pass per page read. Detects corruption, does not repair it.
+
+#### ADR-014: ARIES-lite Crash Recovery
+- **Context**: Restoring a consistent, durable state after a crash
+- **Decision**: WAL-based recovery in analysis, redo, and undo phases, anchored at the last checkpoint
+- **Rationale**:
+  - Analysis scans forward from the last CHECKPOINT to rebuild the loser set and the redo start LSN
+  - Redo is page-LSN-gated: a record whose LSN is at or below the page LSN is skipped, so redo is idempotent
+  - Undo rolls losers back and rollback emits compensation log records so re-runs stay safe
+  - Checkpoints flush the WAL and dirty pages, then advance the redo anchor
+- **Trade-offs**: Checkpoints are taken at startup and after DROP TABLE, not on a periodic timer.
+
+#### ADR-015: Deterministic Crash Simulator
+- **Context**: Proving recovery is correct under adversarial crash timing
+- **Decision**: A FoundationDB-style single-threaded simulator that injects storage faults from a seed and replays them
+- **Rationale**:
+  - One 64-bit seed derives independent PRNG streams (SplitMix64) for the workload, page device, and log store, so a run is fully reproducible
+  - `SimDiskManager` and `SimLogStore` resolve unsynced writes at a simulated crash to lost, torn, or durably-kept outcomes, and can inject transient write errors
+  - Named schedules place the crash at specific points (for example between WAL flush and page flush)
+  - After recovery an oracle checks invariants: every committed row present byte for byte, no uncommitted or rolled-back write visible
+  - The `entropy-sim` CLI runs seed sweeps and writes one JSONL line per run
+- **Trade-offs**: Models faults at the storage seam. It does not inject random in-page bit flips (checksums cover that on the read path).
+
 ---
 
 ## File Dependencies Graph
@@ -695,5 +763,5 @@ execution/executor.hpp
 
 ---
 
-*Last Updated: 2024-12-17*
-*Version: 0.1.0*
+*Last Updated: 2026-07-11*
+*Version: 0.1.1*
