@@ -98,10 +98,18 @@ void TransactionManager::abort(Transaction* txn) {
 
     std::lock_guard<std::mutex> lock(mutex_);
 
-    if (txn->state() != TransactionState::GROWING &&
-        txn->state() != TransactionState::SHRINKING) {
+    // A deadlock victim is already marked ABORTED by the lock manager (so its
+    // waiter loops terminate), but nothing has been finalized: its writes must
+    // still be undone, the WAL ABORT record appended, and the transaction
+    // removed from the active set. Let it through; refuse everything else that
+    // is not active.
+    const TransactionState state = txn->state();
+    const bool deadlock_victim_pending =
+        state == TransactionState::ABORTED && txn->aborted_by_deadlock();
+    if (state != TransactionState::GROWING &&
+        state != TransactionState::SHRINKING && !deadlock_victim_pending) {
         LOG_WARN("Attempting to abort transaction {} in state {}", txn->txn_id(),
-                 transaction_state_to_string(txn->state()));
+                 transaction_state_to_string(state));
         return;
     }
 

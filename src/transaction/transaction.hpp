@@ -125,6 +125,7 @@ public:
     Transaction(Transaction&& other) noexcept
         : txn_id_(other.txn_id_),
           state_(other.state_.load(std::memory_order_relaxed)),
+          aborted_by_deadlock_(other.aborted_by_deadlock_.load(std::memory_order_relaxed)),
           isolation_level_(other.isolation_level_),
           prev_lsn_(other.prev_lsn_),
           start_ts_(other.start_ts_),
@@ -138,6 +139,9 @@ public:
             txn_id_ = other.txn_id_;
             state_.store(other.state_.load(std::memory_order_relaxed),
                          std::memory_order_relaxed);
+            aborted_by_deadlock_.store(
+                other.aborted_by_deadlock_.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
             isolation_level_ = other.isolation_level_;
             prev_lsn_ = other.prev_lsn_;
             start_ts_ = other.start_ts_;
@@ -206,6 +210,27 @@ public:
         return s == TransactionState::GROWING || s == TransactionState::SHRINKING;
     }
 
+    /**
+     * @brief Mark this transaction as a deadlock victim
+     *
+     * Set by the LockManager (possibly from another thread) together with
+     * set_state(ABORTED) so the victim's waiter loops terminate. The mark tells
+     * TransactionManager::abort() that although the state is already ABORTED,
+     * the abort has NOT been finalized: write-set undo, the WAL ABORT record,
+     * and removal from the active-transaction map must still run.
+     */
+    void set_aborted_by_deadlock() noexcept {
+        aborted_by_deadlock_.store(true, std::memory_order_release);
+    }
+
+    /**
+     * @brief True if this transaction was marked ABORTED as a deadlock victim
+     * and still needs abort finalization (undo + WAL ABORT + deregistration)
+     */
+    [[nodiscard]] bool aborted_by_deadlock() const noexcept {
+        return aborted_by_deadlock_.load(std::memory_order_acquire);
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Write Set Management
     // ─────────────────────────────────────────────────────────────────────────
@@ -272,6 +297,9 @@ private:
     // Atomic: read cross-thread by the lock manager's waiter loops while the
     // owning thread (or a deadlock-victim path) mutates it via set_state().
     std::atomic<TransactionState> state_{TransactionState::GROWING};
+    // Atomic: set under the lock manager's latch, read by the victim's own
+    // thread under the TransactionManager mutex (no common lock between them).
+    std::atomic<bool> aborted_by_deadlock_{false};
     IsolationLevel isolation_level_;
 
     // WAL linkage
