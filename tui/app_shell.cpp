@@ -1,7 +1,11 @@
 #include "app_shell.hpp"
 
+#include <atomic>
+#include <chrono>
+#include <cmath>
 #include <iostream>
 #include <string>
+#include <thread>
 
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/event.hpp>
@@ -27,12 +31,13 @@ namespace {
 enum View : int { kBoot = 0, kDashboard = 1, kConsole = 2 };
 
 /// Build the fixed-demo-data element for a named screen. Returns nullptr for an
-/// unknown name.
+/// unknown name. @p galaxy_phase is forwarded to the boot galaxy's sweep.
 [[nodiscard]] Element BuildScreenElement(const std::string &which,
                                          const DataSet &data,
-                                         const std::string &version) {
+                                         const std::string &version,
+                                         double galaxy_phase) {
   if (which == "boot") {
-    return BootScreen(data, /*selected_index=*/0, version);
+    return BootScreen(data, /*selected_index=*/0, version, galaxy_phase);
   }
   if (which == "dashboard") {
     return MakeDashboardScreen(data)->Render();
@@ -53,13 +58,26 @@ int RunApp() {
   int menu_sel = 0;
   const int menu_count = static_cast<int>(BootMenu().size());
 
-  Component boot = Renderer([&] { return BootScreen(data, menu_sel, version); });
+  auto screen = ScreenInteractive::Fullscreen();
+
+  // Clock-driven galaxy sweep: the boot mark's animated sheen rides a phase that
+  // cycles once every kSweepPeriod seconds. Reading a wall clock (rather than
+  // counting frames) keeps the sweep speed independent of the redraw rate.
+  const auto start = std::chrono::steady_clock::now();
+  constexpr double kSweepPeriod = 3.6;  // seconds per full diagonal sweep
+  const auto boot_phase = [&] {
+    const double t = std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - start)
+                         .count();
+    return std::fmod(t / kSweepPeriod, 1.0);
+  };
+
+  Component boot =
+      Renderer([&] { return BootScreen(data, menu_sel, version, boot_phase()); });
   Component dashboard = MakeDashboardScreen(data);
   Component console = MakeQueryConsoleScreen();
 
   Component tab = Container::Tab({boot, dashboard, console}, &view);
-
-  auto screen = ScreenInteractive::Fullscreen();
 
   // Map the current menu row to an action.
   const auto activate = [&] {
@@ -128,11 +146,31 @@ int RunApp() {
     return false;
   });
 
+  // Animation pump: post a redraw ~17x/second so the boot galaxy's sheen sweep
+  // advances smoothly. Only the boot screen animates, so skip the post on the
+  // static dashboard/console to avoid needless re-renders there. Reading `view`
+  // across threads is benign here: it is a lone int used only to decide whether
+  // to request a frame, so a stale value costs at most one extra or missed
+  // frame, never a torn read.
+  std::atomic<bool> running{true};
+  std::thread ticker([&] {
+    while (running.load(std::memory_order_relaxed)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(58));
+      if (view == kBoot) {
+        screen.PostEvent(Event::Custom);
+      }
+    }
+  });
+
   screen.Loop(root);
+
+  running.store(false, std::memory_order_relaxed);
+  ticker.join();
   return 0;
 }
 
-int CaptureFrame(const std::string &which, int cols, int rows) {
+int CaptureFrame(const std::string &which, int cols, int rows,
+                 double galaxy_phase) {
   // Pin TrueColor so the RGB/HSV ramps emit 24-bit ANSI regardless of the
   // capturing terminal's advertised support.
   Terminal::SetColorSupport(Terminal::TrueColor);
@@ -140,7 +178,7 @@ int CaptureFrame(const std::string &which, int cols, int rows) {
   const DataSet data = LoadDemoData();
   const std::string version = entropy::version();
 
-  Element doc = BuildScreenElement(which, data, version);
+  Element doc = BuildScreenElement(which, data, version, galaxy_phase);
   if (!doc) {
     std::cerr << "entropy-tui: unknown screen '" << which
               << "' (expected boot | dashboard | console)\n";

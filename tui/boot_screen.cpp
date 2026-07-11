@@ -80,36 +80,49 @@ namespace {
 }  // namespace
 
 Element BootScreen(const DataSet &data, int selected_index,
-                   const std::string &version) {
-  Element mark = GalaxyMark(26, 13);
+                   const std::string &version, double galaxy_phase) {
+  Element mark = GalaxyMark(26, 13, galaxy_phase);
 
+  // The text column is pinned to a fixed width so the right-aligned menu keys
+  // land inside a stable column and never ride out onto the panel border (the
+  // clip that broke the legend into stray vertical bars near 120 cols). The
+  // longest line ("Replayable fault injection ...") fits comfortably here.
+  constexpr int kTextWidth = 64;
   Element right = vbox({
-      hbox({Wordmark(), text("   "),
-            text("v" + version) | color(theme::kInk2())}),
-      text(""),
-      text("Deterministic crash-recovery simulator") | color(theme::kInk1()),
-      text("Replayable fault injection · WAL redo/undo · invariant oracle") |
-          color(theme::kInk2()),
-      text(""),
-      text(""),
-      Menu(selected_index),
-  });
+                      hbox({Wordmark(), text("   "),
+                            text("v" + version) | color(theme::kInk2())}),
+                      text(""),
+                      text("Deterministic crash-recovery simulator") |
+                          color(theme::kInk1()),
+                      text("Replayable fault injection · WAL redo/undo · "
+                           "invariant oracle") |
+                          color(theme::kInk2()),
+                      text(""),
+                      text(""),
+                      Menu(selected_index),
+                  }) |
+                  ftxui::size(WIDTH, EQUAL, kTextWidth);
 
   Element card = hbox({
-                     mark,
-                     text("   "),
-                     right | flex,
-                 });
+      mark,
+      text("   "),
+      std::move(right),
+  });
 
+  // A blank line and a two-space gutter on every side keep the content off the
+  // rounded border so nothing clips at the frame, at 120 cols or wider.
   Element bordered = vbox({
-                         card,
+                         text(""),
+                         hbox({text("  "), std::move(card), text("  ")}),
+                         text(""),
                      }) |
-                     borderStyled(ROUNDED, theme::kInk3()) | bgcolor(theme::kPanel());
+                     borderStyled(ROUNDED, theme::kInk3()) |
+                     bgcolor(theme::kPanel());
 
   // Center the card in the page, footer pinned to the bottom.
   return vbox({
              filler(),
-             hbox({filler(), bordered, filler()}),
+             hbox({filler(), std::move(bordered), filler()}),
              filler(),
              StatsFooter(data, version),
          }) |

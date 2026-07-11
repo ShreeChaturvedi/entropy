@@ -28,8 +28,12 @@ struct BootMenuItem {
 [[nodiscard]] const std::vector<BootMenuItem> &BootMenu();
 
 /// Render the boot screen with @p selected_index highlighted (amber). @p data
-/// drives the stats footer; @p version fills the wordmark line.
+/// drives the stats footer; @p version fills the wordmark line. @p galaxy_phase
+/// is forwarded to the galaxy mark: the default -1 renders the static mark
+/// (baked luster only), while a value in [0,1] rides an animated sheen sweep
+/// across the disc for a moving capture.
 [[nodiscard]] ftxui::Element BootScreen(const DataSet &data, int selected_index,
-                                        const std::string &version);
+                                        const std::string &version,
+                                        double galaxy_phase = -1.0);
 
 }  // namespace entropy::tui
