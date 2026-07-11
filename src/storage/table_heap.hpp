@@ -23,6 +23,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <unordered_set>
 #include <vector>
 
 #include "common/types.hpp"
@@ -189,9 +190,10 @@ public:
    * @brief Collect the ids of every page currently owned by the heap
    *
    * Used when dropping a table to purge version-store chains keyed by RIDs on
-   * these pages before the pages are reclaimed for reuse.
+   * these pages before the pages are reclaimed for reuse (hence a set: its
+   * sole consumer does membership tests).
    */
-  [[nodiscard]] std::vector<page_id_t> page_ids() const;
+  [[nodiscard]] std::unordered_set<page_id_t> page_ids() const;
 
   // ─────────────────────────────────────────────────────────────────────────
   // Accessors

@@ -245,6 +245,10 @@ private:
     TableResolver table_resolver_;
     std::unordered_map<txn_id_t, std::unique_ptr<Transaction>> txn_map_;
     txn_id_t next_txn_id_ = 1;
+    /// Highest version-GC bound already applied (guarded by mutex_). A commit
+    /// skips the store-wide GC walk while the oldest active snapshot pins the
+    /// bound, because nothing new can become collectible until it advances.
+    uint64_t last_gc_bound_ = 0;
     mutable std::mutex mutex_;
     // Quiesces logging writers against a concurrent checkpoint (see
     // checkpoint_barrier()). Separate from mutex_: the log methods do not hold
