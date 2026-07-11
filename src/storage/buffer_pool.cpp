@@ -74,7 +74,15 @@ Page* BufferPoolManager::fetch_page(page_id_t page_id) {
         if (!status.ok()) {
             LOG_ERROR("Failed to flush dirty page {}: {}", page->page_id(),
                       status.to_string());
-            free_list_.push_back(frame_id);
+            // The victim is still mapped in page_table_ and still dirty. Return
+            // its frame to the replacer as an eviction candidate, NOT to the
+            // free list: a free-list frame can be popped by new_page and
+            // reset() even though the victim's page id still resolves to it, so
+            // a re-fetch that pins the victim could then have its frame reset
+            // out from under the pin. Re-insertion keeps the single mapping and
+            // retries the flush on the next eviction. (unpin marks it evictable;
+            // its pin_count is already 0, which is why it was chosen here.)
+            replacer_->unpin(frame_id);
             return nullptr;
         }
     }
@@ -177,7 +185,10 @@ Page* BufferPoolManager::new_page(page_id_t* page_id) {
         if (!status.ok()) {
             LOG_ERROR("Failed to flush dirty page {}: {}", page->page_id(),
                       status.to_string());
-            free_list_.push_back(frame_id);
+            // Return the victim to the replacer, not the free list: it is still
+            // mapped and dirty, and a free-list frame can be reset() under a
+            // later pin (see fetch_page for the full rationale).
+            replacer_->unpin(frame_id);
             return nullptr;
         }
     }
