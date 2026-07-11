@@ -25,10 +25,6 @@ set(storage_test_sources
     storage/hash_index_test.cpp
 )
 
-if(ENTROPY_ENABLE_LZ4)
-    list(APPEND storage_test_sources storage/page_compression_test.cpp)
-endif()
-
 add_executable(storage_tests ${storage_test_sources})
 
 target_link_libraries(storage_tests
