@@ -72,6 +72,9 @@ private:
 
   std::unique_ptr<Statement> parse_statement();
   std::unique_ptr<SelectStatement> parse_select();
+  // Parse one item of the SELECT projection list (star, plain column, computed
+  // expression, or aggregate), including an optional `AS alias` / bare alias.
+  bool parse_select_column(SelectColumn *out);
   std::unique_ptr<InsertStatement> parse_insert();
   std::unique_ptr<UpdateStatement> parse_update();
   std::unique_ptr<DeleteStatement> parse_delete();
