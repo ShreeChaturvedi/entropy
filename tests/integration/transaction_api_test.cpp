@@ -699,7 +699,67 @@ TEST_F(TransactionApiTest, AbandonedTransactionRolledBackAtTeardown) {
 // a FRESH transaction: it is never told it is "already in a transaction" from
 // the stale binding, never sees the abandoned uncommitted write, and its own
 // explicit transaction commits cleanly.
+//
+// The recycled-id state is reproduced DETERMINISTICALLY via a test seam rather
+// than by hoping the OS recycles a std::thread::id: after opening an explicit
+// transaction and writing (uncommitted), orphan_current_session_for_testing()
+// leaves that binding under this thread's id but stamped with a session
+// identity this thread no longer owns — byte-for-byte the state a recycled id
+// inherits. Everything after the orphan runs as the fresh session that landed
+// on the recycled id. This exercises #87's identity validation on every
+// platform (Linux/macOS/Windows) with no reliance on OS thread-id reuse; the
+// natural end-to-end reuse path is additionally covered, where the OS actually
+// recycles ids, by RecycledThreadIdNaturalReuse below.
 TEST_F(TransactionApiTest, RecycledThreadIdGetsFreshTransaction) {
+  Database db(path_);
+  ASSERT_TRUE(db.execute("CREATE TABLE t (id INTEGER, v INTEGER)").ok());
+  ASSERT_TRUE(db.execute("INSERT INTO t VALUES (1, 0)").ok());
+
+  // A prior session opens an explicit transaction and writes, uncommitted...
+  ASSERT_TRUE(db.begin_transaction().ok());
+  ASSERT_TRUE(db.execute("UPDATE t SET v = 111 WHERE id = 1").ok());
+  // ...then its thread id is recycled: the binding stays under this id but now
+  // belongs to a session this caller does not own.
+  db.orphan_current_session_for_testing();
+
+  // Everything below runs as the FRESH session that landed on the recycled id.
+
+  // 1. Isolation: it sees the baseline, never the abandoned uncommitted write.
+  //    (Reads are lock-free MVCC snapshots, so this does not block on the still-
+  //    held row lock of the abandoned transaction.)
+  auto seen = db.execute("SELECT v FROM t WHERE id = 1");
+  ASSERT_TRUE(seen.ok()) << seen.status().to_string();
+  ASSERT_EQ(seen.row_count(), 1u);
+  EXPECT_EQ(seen.rows()[0][0].as_int32(), 0)
+      << "fresh session inherited the abandoned transaction's write";
+
+  // 2. begin_transaction() is NOT rejected as "already in a transaction" by the
+  //    stale binding; it rolls the abandoned transaction back (releasing its
+  //    locks) and rebinds this session freshly.
+  Status begun = db.begin_transaction();
+  EXPECT_TRUE(begun.ok()) << begun.to_string();
+  ASSERT_TRUE(db.execute("UPDATE t SET v = 222 WHERE id = 1").ok());
+  EXPECT_TRUE(db.commit().ok());
+
+  // 3. The abandoned write is gone and the fresh session's committed write
+  //    stands — proving the abandoned transaction's row lock was released (this
+  //    UPDATE never blocked on it) and its write was undone.
+  auto after = db.execute("SELECT v FROM t WHERE id = 1");
+  ASSERT_TRUE(after.ok()) << after.status().to_string();
+  ASSERT_EQ(after.row_count(), 1u);
+  EXPECT_EQ(after.rows()[0][0].as_int32(), 222);
+}
+
+// End-to-end companion to the deterministic seam test above: exercise the FULL
+// recycled-id lifecycle on platforms whose OS actually recycles a freshly-freed
+// std::thread::id (Linux/macOS reliably do). A thread abandons a transaction
+// and exits — its thread-exit guard rolls the transaction back and clears the
+// binding — and a sequentially-spawned thread reuses the just-freed id. That
+// reused id must behave as a fresh session. On platforms that do not recycle an
+// id within the bounded attempts (observed on Windows/MSVC), this SKIPS rather
+// than fails: the guarantee is still deterministically covered everywhere by
+// RecycledThreadIdGetsFreshTransaction.
+TEST_F(TransactionApiTest, RecycledThreadIdNaturalReuse) {
   Database db(path_);
   ASSERT_TRUE(db.execute("CREATE TABLE t (id INTEGER, v INTEGER)").ok());
   ASSERT_TRUE(db.execute("INSERT INTO t VALUES (1, 0)").ok());
@@ -737,12 +797,11 @@ TEST_F(TransactionApiTest, RecycledThreadIdGetsFreshTransaction) {
     });
     fresh.join();
   }
-  // On mainstream platforms a sequentially-spawned thread reuses the just-freed
-  // id, exercising the recycled-id path directly; the per-session assertions
-  // above hold regardless.
-  EXPECT_TRUE(observed_reuse)
-      << "thread id was not recycled within 64 attempts; the recycled-id path "
-         "went unexercised on this platform";
+  if (!observed_reuse) {
+    GTEST_SKIP() << "OS did not recycle the freed thread id within 64 attempts "
+                    "on this platform; the recycled-id guarantee is covered "
+                    "deterministically by RecycledThreadIdGetsFreshTransaction";
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
