@@ -6,8 +6,10 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <fstream>
 
 #include "storage/disk_manager.hpp"
+#include "storage/page.hpp"
 #include "test_utils.hpp"
 
 namespace entropy {
@@ -166,6 +168,69 @@ TEST(FileDiskManagerOptionsTest, CreateIfMissingFalseFailsOnMissingFile) {
 
     FileDiskManager dm(temp.string(), /*create_if_missing=*/false);
     EXPECT_FALSE(dm.is_open());
+}
+
+// With checksums enabled, a clean page round-trips and verifies, while a
+// torn/partial write (a byte flipped on disk after the stamp) is DETECTED at
+// read time as a Corruption Status instead of being silently returned.
+TEST(FileDiskManagerChecksumTest, RoundTripsAndDetectsTornPage) {
+    test::TempFile temp("dm_checksum_");
+    page_id_t page_id = 0;
+    {
+        FileDiskManager dm(temp.string(), /*create_if_missing=*/true,
+                           /*error_if_exists=*/false, /*enable_checksums=*/true);
+        ASSERT_TRUE(dm.is_open());
+        page_id = dm.allocate_page();
+
+        char page[config::kDefaultPageSize];
+        std::memset(page, 'A', sizeof(page));
+        ASSERT_TRUE(dm.write_page(page_id, page).ok());
+
+        // A clean read verifies its stamp and succeeds.
+        char read_back[config::kDefaultPageSize];
+        EXPECT_TRUE(dm.read_page(page_id, read_back).ok());
+    }
+
+    // Simulate a torn write: flip one payload byte on disk, leaving the stamped
+    // checksum stale. Offset 64 is well past the header checksum field (12-15).
+    {
+        std::fstream f(temp.string(),
+                       std::ios::binary | std::ios::in | std::ios::out);
+        ASSERT_TRUE(f.is_open());
+        f.seekp(64, std::ios::beg);
+        const char corrupt = 'B';  // the byte was 'A'
+        f.write(&corrupt, 1);
+        ASSERT_TRUE(f.good());
+    }
+
+    // Reopen and read: the stale checksum no longer matches the bytes.
+    FileDiskManager dm(temp.string(), /*create_if_missing=*/true,
+                       /*error_if_exists=*/false, /*enable_checksums=*/true);
+    ASSERT_TRUE(dm.is_open());
+    char read_back[config::kDefaultPageSize];
+    Status s = dm.read_page(page_id, read_back);
+    EXPECT_EQ(s.code(), StatusCode::kCorruption) << s.to_string();
+}
+
+// The checksum stamp lives in the page header, so a manager with checksums
+// DISABLED (the default) round-trips arbitrary bytes untouched and never
+// rejects them — the opt-in must not change behavior for existing callers.
+TEST(FileDiskManagerChecksumTest, DisabledLeavesBytesUntouched) {
+    test::TempFile temp("dm_nocksum_");
+    FileDiskManager dm(temp.string());  // checksums off by default
+    ASSERT_TRUE(dm.is_open());
+    page_id_t page_id = dm.allocate_page();
+
+    char page[config::kDefaultPageSize];
+    for (size_t i = 0; i < sizeof(page); ++i) {
+        page[i] = static_cast<char>((i * 7 + 1) % 256);
+    }
+    ASSERT_TRUE(dm.write_page(page_id, page).ok());
+
+    char read_back[config::kDefaultPageSize];
+    ASSERT_TRUE(dm.read_page(page_id, read_back).ok());
+    EXPECT_EQ(std::memcmp(page, read_back, sizeof(page)), 0)
+        << "checksums-off must preserve every byte, header included";
 }
 
 // A deallocated page id is handed back by the next allocate_page before the
