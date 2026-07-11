@@ -39,13 +39,49 @@ namespace entropy {
 // kept pinned, the buffer pool refuses to evict or delete that frame, so a
 // latched page can never be reused underneath its holder.
 //
-// Deadlock freedom: structural writers are serialized by write_mutex_, so the
-// only latch-ordering interactions are reader-vs-writer. Both descend top-down
-// (ancestors before descendants), and every sibling latch a writer takes is
-// acquired left-to-right in the leaf chain (the merge/borrow-with-left cases
-// briefly drop and re-take the current node's latch to preserve that order),
-// matching the rightward direction of range scans. With a single global order
-// (ancestor < descendant, left < right) no cycle can form.
+// Deadlock freedom: readers run CONCURRENTLY with the (serialized) writer, so
+// serialization alone proves nothing about reader-vs-writer cycles (writers
+// only ever face readers; serialization removes writer-vs-writer ordering).
+// Readers hold at most two latches at a time -- parent+child during descent
+// (top-down) and current+next leaf during chain scans (rightward only). The
+// certificate against reader-vs-writer cycles has two parts:
+//
+// LEAF LEVEL -- one direction. Chain scanners and the writer contend on
+// leaves, and every leaf-latch wait goes left-to-right:
+//   * The writer's fresh leaf acquisitions (right sibling, far-right neighbor,
+//     split target's old next) are all rightward of latches it already holds.
+//   * Turning left (borrow/merge with the left sibling) first RELEASES any
+//     right-sibling latch held from a failed right-borrow, then unlatches the
+//     node, latches the left sibling, and re-latches the node. Re-latching a
+//     leaf while holding any latch right of it would deadlock against a
+//     rightward chain scan (the scanner holds the leaf and waits for the right
+//     sibling; we would hold the right sibling and wait for the leaf) -- the
+//     live deadlock fixed after review. With the release, a scanner holding
+//     the leaf only ever waits on free latches, so it drains and the relatch
+//     completes.
+//   * Parent-pointer maintenance (set_parent / reparent_children) takes NO
+//     page latches at all. A split or merge must fix the parent pointers of
+//     children on BOTH sides of the moved range, including pages LEFT of leaf
+//     latches the operation already holds; latching them would invert the
+//     leaf order against chain scans (also a live deadlock in review). It is
+//     safe unlatched because parent_page_id is written and read only by
+//     structural writers, which write_mutex_ serializes, and readers never
+//     access the field.
+//
+// INTERNAL LEVELS -- fencing. The writer's internal-level unlatch/relatch and
+// left-sibling acquisitions do NOT follow a single global order (it re-takes a
+// node while holding that node's descendants), but they cannot block on
+// anyone: the underflowing node's PARENT stays write-latched throughout, which
+// fences every descent-reader out of the subtree, and chain scanners never
+// hold internal pages. A latch nobody else can hold cannot participate in a
+// cycle. (Corollary for maintainers: the retained parent latch is what makes
+// the internal-level dance safe -- do not shed it earlier.)
+//
+// Root growth never latches the new root (an ancestor) while descendants are
+// held: the grown root is unreachable until change_root's release store
+// publishes it, readers observe it via an acquire load, and the publishing
+// writer never touches it afterward, so it is installed unlatched (see
+// WriteSet::adopt_unlatched).
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -82,6 +118,17 @@ public:
 
     /// Adopt a freshly created page (already pinned once by new_page).
     Page* adopt(page_id_t id, Page* p) { return track(id, p); }
+
+    /// Adopt a freshly created page WITHOUT latching it. Used only for a grown
+    /// root: latching it would acquire an ancestor while descendants are held
+    /// (inverting the top-down order), and no latch is needed because the page
+    /// is unreachable until change_root publishes it (release store paired with
+    /// readers' acquire load of root_page_id) and is never touched by this
+    /// writer after publication. The pin is still tracked and released.
+    Page* adopt_unlatched(page_id_t id, Page* p) {
+        held_[id].page = p;
+        return p;
+    }
 
     /// Temporarily drop @p id's write latch (keeps pins) to re-take it later in
     /// a deadlock-free (left-to-right) order.
@@ -167,7 +214,7 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 
 void BPlusTree::change_root(page_id_t new_root_id) {
-    root_page_id_.store(new_root_id, std::memory_order_relaxed);
+    root_page_id_.store(new_root_id, std::memory_order_release);
     if (root_change_callback_) {
         root_change_callback_(new_root_id);
     }
@@ -298,26 +345,32 @@ Page* BPlusTree::create_internal_page(page_id_t* page_id) {
     return page;
 }
 
-void BPlusTree::set_parent(WriteSet& ws, page_id_t child_id,
-                           page_id_t parent_id) {
+void BPlusTree::set_parent(page_id_t child_id, page_id_t parent_id) {
     if (child_id == INVALID_PAGE_ID) {
         return;
     }
-    Page* child = ws.acquire(child_id);
+    // Latch-free by design: pin the frame, write the field, unpin. See the
+    // declaration comment -- parent_page_id is a writer-only field (serialized
+    // by write_mutex_; readers never access it), and write-latching children
+    // here would acquire pages LEFT of leaf latches this operation already
+    // holds, inverting the global order against leaf-chain scans.
+    Page* child = buffer_pool_->fetch_page(child_id);
     if (child != nullptr) {
         BPTreePage(child).set_parent_page_id(parent_id);
+        buffer_pool_->unpin_page(child_id, true);
     }
 }
 
-void BPlusTree::reparent_children(WriteSet& ws, page_id_t parent_id,
+void BPlusTree::reparent_children(page_id_t parent_id,
                                   BPTreeInternalPage& internal) {
     for (uint32_t i = 0; i <= internal.num_keys(); ++i) {
-        set_parent(ws, internal.child_at(i), parent_id);
+        set_parent(internal.child_at(i), parent_id);
     }
 }
 
 Status BPlusTree::insert(KeyType key, const ValueType& value) {
     std::lock_guard<std::mutex> wlock(write_mutex_);
+    drain_deferred_free();
 
     // Case 1: Empty tree - create the root as a leaf.
     if (root_page_id() == INVALID_PAGE_ID) {
@@ -418,18 +471,22 @@ Status BPlusTree::insert_into_parents(WriteSet& ws, std::vector<page_id_t>& path
         path.pop_back();
 
         if (path.empty()) {
-            // The split node was the root - grow a new root above it.
+            // The split node was the root - grow a new root above it. The new
+            // root is deliberately NOT latched (see adopt_unlatched): it is
+            // fully wired before change_root's release store publishes it, and
+            // this writer never touches it afterward, so readers that observe
+            // the new id (acquire load) see complete bytes.
             page_id_t new_root_id;
             Page* new_root_page = create_internal_page(&new_root_id);
             if (new_root_page == nullptr) {
                 return Status::OutOfMemory("Failed to create new root");
             }
-            ws.adopt(new_root_id, new_root_page);
+            ws.adopt_unlatched(new_root_id, new_root_page);
             BPTreeInternalPage new_root(new_root_page);
             new_root.set_child_at(0, split_id);
             new_root.insert_at(0, up_key, up_child);
-            set_parent(ws, split_id, new_root_id);
-            set_parent(ws, up_child, new_root_id);
+            set_parent(split_id, new_root_id);
+            set_parent(up_child, new_root_id);
             change_root(new_root_id);
             return Status::Ok();
         }
@@ -441,7 +498,7 @@ Status BPlusTree::insert_into_parents(WriteSet& ws, std::vector<page_id_t>& path
         }
         BPTreeInternalPage parent(parent_page);
         uint32_t idx = parent.find_child_index(up_key);
-        set_parent(ws, up_child, parent_id);
+        set_parent(up_child, parent_id);
 
         if (!parent.is_full()) {
             parent.insert_at(idx, up_key, up_child);
@@ -493,7 +550,7 @@ Status BPlusTree::insert_into_parents(WriteSet& ws, std::vector<page_id_t>& path
 
         // Children that moved into new_internal need their parent pointer fixed
         // (this also re-parents up_child if it landed on the right side).
-        reparent_children(ws, new_internal_id, new_internal);
+        reparent_children(new_internal_id, new_internal);
 
         up_key = push_up_key;
         up_child = new_internal_id;
@@ -506,8 +563,46 @@ Status BPlusTree::insert_into_parents(WriteSet& ws, std::vector<page_id_t>& path
 // Remove Operation (with rebalancing)
 // ─────────────────────────────────────────────────────────────────────────────
 
+void BPlusTree::free_page_or_defer(WriteSet& ws, page_id_t id) {
+    // delete_page refuses pages that still carry a pin -- e.g. a reader that
+    // has unlatched this (now unlinked) page but not yet unpinned it. That pin
+    // drains in microseconds, so queue the id and let a later structural write
+    // finish the deallocation rather than leaking the page on disk.
+    if (!ws.discard_and_delete(id)) {
+        deferred_free_.push_back(id);
+    }
+}
+
+void BPlusTree::drain_deferred_free() {
+    if (deferred_free_.empty()) {
+        return;
+    }
+    std::vector<page_id_t> still_refused;
+    for (page_id_t id : deferred_free_) {
+        // Re-fetch before deleting: delete_page reports success for ids absent
+        // from the page table WITHOUT touching the disk allocation, so a
+        // deferred page whose frame was evicted in the meantime would slip
+        // through as a disk leak. Fetching re-registers (and pins) it; after
+        // the unpin, delete_page finds it buffered and really deallocates.
+        // (The instant between unpin and delete remains exposed to a racing
+        // eviction; closing it fully needs a delete-while-pinned API in the
+        // buffer pool, which is outside this component.)
+        Page* page = buffer_pool_->fetch_page(id);
+        if (page == nullptr) {
+            still_refused.push_back(id);
+            continue;
+        }
+        buffer_pool_->unpin_page(id, false);
+        if (!buffer_pool_->delete_page(id)) {
+            still_refused.push_back(id);
+        }
+    }
+    deferred_free_ = std::move(still_refused);
+}
+
 Status BPlusTree::remove(KeyType key) {
     std::lock_guard<std::mutex> wlock(write_mutex_);
+    drain_deferred_free();
 
     if (root_page_id() == INVALID_PAGE_ID) {
         return Status::NotFound("Key not found");
@@ -552,7 +647,7 @@ Status BPlusTree::remove(KeyType key) {
         // Root leaf: dropping the last key empties the whole tree.
         if (leaf.is_empty()) {
             page_id_t leaf_id = leaf.page_id();
-            ws.discard_and_delete(leaf_id);
+            free_page_or_defer(ws, leaf_id);
             change_root(INVALID_PAGE_ID);
         }
         return Status::Ok();
@@ -593,6 +688,12 @@ Status BPlusTree::handle_leaf_underflow(WriteSet& ws,
                 parent.set_key_at(child_idx, new_key);
                 return Status::Ok();
             }
+            // CRITICAL: drop the right sibling before turning left. The left
+            // path below re-latches this leaf, and re-latching a node while
+            // holding any latch RIGHT of it inverts the global left-to-right
+            // order against rightward-crabbing scans (scanner holds leaf, waits
+            // for right; we hold right, wait for leaf: deadlock).
+            ws.release(right_id);
         }
     }
 
@@ -628,7 +729,7 @@ Status BPlusTree::handle_leaf_underflow(WriteSet& ws,
                     BPTreeLeafPage(far).set_prev_leaf_id(leaf.page_id());
                 }
             }
-            ws.discard_and_delete(right_id);
+            free_page_or_defer(ws, right_id);
         }
     } else if (child_idx > 0) {
         // This leaf is the rightmost child: merge it into the left sibling.
@@ -647,7 +748,7 @@ Status BPlusTree::handle_leaf_underflow(WriteSet& ws,
                     BPTreeLeafPage(far).set_prev_leaf_id(left_sibling.page_id());
                 }
             }
-            ws.discard_and_delete(leaf_id);
+            free_page_or_defer(ws, leaf_id);
         }
     }
 
@@ -669,8 +770,8 @@ Status BPlusTree::handle_parent_after_merge(WriteSet& ws,
         // the new root.
         if (node.num_keys() == 0) {
             page_id_t new_root = node.child_at(0);
-            set_parent(ws, new_root, INVALID_PAGE_ID);
-            ws.discard_and_delete(node_id);
+            set_parent(new_root, INVALID_PAGE_ID);
+            free_page_or_defer(ws, node_id);
             change_root(new_root);
         }
         return Status::Ok();
@@ -707,9 +808,13 @@ Status BPlusTree::handle_internal_underflow(WriteSet& ws,
                 BPTreeKey separator = parent.key_at(child_idx);
                 BPTreeKey new_sep = node.borrow_from_right(&right_sibling, separator);
                 parent.set_key_at(child_idx, new_sep);
-                set_parent(ws, node.child_at(node.num_keys()), node.page_id());
+                set_parent(node.child_at(node.num_keys()), node.page_id());
                 return Status::Ok();
             }
+            // Same rule as the leaf level: never hold a latch RIGHT of a node
+            // that is about to be re-latched. Drop the right sibling before the
+            // left path unlatches/relatches this node.
+            ws.release(right_id);
         }
     }
 
@@ -725,7 +830,7 @@ Status BPlusTree::handle_internal_underflow(WriteSet& ws,
                 BPTreeKey separator = parent.key_at(child_idx - 1);
                 BPTreeKey new_sep = node.borrow_from_left(&left_sibling, separator);
                 parent.set_key_at(child_idx - 1, new_sep);
-                set_parent(ws, node.child_at(0), node.page_id());
+                set_parent(node.child_at(0), node.page_id());
                 return Status::Ok();
             }
         }
@@ -739,9 +844,9 @@ Status BPlusTree::handle_internal_underflow(WriteSet& ws,
             BPTreeInternalPage right_sibling(right);
             BPTreeKey separator = parent.key_at(child_idx);
             node.merge_from_right(&right_sibling, separator);
-            reparent_children(ws, node.page_id(), node);
+            reparent_children(node.page_id(), node);
             parent.remove_at(child_idx);
-            ws.discard_and_delete(right_id);
+            free_page_or_defer(ws, right_id);
         }
     } else if (child_idx > 0) {
         // Rightmost child: merge it into the left sibling (reorder).
@@ -753,9 +858,9 @@ Status BPlusTree::handle_internal_underflow(WriteSet& ws,
             BPTreeInternalPage left_sibling(left);
             BPTreeKey separator = parent.key_at(child_idx - 1);
             left_sibling.merge_from_right(&node, separator);
-            reparent_children(ws, left_sibling.page_id(), left_sibling);
+            reparent_children(left_sibling.page_id(), left_sibling);
             parent.remove_at(child_idx - 1);
-            ws.discard_and_delete(node_id);
+            free_page_or_defer(ws, node_id);
         }
     }
 
@@ -867,6 +972,7 @@ std::vector<page_id_t> BPlusTree::collect_tree_pages() {
 
 Status BPlusTree::reclaim_all_pages() {
     std::lock_guard<std::mutex> wlock(write_mutex_);
+    drain_deferred_free();
     for (page_id_t page_id : collect_tree_pages()) {
         buffer_pool_->delete_page(page_id);
     }
@@ -874,7 +980,7 @@ Status BPlusTree::reclaim_all_pages() {
     // Bypass change_root deliberately: the caller is destroying the tree and
     // persists the removal itself (firing the callback here could deadlock a
     // caller that already holds its own lock).
-    root_page_id_.store(INVALID_PAGE_ID, std::memory_order_relaxed);
+    root_page_id_.store(INVALID_PAGE_ID, std::memory_order_release);
     return Status::Ok();
 }
 

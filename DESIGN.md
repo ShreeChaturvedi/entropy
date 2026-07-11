@@ -435,6 +435,18 @@ Leaf Node:
 5. Buffer pool internal mutex (leaf-level; never held while waiting on a
    page latch)
 
+B+ tree deadlock freedom is reader-vs-writer (writer serialization removes
+writer-vs-writer ordering; readers run concurrently with the writer) and has
+two parts. At the leaf level all latch waits go left-to-right: a writer
+turning left first releases any right-sibling latch before re-latching the
+node, and parent-pointer maintenance is latch-free (the field is writer-only;
+latching would touch pages left of held leaf latches). At internal levels the
+writer's re-latches do not follow a global order but cannot block: the
+underflowing node's parent stays write-latched, fencing descent readers out of
+the subtree, and chain scanners never hold internal pages. A grown root is
+published unlatched via a release-store of the root id (readers use an acquire
+load). See the design notes in b_plus_tree.cpp for the full argument.
+
 ---
 
 ## External Dependencies
