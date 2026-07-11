@@ -865,4 +865,152 @@ Component MakeQueryConsoleScreen() {
   });
 }
 
+// ── Deterministic replay demo (for animated capture) ─────────────────────────
+
+namespace {
+
+// Open a temp database with no schema or rows, so the replay can build it up by
+// typing DDL/DML for real. Mirrors open_and_seed's temp-file bookkeeping.
+void open_blank(Console &c) {
+  std::error_code ec;
+  const auto dir = std::filesystem::temp_directory_path(ec);
+  static int counter = 0;
+  const auto token = std::chrono::steady_clock::now().time_since_epoch().count();
+  c.db_path = (dir / ("entropy-console-demo-" + std::to_string(token) + "-" +
+                      std::to_string(counter++) + ".edb"))
+                  .string();
+  std::filesystem::remove(c.db_path, ec);
+  std::filesystem::remove(c.db_path + "-wal", ec);
+  try {
+    c.db = std::make_unique<Database>(c.db_path);
+    c.db_note = "connected · " + std::to_string(schema().size()) + " tables";
+  } catch (...) {
+    c.db.reset();
+    c.db_note = "unavailable";
+  }
+  // A neutral, empty result panel before the first statement runs (the default
+  // Grid is !ok, which would render as a red "query failed").
+  c.grid.ok = true;
+  c.grid.is_query = false;
+  c.grid.message = "";
+}
+
+// One rendered frame of the console session: the editor text to show, whether
+// the statement transitions in (executes) on this frame, the active tab, the
+// grid selection, and whether focus sits on the results grid.
+struct DemoFrame {
+  std::string editor;
+  bool run = false;
+  int tab = 0;  // 0 Query, 1 History, 2 Plan
+  int sel_row = 0;
+  bool results_focus = false;
+};
+
+// The scripted session, expanded to one descriptor per rendered frame. Kept in
+// one place so the frame count and the renderer never drift.
+[[nodiscard]] const std::vector<DemoFrame> &ConsoleScript() {
+  static const std::vector<DemoFrame> frames = [] {
+    std::vector<DemoFrame> f;
+
+    const auto blank = [&](int n) {  // idle frames with an empty editor
+      for (int i = 0; i < n; ++i) f.push_back(DemoFrame{"", false, 0, 0, false});
+    };
+    const auto type = [&](const std::string &text, int cpf) {
+      for (size_t shown = 1; shown <= text.size();
+           shown = std::min(shown + static_cast<size_t>(cpf), text.size() + 1)) {
+        f.push_back(DemoFrame{text.substr(0, shown), false, 0, 0, false});
+        if (shown == text.size()) break;
+      }
+    };
+    const auto run = [&](const std::string &text, int hold) {
+      f.push_back(DemoFrame{text, true, 0, 0, true});  // executes here
+      for (int i = 1; i < hold; ++i)
+        f.push_back(DemoFrame{text, false, 0, 0, true});
+    };
+    const auto nav = [&](const std::string &text, int rows, int per) {
+      for (int r = 1; r <= rows; ++r)
+        for (int i = 0; i < per; ++i)
+          f.push_back(DemoFrame{text, false, 0, r, true});
+    };
+    const auto tab = [&](const std::string &text, int which, int hold) {
+      for (int i = 0; i < hold; ++i)
+        f.push_back(DemoFrame{text, false, which, 0, true});
+    };
+
+    // Split across two editor lines so neither overruns the editor width (an
+    // over-wide line gets shrunk by the layout) and the line-numbered multi-line
+    // editor is shown off. SQL treats the newline as plain whitespace.
+    const std::string create =
+        "CREATE TABLE runs (seed INTEGER, schedule VARCHAR(16),\n"
+        "  outcome VARCHAR(8), faults INTEGER, recovery_ms DOUBLE)";
+    const std::array<const char *, 4> inserts = {
+        "INSERT INTO runs VALUES (1042, 'mixed', 'pass', 3, 12.40)",
+        "INSERT INTO runs VALUES (1044, 'wal_stress', 'fail', 7, 48.75)",
+        "INSERT INTO runs VALUES (1047, 'page_tears', 'fail', 9, 63.10)",
+        "INSERT INTO runs VALUES (1050, 'crash_storm', 'pass', 8, 41.05)"};
+    const std::string sel_fail =
+        "SELECT seed, schedule, outcome, recovery_ms FROM runs WHERE outcome "
+        "= 'fail'";
+    const std::string sel_order =
+        "SELECT seed, schedule, recovery_ms FROM runs ORDER BY recovery_ms "
+        "DESC LIMIT 5";
+
+    blank(4);
+    type(create, 8);
+    run(create, 5);
+    for (const char *ins : inserts) {
+      blank(1);
+      type(ins, 14);
+      run(ins, 3);
+    }
+    blank(1);
+    type(sel_fail, 9);
+    run(sel_fail, 11);
+    nav(sel_fail, 1, 4);
+    blank(1);
+    type(sel_order, 9);
+    run(sel_order, 10);
+    nav(sel_order, 2, 3);
+    tab(sel_order, 1, 8);   // History
+    tab(sel_order, 2, 11);  // Plan (EXPLAIN of the last SELECT)
+    tab(sel_order, 0, 6);   // back to the result grid, dwell
+    return f;
+  }();
+  return frames;
+}
+
+}  // namespace
+
+int ConsoleDemoFrameCount() {
+  return static_cast<int>(ConsoleScript().size());
+}
+
+Element RenderConsoleDemoFrame(int step) {
+  const std::vector<DemoFrame> &script = ConsoleScript();
+  step = std::clamp(step, 0, static_cast<int>(script.size()) - 1);
+
+  Console c;
+  open_blank(c);
+
+  // Replay every statement that has executed at or before this frame, so the
+  // live engine holds the real schema/rows and the grid is genuine output.
+  for (int j = 0; j <= step; ++j) {
+    if (script[static_cast<size_t>(j)].run) {
+      c.sql = script[static_cast<size_t>(j)].editor;
+      run_query(c);
+    }
+  }
+
+  const DemoFrame &fr = script[static_cast<size_t>(step)];
+  c.sql = fr.editor;
+  c.tab = static_cast<Tab>(fr.tab);
+  c.sel_row = fr.sel_row;
+  c.focus = fr.results_focus ? Focus::kResults : Focus::kEditor;
+  if (c.tab == Tab::kPlan) {
+    refresh_plan(c);  // uses c.sql, which still holds the last SELECT here
+  }
+
+  return render_console(c);
+}
+
 }  // namespace entropy::tui

@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
-# Render still frames (and the boot sheen-sweep GIF) of each entropy-tui screen.
+# Render a still frame of each entropy-tui screen. The animated GIFs (boot,
+# dashboard, console) are produced by the companion capture-anim.sh.
 #
 # Still pipeline:
 #   entropy-tui --capture-frame <screen>   ->  ANSI frame (.ans)
 #   freeze <ans>                           ->  vector still (.svg)
 #   headless Chrome rasterizes the SVG     ->  crisp 2x still (.png)
-#
-# GIF pipeline (boot only):
-#   entropy-tui --capture-frame boot --phase p   for p across one sweep cycle
-#   each frame rasterized as above, then assembled by ffmpeg into boot.gif.
 #
 # The galaxy mark is drawn in braille (U+28xx). JetBrains Mono (freeze's font)
 # has no braille glyphs, so the browser would substitute a proportional fallback
@@ -17,8 +14,8 @@
 # every cell keeps its advance and the layout stays grid-aligned.
 #
 # Requirements: a built entropy-tui, `freeze` (github.com/charmbracelet/freeze),
-# a Chromium/Chrome binary, ffmpeg, and a monospace braille font (FreeMono).
-# Override any of them via the env vars below.
+# a Chromium/Chrome binary, and a monospace braille font (FreeMono). Override any
+# of them via the env vars below.
 #
 # Usage: tui/captures/capture.sh [<cols>x<rows>]   (default 120x40)
 set -euo pipefail
@@ -29,12 +26,8 @@ size="${1:-120x40}"
 BIN="${ENTROPY_TUI_BIN:-$here/../../build-integ/tui/entropy-tui}"
 FREEZE="${FREEZE_BIN:-$(command -v freeze || echo "$HOME/go/bin/freeze")}"
 CHROME="${CHROME_BIN:-$(command -v google-chrome || command -v chromium || true)}"
-FFMPEG="${FFMPEG_BIN:-$(command -v ffmpeg || true)}"
 # Monospace fallback for braille cells (see header note).
 BRAILLE_FALLBACK="${BRAILLE_FALLBACK:-FreeMono, monospace}"
-# Number of frames in one boot sheen-sweep cycle, and the GIF frame rate.
-GIF_FRAMES="${GIF_FRAMES:-36}"
-GIF_FPS="${GIF_FPS:-20}"
 BG="#0e0e10"
 
 [ -x "$BIN" ] || { echo "capture: entropy-tui not found at $BIN" >&2; exit 1; }
@@ -77,26 +70,3 @@ for screen in boot dashboard console; do
   render_png "$here/$screen.svg" "$here/$screen.png"
   echo "captured $screen"
 done
-
-# ── Boot sheen-sweep GIF ──────────────────────────────────────────────────────
-# Deterministic: GIF_FRAMES phases evenly spanning one cycle [0, 1). The sweep
-# sits fully off-disc at phase 0 and ~1, so the loop is seamless.
-if [ -n "$CHROME" ] && [ -n "$FFMPEG" ]; then
-  frames="$(mktemp -d)"
-  for i in $(seq 0 $((GIF_FRAMES - 1))); do
-    phase=$(awk "BEGIN{printf \"%.5f\", $i/$GIF_FRAMES}")
-    ans="$frames/f.ans"; svg="$frames/f.svg"
-    png=$(printf '%s/f_%03d.png' "$frames" "$i")
-    "$BIN" --capture-frame boot --size "$size" --phase "$phase" > "$ans"
-    render_svg "$ans" "$svg"
-    render_png "$svg" "$png" 1
-  done
-  "$FFMPEG" -y -framerate "$GIF_FPS" -i "$frames/f_%03d.png" \
-    -vf "palettegen=stats_mode=full" "$frames/pal.png" >/dev/null 2>&1
-  "$FFMPEG" -y -framerate "$GIF_FPS" -i "$frames/f_%03d.png" -i "$frames/pal.png" \
-    -lavfi "paletteuse=dither=bayer:bayer_scale=3" -loop 0 "$here/boot.gif" >/dev/null 2>&1
-  rm -rf "$frames"
-  echo "captured boot.gif (${GIF_FRAMES} frames @ ${GIF_FPS}fps)"
-else
-  echo "capture: skipping boot.gif (need Chrome + ffmpeg)" >&2
-fi

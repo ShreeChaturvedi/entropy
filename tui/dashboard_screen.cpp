@@ -599,4 +599,112 @@ Component MakeDashboardScreen(const DataSet &data) {
   return CatchEvent(Renderer(view), handler);
 }
 
+// ── Deterministic replay demo (for animated capture) ─────────────────────────
+
+namespace {
+
+// Frame budget for the dashboard replay, split into four contiguous phases.
+constexpr int kDemoStream = 60;   ///< runs streaming into the table
+constexpr int kDemoHold1 = 8;     ///< dwell on the fully-populated board
+constexpr int kDemoInspect = 34;  ///< spotlight sweeping back up the table
+constexpr int kDemoHold2 = 12;    ///< dwell on the final inspected run
+constexpr int kDemoRevealCap = 340;  ///< runs revealed by the end of streaming
+
+/// Full dataset reordered for the stream: by seed, then by each schedule's
+/// first-seen position, so every seed's cohort (all schedules, the occasional
+/// torn-page failure among them) lands together and the matrix, timeline, and
+/// gauge all grow at once instead of one schedule at a time.
+[[nodiscard]] std::vector<int> DemoStreamOrder(const DataSet &full) {
+  std::vector<int> order(full.runs.size());
+  for (int i = 0; i < static_cast<int>(order.size()); ++i) {
+    order[static_cast<size_t>(i)] = i;
+  }
+  const auto sched_index = [&](const std::string &name) {
+    const auto it =
+        std::find(full.schedules.begin(), full.schedules.end(), name);
+    return static_cast<int>(it - full.schedules.begin());
+  };
+  std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+    const RunRecord &ra = full.runs[static_cast<size_t>(a)];
+    const RunRecord &rb = full.runs[static_cast<size_t>(b)];
+    if (ra.seed != rb.seed) return ra.seed < rb.seed;
+    return sched_index(ra.schedule) < sched_index(rb.schedule);
+  });
+  return order;
+}
+
+}  // namespace
+
+int DashboardDemoFrameCount() {
+  return kDemoStream + kDemoHold1 + kDemoInspect + kDemoHold2;
+}
+
+Element RenderDashboardDemoFrame(const DataSet &full, int step) {
+  const int frames = DashboardDemoFrameCount();
+  step = std::clamp(step, 0, frames - 1);
+
+  const int cap = std::min<int>(kDemoRevealCap,
+                                static_cast<int>(full.runs.size()));
+  const std::vector<int> stream = DemoStreamOrder(full);
+
+  // Resolve this frame's reveal count and selected row from the phase timeline.
+  int revealed = cap;
+  int sel = cap - 1;
+  if (step < kDemoStream) {
+    const double frac = static_cast<double>(step + 1) /
+                        static_cast<double>(kDemoStream);
+    revealed = std::clamp(static_cast<int>(std::lround(cap * frac)), 6, cap);
+    sel = revealed - 1;  // spotlight rides the newest landed run
+  } else if (step < kDemoStream + kDemoHold1) {
+    revealed = cap;
+    sel = cap - 1;
+  } else if (step < kDemoStream + kDemoHold1 + kDemoInspect) {
+    revealed = cap;
+    const int k = step - (kDemoStream + kDemoHold1);
+    sel = std::clamp(cap - 1 - k, 0, cap - 1);  // sweep the spotlight upward
+  } else {
+    revealed = cap;
+    sel = std::clamp(cap - 1 - kDemoInspect, 0, cap - 1);
+  }
+
+  // Build the partial dataset (first `revealed` runs in stream order) and a
+  // model whose display order is that same stream order, so rows only ever
+  // append at the bottom and the spotlight tails them cleanly.
+  DataSet d;
+  d.runs.reserve(static_cast<size_t>(revealed));
+  for (int i = 0; i < revealed; ++i) {
+    d.runs.push_back(full.runs[static_cast<size_t>(stream[static_cast<size_t>(i)])]);
+  }
+  Recompute(d);
+
+  Model m = BuildModel(d);
+  m.order.resize(static_cast<size_t>(revealed));
+  for (int i = 0; i < revealed; ++i) {
+    m.order[static_cast<size_t>(i)] = i;
+  }
+
+  sel = std::clamp(sel, 0, std::max(0, revealed - 1));
+
+  Element mid = hbox({
+                    MatrixPanel(m) | flex,
+                    TimelinePanel(d) | flex,
+                }) |
+                ftxui::size(HEIGHT, EQUAL, 9);
+
+  Element bottom = hbox({
+      RunTablePanel(d, m, sel) | flex,
+      FeedPanel(d, m, sel) | flex,
+  });
+
+  return vbox({
+             HeaderStrip(d, m),
+             KpiStrip(d),
+             SweepPanel(d),
+             mid,
+             bottom | flex,
+             LegendBar(),
+         }) |
+         theme::canvas_bg() | color(theme::kInk1());
+}
+
 }  // namespace entropy::tui
