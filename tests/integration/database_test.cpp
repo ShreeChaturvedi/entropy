@@ -632,12 +632,12 @@ TEST_F(DatabaseTest, IllTypedDmlReturnsErrorNotCrash) {
     EXPECT_FALSE(result.ok()) << "expected error for: " << sql;
   }
 
-  // An ill-typed DELETE can't reach that throw: its only expression is the
-  // WHERE predicate, which evaluates to a fresh boolean, never a materialized
-  // mistyped column, so it matches nothing. It must still not crash.
+  // An ill-typed DELETE is handled gracefully too. Its only expression is the
+  // WHERE predicate, and arithmetic over a VARCHAR column (`name * 2`) is a type
+  // error that bind-time checking rejects with a clean Status rather than
+  // coercing the string to 0 or aborting the process. Nothing is deleted.
   auto del = db.execute("DELETE FROM emp WHERE name * 2 = 4");
-  EXPECT_TRUE(del.ok()) << del.status().to_string();
-  EXPECT_EQ(del.affected_rows(), 0u);
+  EXPECT_FALSE(del.ok()) << "expected type error for ill-typed DELETE predicate";
 
   // The database is still usable after the ill-typed DML: the two original rows
   // are intact (the aborted statements applied nothing) and a well-typed UPDATE
