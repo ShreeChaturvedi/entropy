@@ -11,6 +11,9 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
+#include <span>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -25,6 +28,7 @@
 #include "transaction/recovery.hpp"
 #include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
+#include "transaction/version_store.hpp"
 #include "transaction/wal.hpp"
 
 namespace entropy {
@@ -2150,6 +2154,38 @@ TEST_F(RecoveryTest, WarmPoolRetryFlushesCompensationBeforeAbort) {
   EXPECT_FALSE(disk_row_present());
 }
 
+TEST_F(RecoveryTest, SeededManagersNeverReuseTxnId) {
+  // #19: a transaction manager restarted from a WAL must consume the recovered
+  // high-water mark so post-restart transactions can never alias recovered ids.
+  {
+    auto wal = std::make_shared<WALManager>(wal_file_.string());
+    TransactionManager tm(wal);
+    auto *t1 = tm.begin();
+    auto *t2 = tm.begin();
+    auto *t3 = tm.begin();
+    EXPECT_GT(t3->txn_id(), t1->txn_id());
+    tm.commit(t1);
+    tm.commit(t2);
+    tm.commit(t3);
+  }
+
+  // Recover the next-txn-id high-water mark from the same WAL.
+  auto pool = make_buffer_pool();
+  auto wal = std::make_shared<WALManager>(wal_file_.string());
+  RecoveryManager recovery(pool, wal, disk_manager_);
+  ASSERT_TRUE(recovery.recover().ok());
+  const txn_id_t seed = recovery.next_txn_id();
+  EXPECT_GE(seed, 4u); // strictly past the recovered ids 1..3
+
+  // A fresh manager seeded from recovery must not reissue any recovered id.
+  TransactionManager tm2(wal);
+  tm2.seed_next_txn_id(seed);
+  auto *t = tm2.begin();
+  EXPECT_GE(t->txn_id(), seed);
+  EXPECT_GT(t->txn_id(), 3u);
+  tm2.commit(t);
+}
+
 TEST_F(RecoveryTest, UndoInsertSkipsLongerCommittedRowSharingPrefix) {
   // Loser T1 inserts "AB" at (0,0) and deletes it; committed T2 reuses the
   // slot with "ABxy". A prefix match would mistake T2's longer row for T1's
@@ -2573,6 +2609,248 @@ TEST_F(MVCCTest, CreatorCannotSeeAfterSelfDelete) {
 
   // Creator should NOT see after self-delete
   EXPECT_FALSE(mvcc_.is_visible(version, &txn));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WP5: TransactionManager <-> MVCC / VersionStore integration
+//
+// Exercises the wiring itself: begin()/commit() draw timestamps from the single
+// logical clock, commit() finalizes version stamps, and abort() both flushes
+// its undo compensation before the durable ABORT and drops uncommitted versions.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class MVCCTxnIntegrationTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    test_dir_ = std::filesystem::temp_directory_path() /
+                ("entropy_wp5_" + std::to_string(rand()));
+    std::filesystem::create_directories(test_dir_);
+    db_file_ = test_dir_ / "data.db";
+    wal_file_ = test_dir_ / "test.wal";
+
+    disk_manager_ = std::make_shared<FileDiskManager>(db_file_.string());
+    buffer_pool_ = std::make_shared<BufferPoolManager>(16, disk_manager_);
+    table_heap_ = std::make_shared<TableHeap>(buffer_pool_);
+
+    std::vector<Column> columns = {
+        Column("id", TypeId::INTEGER),
+        Column("name", TypeId::VARCHAR, 64),
+    };
+    schema_ = Schema(std::move(columns));
+
+    wal_ = std::make_shared<WALManager>(wal_file_.string());
+    lock_mgr_ = std::make_unique<LockManager>(false, 100);
+    mvcc_ = std::make_shared<MVCCManager>();
+    version_store_ = std::make_shared<VersionStore>(*mvcc_);
+
+    tm_ = std::make_unique<TransactionManager>(wal_);
+    tm_->set_lock_manager(lock_mgr_.get());
+    tm_->set_mvcc(mvcc_);
+    tm_->set_version_store(version_store_);
+    tm_->set_buffer_pool(buffer_pool_.get());
+    tm_->set_table_resolver([this](oid_t oid) -> TableHeap * {
+      return oid == kTableOid ? table_heap_.get() : nullptr;
+    });
+  }
+
+  void TearDown() override {
+    tm_.reset();
+    version_store_.reset();
+    mvcc_.reset();
+    lock_mgr_.reset();
+    wal_.reset();
+    table_heap_.reset();
+    buffer_pool_.reset();
+    disk_manager_.reset();
+    std::error_code ec;
+    std::filesystem::remove_all(test_dir_, ec);
+  }
+
+  Tuple make_tuple(int32_t id, const std::string &name) {
+    return Tuple({TupleValue(id), TupleValue(name)}, schema_);
+  }
+  std::vector<char> tuple_bytes(const Tuple &t) {
+    return std::vector<char>(t.data(), t.data() + t.size());
+  }
+  static std::span<const char> span_of(const std::vector<char> &v) {
+    return std::span<const char>(v.data(), v.size());
+  }
+  bool tuple_exists(const RID &rid) {
+    Tuple out;
+    return table_heap_->get_tuple(rid, &out).ok();
+  }
+
+  static constexpr oid_t kTableOid = 1;
+
+  std::filesystem::path test_dir_;
+  std::filesystem::path db_file_;
+  std::filesystem::path wal_file_;
+  std::shared_ptr<DiskManager> disk_manager_;
+  std::shared_ptr<BufferPoolManager> buffer_pool_;
+  std::shared_ptr<TableHeap> table_heap_;
+  Schema schema_;
+  std::shared_ptr<WALManager> wal_;
+  std::unique_ptr<LockManager> lock_mgr_;
+  std::shared_ptr<MVCCManager> mvcc_;
+  std::shared_ptr<VersionStore> version_store_;
+  std::unique_ptr<TransactionManager> tm_;
+};
+
+// begin() seeds start_ts from the logical clock (not steady_clock), so a
+// snapshot cannot see a version committed after it began. The review-demanded
+// clock-unification test.
+TEST_F(MVCCTxnIntegrationTest, SnapshotDoesNotSeeCommitAfterItStarted) {
+  const RID rid(0, 0);
+  const std::vector<char> heap = tuple_bytes(make_tuple(1, "v1"));
+
+  // A takes its snapshot first. On a fresh clock the first stamp is small and
+  // logical (== TIMESTAMP_PREHISTORY + 1), proving it came from get_timestamp()
+  // rather than a steady_clock nanosecond count.
+  auto *a = tm_->begin();
+  EXPECT_EQ(a->start_ts(), TIMESTAMP_PREHISTORY + 1)
+      << "begin() must seed start_ts from MVCCManager::get_timestamp()";
+
+  // B begins strictly after A, writes rid, and commits.
+  auto *b = tm_->begin();
+  ASSERT_TRUE(version_store_->on_insert(b, rid).ok());
+  tm_->commit(b); // commit_ts drawn from the same clock, > a's start_ts
+
+  // Unified clock: b's begin_ts (its commit_ts) exceeds a's snapshot, so a
+  // cannot see the row at all.
+  auto seen = version_store_->read_visible(rid, span_of(heap), a);
+  EXPECT_FALSE(seen.has_value())
+      << "snapshot A must not observe a version committed after it began";
+
+  // A reader whose snapshot starts after the commit does see it.
+  auto *late = tm_->begin();
+  auto late_seen = version_store_->read_visible(rid, span_of(heap), late);
+  ASSERT_TRUE(late_seen.has_value());
+  EXPECT_EQ(*late_seen, heap);
+
+  tm_->commit(a);
+  tm_->commit(late);
+}
+
+// First-updater-wins fires across the unified clock: A cannot overwrite a row
+// that B committed after A's snapshot (the lost-update the review flagged).
+TEST_F(MVCCTxnIntegrationTest, LostUpdateBecomesConflictAcrossUnifiedClock) {
+  const RID rid(0, 0);
+  const std::vector<char> v1 = tuple_bytes(make_tuple(1, "v1"));
+
+  auto *creator = tm_->begin();
+  ASSERT_TRUE(version_store_->on_insert(creator, rid).ok());
+  tm_->commit(creator);
+
+  auto *a = tm_->begin(); // A's snapshot
+
+  auto *b = tm_->begin();
+  ASSERT_TRUE(version_store_->on_update(b, rid, span_of(v1)).ok());
+  tm_->commit(b); // committed strictly after A's snapshot
+
+  // A's update must be rejected: B's committed version is newer than A saw.
+  const Status s = version_store_->on_update(a, rid, span_of(v1));
+  EXPECT_FALSE(s.ok());
+  EXPECT_EQ(s.code(), StatusCode::kAborted);
+
+  tm_->abort(a);
+}
+
+// commit() finalizes version timestamps: a later snapshot reads the new value,
+// an earlier snapshot keeps reading the retained before-image.
+TEST_F(MVCCTxnIntegrationTest, CommitFinalizesTimestampsForSnapshotReaders) {
+  const RID rid(0, 0);
+  const std::vector<char> v1 = tuple_bytes(make_tuple(1, "v1"));
+  const std::vector<char> v2 = tuple_bytes(make_tuple(1, "v2"));
+
+  auto *creator = tm_->begin();
+  ASSERT_TRUE(version_store_->on_insert(creator, rid).ok());
+  tm_->commit(creator);
+
+  auto *early = tm_->begin(); // snapshot while the heap holds v1
+
+  auto *updater = tm_->begin();
+  ASSERT_TRUE(version_store_->on_update(updater, rid, span_of(v1)).ok());
+  tm_->commit(updater); // heap now conceptually holds v2
+
+  auto *late = tm_->begin(); // snapshot after the update committed
+
+  auto early_view = version_store_->read_visible(rid, span_of(v2), early);
+  ASSERT_TRUE(early_view.has_value());
+  EXPECT_EQ(*early_view, v1) << "earlier snapshot reads the before-image";
+
+  auto late_view = version_store_->read_visible(rid, span_of(v2), late);
+  ASSERT_TRUE(late_view.has_value());
+  EXPECT_EQ(*late_view, v2) << "later snapshot reads the finalized new value";
+
+  tm_->commit(early);
+  tm_->commit(late);
+}
+
+// abort() undoes the heap mutation AND drops the transaction's uncommitted
+// versions from the store.
+TEST_F(MVCCTxnIntegrationTest, AbortRestoresHeapAndDropsUncommittedVersions) {
+  auto *txn = tm_->begin();
+  Tuple t = make_tuple(1, "alice");
+  RID rid;
+  ASSERT_TRUE(table_heap_->insert_tuple(t, &rid).ok());
+  ASSERT_TRUE(version_store_->on_insert(txn, rid).ok());
+  tm_->log_insert(txn, kTableOid, rid, tuple_bytes(t));
+
+  ASSERT_TRUE(tuple_exists(rid));
+  ASSERT_EQ(version_store_->chain_length(rid), 1u);
+
+  tm_->abort(txn);
+
+  EXPECT_FALSE(tuple_exists(rid)) << "aborted INSERT must be undone in the heap";
+  EXPECT_EQ(version_store_->chain_length(rid), 0u)
+      << "abort must drop the uncommitted version";
+  EXPECT_EQ(tm_->active_transaction_count(), 0u);
+}
+
+// abort() must flush its undo compensation to disk BEFORE the WAL ABORT record
+// is made durable (mirrors recovery's WarmPoolRetryFlushesCompensationBeforeAbort).
+TEST_F(MVCCTxnIntegrationTest, AbortFlushesCompensationBeforeAbortRecord) {
+  auto *txn = tm_->begin();
+  Tuple t = make_tuple(1, "loser");
+  RID rid;
+  ASSERT_TRUE(table_heap_->insert_tuple(t, &rid).ok());
+  tm_->log_insert(txn, kTableOid, rid, tuple_bytes(t));
+
+  // Steal: force the uncommitted row to disk before the abort.
+  ASSERT_TRUE(buffer_pool_->flush_page(rid.page_id));
+
+  const page_id_t page_id = rid.page_id;
+  const slot_id_t slot_id = rid.slot_id;
+  auto disk_row_present = [this, page_id, slot_id]() {
+    auto probe_disk = std::make_shared<FileDiskManager>(db_file_.string());
+    BufferPoolManager probe_pool(4, probe_disk);
+    Page *page = probe_pool.fetch_page(page_id);
+    EXPECT_NE(page, nullptr);
+    TablePage table_page(page);
+    const bool present = !table_page.get_record(slot_id).empty();
+    probe_pool.unpin_page(page_id, false);
+    return present;
+  };
+  ASSERT_TRUE(disk_row_present());
+
+  // Probe at the ABORT sync: the compensation must already be on disk.
+  bool abort_sync_seen = false;
+  bool compensated_at_abort_sync = false;
+  wal_->set_sync_hook_for_testing([&]() -> Status {
+    abort_sync_seen = true;
+    compensated_at_abort_sync = !disk_row_present();
+    return Status::Ok();
+  });
+
+  tm_->abort(txn);
+
+  // Drop the hook so a teardown flush cannot call into freed stack captures.
+  wal_->set_sync_hook_for_testing(nullptr);
+
+  EXPECT_TRUE(abort_sync_seen);
+  EXPECT_TRUE(compensated_at_abort_sync)
+      << "undo compensation must reach disk before the ABORT record is synced";
+  EXPECT_FALSE(disk_row_present());
 }
 
 } // namespace
