@@ -359,7 +359,17 @@ std::unique_ptr<InsertStatement> Parser::parse_insert() {
   if (match(TokenType::LPAREN)) {
     do {
       if (check(TokenType::IDENTIFIER)) {
-        stmt->columns.push_back(current_.value);
+        std::string name = current_.value;
+        // Reject duplicate column names in the target list: a column would
+        // otherwise be assigned twice with no clear semantics.
+        for (const auto &existing : stmt->columns) {
+          if (existing == name) {
+            set_error("Duplicate column name '" + name +
+                      "' in INSERT column list");
+            return nullptr;
+          }
+        }
+        stmt->columns.push_back(std::move(name));
         advance();
       } else {
         set_error("Expected column name");
@@ -524,6 +534,15 @@ std::unique_ptr<CreateTableStatement> Parser::parse_create_table() {
       advance();
       expect(TokenType::NULL_KEYWORD, "Expected NULL after NOT");
       col.nullable = false;
+    }
+
+    // Reject duplicate column names: the second definition would otherwise be
+    // silently unreachable.
+    for (const auto &existing : stmt->columns) {
+      if (existing.name == col.name) {
+        set_error("Duplicate column name '" + col.name + "' in CREATE TABLE");
+        return nullptr;
+      }
     }
 
     stmt->columns.push_back(col);

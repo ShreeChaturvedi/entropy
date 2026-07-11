@@ -1098,5 +1098,19 @@ TEST_F(ParserTest, ParseDropIndexOnTable) {
   EXPECT_EQ(idx->table_name, "users");
 }
 
+// -- Parser: duplicate column names are rejected -----------------------------
+
+TEST_F(ParserTest, DuplicateColumnInCreateTableIsError) {
+  Parser parser("CREATE TABLE t (id INTEGER, id VARCHAR(10))");
+  std::unique_ptr<Statement> stmt;
+  EXPECT_FALSE(parser.parse(&stmt).ok());
+}
+
+TEST_F(ParserTest, DuplicateColumnInInsertIsError) {
+  Parser parser("INSERT INTO t (a, b, a) VALUES (1, 2, 3)");
+  std::unique_ptr<Statement> stmt;
+  EXPECT_FALSE(parser.parse(&stmt).ok());
+}
+
 } // namespace
 } // namespace entropy
