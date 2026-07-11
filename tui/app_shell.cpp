@@ -31,19 +31,22 @@ namespace {
 enum View : int { kBoot = 0, kDashboard = 1, kConsole = 2 };
 
 /// Build the fixed-demo-data element for a named screen. Returns nullptr for an
-/// unknown name. @p galaxy_phase is forwarded to the boot galaxy's sweep.
+/// unknown name. @p galaxy_phase is forwarded to the boot galaxy's sweep;
+/// @p demo_step, when >= 0, selects a frame of the dashboard/console replay.
 [[nodiscard]] Element BuildScreenElement(const std::string &which,
                                          const DataSet &data,
                                          const std::string &version,
-                                         double galaxy_phase) {
+                                         double galaxy_phase, int demo_step) {
   if (which == "boot") {
     return BootScreen(data, /*selected_index=*/0, version, galaxy_phase);
   }
   if (which == "dashboard") {
-    return MakeDashboardScreen(data)->Render();
+    return demo_step >= 0 ? RenderDashboardDemoFrame(data, demo_step)
+                          : MakeDashboardScreen(data)->Render();
   }
   if (which == "console") {
-    return MakeQueryConsoleScreen()->Render();
+    return demo_step >= 0 ? RenderConsoleDemoFrame(demo_step)
+                          : MakeQueryConsoleScreen()->Render();
   }
   return nullptr;
 }
@@ -169,8 +172,18 @@ int RunApp() {
   return 0;
 }
 
+int DemoFrameCount(const std::string &which) {
+  if (which == "dashboard") {
+    return DashboardDemoFrameCount();
+  }
+  if (which == "console") {
+    return ConsoleDemoFrameCount();
+  }
+  return 0;
+}
+
 int CaptureFrame(const std::string &which, int cols, int rows,
-                 double galaxy_phase) {
+                 double galaxy_phase, int demo_step) {
   // Pin TrueColor so the RGB/HSV ramps emit 24-bit ANSI regardless of the
   // capturing terminal's advertised support.
   Terminal::SetColorSupport(Terminal::TrueColor);
@@ -178,7 +191,8 @@ int CaptureFrame(const std::string &which, int cols, int rows,
   const DataSet data = LoadDemoData();
   const std::string version = entropy::version();
 
-  Element doc = BuildScreenElement(which, data, version, galaxy_phase);
+  Element doc =
+      BuildScreenElement(which, data, version, galaxy_phase, demo_step);
   if (!doc) {
     std::cerr << "entropy-tui: unknown screen '" << which
               << "' (expected boot | dashboard | console)\n";

@@ -62,3 +62,4 @@ third_party/*/
 
 # Git worktrees
 .worktrees/
+build-integ/
