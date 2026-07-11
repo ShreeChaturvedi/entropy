@@ -75,6 +75,38 @@ TEST_F(HashIndexTest, DirectoryGrowth) {
   EXPECT_GE(hash_index_->global_depth(), initial_depth);
 }
 
+// Regression: a bucket whose keys collide on many low hash bits needs more
+// than one split to relieve the overflow. std::hash<int32_t> is the identity
+// on libstdc++, so keys that are multiples of 1024 share their low 10 bits and
+// all land in the same bucket; the 257th such key can only be admitted after
+// the directory grows enough for the keys to separate at bit 10. The old code
+// split exactly once, moved nothing (every key shared the first split bit), and
+// then returned InvalidArgument. A correct implementation keeps splitting until
+// the key fits.
+TEST_F(HashIndexTest, MultiSplitBucketOverflow) {
+  constexpr int32_t kStride = 1024;      // 2^10 — forces shared low bits
+  constexpr int kCount = 257;            // one past a full 256-entry bucket
+  const uint32_t initial_depth = hash_index_->global_depth();
+
+  for (int i = 0; i < kCount; ++i) {
+    const int32_t key = i * kStride;
+    ASSERT_TRUE(hash_index_->insert(key, key * 2).ok())
+        << "insert failed for key " << key << " (needs multiple splits)";
+  }
+
+  // Every key must be present and the total exact.
+  for (int i = 0; i < kCount; ++i) {
+    const int32_t key = i * kStride;
+    auto val = hash_index_->find(key);
+    ASSERT_TRUE(val.has_value()) << "missing key " << key;
+    EXPECT_EQ(*val, static_cast<int64_t>(key) * 2);
+  }
+  EXPECT_EQ(hash_index_->size(), static_cast<size_t>(kCount));
+
+  // Relieving the overflow required growing well past a single split.
+  EXPECT_GT(hash_index_->global_depth(), initial_depth + 1);
+}
+
 TEST_F(HashIndexTest, StringKeys) {
   HashIndex<std::string, int32_t> string_index(2);
 
