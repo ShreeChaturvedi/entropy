@@ -13,6 +13,8 @@
 
 #include "execution/index_scan_executor.hpp"
 
+#include "execution/executor_context.hpp"
+
 namespace entropy {
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -80,6 +82,24 @@ void IndexScanExecutor::init() {
 // next() - Return next matching tuple
 // ─────────────────────────────────────────────────────────────────────────────
 
+std::optional<Tuple> IndexScanExecutor::fetch_visible(RID rid) {
+  Tuple tuple;
+  Status status = table_heap_->get_tuple(rid, &tuple);
+  if (!status.ok()) {
+    // Ghost probe, matching the seq scan's policy: only a transactional scan
+    // asks the version store whether a freed slot still has a before-image
+    // visible to its snapshot. Outside a transaction a missing tuple is
+    // simply gone.
+    if (ctx_ == nullptr || ctx_->txn == nullptr) {
+      return std::nullopt;
+    }
+    return mvcc_visible(ctx_, Tuple({}, rid));
+  }
+  // The index still points at a RID whose heap version may be invisible to
+  // this snapshot; the version store makes the call.
+  return mvcc_visible(ctx_, tuple);
+}
+
 std::optional<Tuple> IndexScanExecutor::next() {
   switch (scan_type_) {
   case IndexScanType::POINT_LOOKUP: {
@@ -88,14 +108,7 @@ std::optional<Tuple> IndexScanExecutor::next() {
       return std::nullopt;
     }
     point_lookup_done_ = true;
-
-    // Fetch tuple from table heap
-    Tuple tuple;
-    Status status = table_heap_->get_tuple(*point_lookup_rid_, &tuple);
-    if (status.ok()) {
-      return tuple;
-    }
-    return std::nullopt;
+    return fetch_visible(*point_lookup_rid_);
   }
 
   case IndexScanType::RANGE_SCAN: {
@@ -109,13 +122,10 @@ std::optional<Tuple> IndexScanExecutor::next() {
         return std::nullopt;
       }
 
-      // Fetch tuple from table heap
-      Tuple tuple;
-      Status status = table_heap_->get_tuple(rid, &tuple);
-      if (status.ok()) {
-        return tuple;
+      if (std::optional<Tuple> visible = fetch_visible(rid); visible) {
+        return visible;
       }
-      // RID might be invalid (deleted), continue to next
+      // Deleted or invisible to this snapshot; continue.
     }
     return std::nullopt;
   }
@@ -126,13 +136,10 @@ std::optional<Tuple> IndexScanExecutor::next() {
       auto [key, rid] = *iterator_;
       ++iterator_;
 
-      // Fetch tuple from table heap
-      Tuple tuple;
-      Status status = table_heap_->get_tuple(rid, &tuple);
-      if (status.ok()) {
-        return tuple;
+      if (std::optional<Tuple> visible = fetch_visible(rid); visible) {
+        return visible;
       }
-      // Continue to next if current RID invalid
+      // Deleted or invisible to this snapshot; continue.
     }
     return std::nullopt;
   }

@@ -207,13 +207,23 @@ TEST_F(VersionStoreTest, GcDropsCommittedDeletedChain) {
   EXPECT_EQ(store_.chain_count(), 0u);
 }
 
-// Rollback removes an uncommitted insert entirely.
+// Rollback invalidates an uncommitted insert: the node is kept as a tombstone
+// (so a reader racing the abort teardown still finds proof the bytes were
+// never committed) but is invisible to every snapshot, and GC prunes it.
 TEST_F(VersionStoreTest, RollbackRemovesUncommittedInsert) {
   Transaction txn(1);
   ASSERT_TRUE(store_.on_insert(&txn, rid_).ok());
   ASSERT_EQ(store_.chain_length(rid_), 1u);
 
   store_.rollback(&txn);
+
+  const std::string heap_bytes = "ZOMBIE";
+  Transaction reader(2);
+  EXPECT_FALSE(store_.read_visible(rid_, span_of(heap_bytes), &reader)
+                   .has_value())
+      << "rolled-back insert still visible through its chain";
+
+  store_.gc(100);
   EXPECT_EQ(store_.chain_length(rid_), 0u);
 }
 
@@ -229,12 +239,16 @@ TEST_F(VersionStoreTest, RollbackRevertsUncommittedUpdate) {
   ASSERT_EQ(store_.chain_length(rid_), 2u);
 
   store_.rollback(&updater);
-  EXPECT_EQ(store_.chain_length(rid_), 1u);
 
+  // The committed version is what every reader sees again; the invalidated
+  // update survives only as a tombstone until GC.
   Transaction reader(3);
   auto v = store_.read_visible(rid_, span_of(heap_v1), &reader);
   ASSERT_TRUE(v.has_value());
   EXPECT_EQ(bytes_of(*v), "V1");
+
+  store_.gc(100);
+  EXPECT_EQ(store_.chain_length(rid_), 1u) << "tombstone not pruned";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

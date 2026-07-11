@@ -2847,8 +2847,15 @@ TEST_F(MVCCTxnIntegrationTest, AbortRestoresHeapAndDropsUncommittedVersions) {
   tm_->abort(txn);
 
   EXPECT_FALSE(tuple_exists(rid)) << "aborted INSERT must be undone in the heap";
+  // The invalidated version is kept as a tombstone (a reader racing the abort
+  // teardown must still find proof the bytes were never committed) but is
+  // invisible to every snapshot; GC prunes it.
+  auto *reader = tm_->begin();
+  EXPECT_FALSE(version_store_->read_visible(rid, {}, reader).has_value())
+      << "aborted version still visible";
+  tm_->commit(reader);
   EXPECT_EQ(version_store_->chain_length(rid), 0u)
-      << "abort must drop the uncommitted version";
+      << "commit-time GC must prune the aborted version's tombstone";
   EXPECT_EQ(tm_->active_transaction_count(), 0u);
 }
 

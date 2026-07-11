@@ -5,6 +5,8 @@
 
 #include "execution/update_executor.hpp"
 
+#include <vector>
+
 namespace entropy {
 
 namespace {
@@ -40,6 +42,7 @@ TupleValue convert_to_type(const TupleValue &val, TypeId target_type) {
 void UpdateExecutor::init() {
   rows_updated_ = 0;
   done_ = false;
+  status_ = Status::Ok();
   if (child_) {
     child_->init();
   }
@@ -58,6 +61,13 @@ std::optional<Tuple> UpdateExecutor::next() {
   while (auto tuple = child_->next()) {
     to_update.push_back(std::move(*tuple));
   }
+
+  // Loop-invariant transaction plumbing: the barrier keeps each mutation +
+  // log atomic against a checkpoint (F3); the slot-reserved predicate keeps a
+  // relocation's insert off a slot an uncommitted DELETE will restore into
+  // (F1). Both are null without a transaction context (executor unit tests).
+  std::shared_mutex *barrier = txn_checkpoint_barrier(ctx_);
+  const SlotReservedFn slot_reserved = txn_slot_reserved(ctx_);
 
   // Phase 2: apply SET expressions to the snapshotted rows only.
   for (const auto &tuple : to_update) {
@@ -81,12 +91,73 @@ std::optional<Tuple> UpdateExecutor::next() {
       new_values[col_idx] = convert_to_type(new_val, target_type);
     }
 
-    // Create new tuple and update
     Tuple new_tuple(new_values, *schema_);
-    Status status = table_heap_->update_tuple(new_tuple, rid);
-    if (status.ok()) {
-      rows_updated_++;
+
+    // Pre-mutation: row lock + first-updater-wins registration against the
+    // before-image. A conflict aborts before the heap is touched, and the
+    // lock is held until commit/abort so no other writer can interleave
+    // between this check and the mutation.
+    Status status =
+        txn_acquire_write(ctx_, table_oid_, rid, tuple, TxnWriteKind::kUpdate);
+    if (!status.ok()) {
+      status_ = status;
+      break;
     }
+
+    // The in-place mutation + its UPDATE record run under one checkpoint-
+    // barrier hold so the page cannot be checkpoint-flushed ahead of its
+    // record (F3).
+    status = table_heap_->update_tuple_in_place(
+        new_tuple, rid,
+        [&] { txn_log_update(ctx_, table_oid_, rid, tuple, new_tuple); },
+        barrier);
+    if (status.ok()) {
+      // In-place update: one UPDATE record at the original RID.
+      rows_updated_++;
+      continue;
+    }
+    if (status.code() != StatusCode::kOutOfMemory) {
+      status_ = status; // row vanished or page error: surface it
+      break;
+    }
+
+    // The new bytes do not fit in place: relocate as an explicit, logged
+    // delete+insert. A single UPDATE record at the old RID could not be
+    // redone (the old slot is empty after replaying the delete), and the new
+    // RID needs its own version metadata or its uncommitted bytes would be
+    // exposed to every snapshot. Order: convert the pending update on the
+    // old chain into a delete, free the old slot (older snapshots keep
+    // reading the retained before-image through the chain), log the delete
+    // AFTER the slot is freed (so the stamped page LSN never claims an
+    // unapplied delete), then insert+publish the new location and lock it.
+    // Each heap step holds the checkpoint barrier across its mutate + log (F3).
+    status = txn_acquire_write(ctx_, table_oid_, rid, tuple,
+                               TxnWriteKind::kDelete);
+    if (!status.ok()) {
+      status_ = status;
+      break;
+    }
+    status = table_heap_->delete_tuple(
+        rid, [&] { txn_log_delete(ctx_, table_oid_, rid, tuple); }, barrier);
+    if (!status.ok()) {
+      status_ = status;
+      break;
+    }
+
+    RID new_rid;
+    status = table_heap_->insert_tuple(
+        new_tuple, &new_rid, txn_insert_hook(ctx_, table_oid_, new_tuple),
+        barrier, slot_reserved);
+    if (!status.ok()) {
+      status_ = status;
+      break;
+    }
+    status = txn_lock_row(ctx_, table_oid_, new_rid);
+    if (!status.ok()) {
+      status_ = status;
+      break;
+    }
+    rows_updated_++;
   }
 
   done_ = true;
