@@ -145,8 +145,11 @@ public:
   /**
    * @brief Undo all uncommitted version changes made by this transaction.
    *
-   * Uncommitted creations are removed from their chains; uncommitted deletes
-   * are reverted, leaving the underlying committed version intact.
+   * Uncommitted creations are invalidated in place (kept as tombstones so a
+   * reader racing the abort teardown still finds proof the bytes it copied
+   * were never committed); uncommitted deletes are reverted, leaving the
+   * underlying committed version intact. Tombstones are pruned by the next
+   * writer on the RID or by gc().
    */
   void rollback(const Transaction *txn);
 
@@ -156,10 +159,20 @@ public:
    * @param min_active_start_ts The smallest start_ts among active
    *        transactions (or the current clock value if none are active). Older
    *        before-images superseded by a version committed at or before this
-   *        bound are removed, and chains whose row is committed-deleted at or
-   *        before it are dropped entirely.
+   *        bound are removed, rollback tombstones are dropped, and chains
+   *        whose row is committed-deleted at or before the bound are dropped
+   *        entirely.
    */
   void gc(uint64_t min_active_start_ts);
+
+  /**
+   * @brief Drop every chain living on the given pages.
+   *
+   * Called when a table is dropped: its heap pages are reclaimed and may be
+   * reused by a different table, so stale chains keyed by the old RIDs must
+   * not leak into the new table's visibility decisions.
+   */
+  void purge_pages(const std::unordered_set<page_id_t> &pages);
 
   // ───────────────────────────────────────────────────────────────────────
   // Introspection (testing / diagnostics)
