@@ -77,6 +77,8 @@ private:
   std::unique_ptr<DeleteStatement> parse_delete();
   std::unique_ptr<CreateTableStatement> parse_create_table();
   std::unique_ptr<DropTableStatement> parse_drop_table();
+  std::unique_ptr<CreateIndexStatement> parse_create_index();
+  std::unique_ptr<DropIndexStatement> parse_drop_index();
   std::unique_ptr<ExplainStatement> parse_explain();
 
   // ─────────────────────────────────────────────────────────────────────────
