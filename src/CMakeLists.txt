@@ -104,6 +104,31 @@ target_link_libraries(entropy_transaction
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Simulation Library (deterministic crash-simulation harness)
+# ─────────────────────────────────────────────────────────────────────────────
+
+add_library(entropy_sim STATIC
+    sim/sim_disk_manager.cpp
+    sim/sim_log_store.cpp
+    sim/workload.cpp
+    sim/schedule.cpp
+)
+
+target_include_directories(entropy_sim
+    PUBLIC
+        ${ENTROPY_INCLUDE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_link_libraries(entropy_sim
+    PUBLIC
+        entropy_common
+        entropy_storage
+        entropy_catalog
+        entropy_transaction
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Parser Library
 # ─────────────────────────────────────────────────────────────────────────────
 
