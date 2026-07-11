@@ -69,6 +69,7 @@ size_t RandomWorkload::run(const WorkloadContext &ctx, std::mt19937_64 &rng,
                            Oracle &oracle, size_t num_txns,
                            bool leave_in_flight) {
   size_t ops = 0;
+  aborts_ = 0;
   std::vector<RID> live;  // committed RIDs available to update/delete
 
   // Pick a random already-committed row to update/delete. Returns the map entry
@@ -207,6 +208,7 @@ size_t RandomWorkload::run(const WorkloadContext &ctx, std::mt19937_64 &rng,
       }
     } else {
       ctx.tm->abort(txn);
+      ++aborts_;
       // Aborted effects vanish; oracle and `live` are unchanged.
     }
   }
