@@ -418,16 +418,34 @@ Leaf Node:
 ## Threading Model
 
 ### Concurrency Strategy
-1. **Buffer Pool**: Thread-safe with per-page latches (shared/exclusive)
-2. **B+ Tree**: Latch crabbing protocol for concurrent access
+1. **Buffer Pool**: Thread-safe (internal mutex); every `Page` carries a
+   shared/exclusive latch used by the B+ tree
+2. **B+ Tree**: Latch crabbing (hand-over-hand page latches) — concurrent
+   readers and range scans; structural writers (insert/delete) are serialized
+   and shed ancestor latches once a node is split/merge-safe
 3. **Transaction Manager**: Centralized lock manager with 2PL + MVCC
 4. **WAL**: Single-writer with group commit optimization
 
 ### Lock Hierarchy (to prevent deadlocks)
 1. Lock Manager mutex
 2. Transaction mutexes
-3. Buffer pool frame latches
-4. Page latches (acquired via crabbing)
+3. B+ tree writer mutex (serializes structural writers)
+4. Page latches (acquired via crabbing: ancestors before descendants,
+   left siblings before right)
+5. Buffer pool internal mutex (leaf-level; never held while waiting on a
+   page latch)
+
+B+ tree deadlock freedom is reader-vs-writer (writer serialization removes
+writer-vs-writer ordering; readers run concurrently with the writer) and has
+two parts. At the leaf level all latch waits go left-to-right: a writer
+turning left first releases any right-sibling latch before re-latching the
+node, and parent-pointer maintenance is latch-free (the field is writer-only;
+latching would touch pages left of held leaf latches). At internal levels the
+writer's re-latches do not follow a global order but cannot block: the
+underflowing node's parent stays write-latched, fencing descent readers out of
+the subtree, and chain scanners never hold internal pages. A grown root is
+published unlatched via a release-store of the root id (readers use an acquire
+load). See the design notes in b_plus_tree.cpp for the full argument.
 
 ---
 

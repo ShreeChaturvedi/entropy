@@ -165,11 +165,15 @@ void TransactionManager::abort(Transaction* txn) {
 
     // Undo all modifications in reverse order using the write set, collecting
     // the pages the undo compensated so they can be forced to disk before the
-    // WAL ABORT record is made durable.
+    // WAL ABORT record is made durable. Each physical undo also emits a redoable
+    // compensation record (CLR) and stamps its LSN onto the page, so recovery's
+    // repeat-history redo reproduces the undone state even if the compensated
+    // page was lost at a crash and rebuilt from the log (#75/#81).
     std::unordered_set<page_id_t> undone_pages;
     const auto& write_set = txn->write_set();
     for (auto it = write_set.rbegin(); it != write_set.rend(); ++it) {
         undo_write_record(*it);
+        log_compensation(txn, *it);
         if (it->rid.page_id >= 0) {
             undone_pages.insert(it->rid.page_id);
         }
@@ -303,6 +307,52 @@ void TransactionManager::undo_write_record(const WriteRecord& record) {
             break;
         }
     }
+}
+
+void TransactionManager::log_compensation(Transaction* txn,
+                                          const WriteRecord& record) {
+    if (wal_manager_ == nullptr || txn == nullptr) {
+        return;
+    }
+
+    // Emit the inverse of the write-set entry the undo above just applied, as a
+    // normal redoable data record, then stamp its LSN onto the page. Recovery
+    // repeats history from the log: it replays the original mutation AND this
+    // compensation, so a transaction that aborted during normal operation leaves
+    // none of its effects behind — its inserts are re-deleted and its
+    // delete/update of a committed row is restored — even when the compensated
+    // page never reached disk and is rebuilt purely from the log. The undo phase
+    // never revisits such a transaction (its ABORT record is already durable, so
+    // it is not a loser), which is exactly why the compensation must live in the
+    // log rather than only in the page the crash may drop (#75/#81).
+    LogRecord clr;
+    switch (record.type) {
+        case WriteType::INSERT:
+            // Undo of an INSERT is a DELETE at the same rid; redo drops the slot
+            // and needs no payload.
+            clr = LogRecord::make_delete(txn->txn_id(), txn->prev_lsn(),
+                                         record.table_oid, record.rid, {});
+            break;
+        case WriteType::DELETE:
+            // Undo of a DELETE restores the row; redo re-inserts the before-image
+            // the write record carries.
+            clr = LogRecord::make_insert(txn->txn_id(), txn->prev_lsn(),
+                                         record.table_oid, record.rid,
+                                         record.old_data);
+            break;
+        case WriteType::UPDATE:
+            // Undo of an UPDATE restores the before-image in place; redo writes it
+            // back as the new image. A CLR is never itself undone, so it carries
+            // no separate before-image.
+            clr = LogRecord::make_update(txn->txn_id(), txn->prev_lsn(),
+                                         record.table_oid, record.rid,
+                                         /*old_data=*/{}, record.old_data);
+            break;
+    }
+
+    lsn_t lsn = wal_manager_->append_log(clr);
+    txn->set_prev_lsn(lsn);
+    stamp_page_lsn(record.rid, lsn);
 }
 
 Transaction* TransactionManager::get_transaction(txn_id_t txn_id) {
