@@ -11,17 +11,26 @@
 [![c++](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
 
 Entropy is a high-performance relational database engine built from scratch in
-modern C++20. It showcases core database internals: B+ tree storage, MVCC,
-ACID transactions, write-ahead logging, and a cost-based query optimizer.
+modern C++20. It showcases core database internals: slotted-page storage, a
+latch-crabbing B+ tree, MVCC snapshot isolation, ACID transactions, write-ahead
+logging with ARIES-style crash recovery, and a cost-based query optimizer, all
+exercised by a deterministic, FoundationDB-style crash simulator.
 
 ## Highlights
 
-- End-to-end SQL engine: parser, binder, optimizer, execution.
-- Storage engine with B+ trees, hash indexes, and buffer pool caching.
-- MVCC + WAL for snapshot isolation and crash recovery.
+- End-to-end SQL engine: recursive-descent parser, type-checking binder,
+  cost-based optimizer, and Volcano-model executors.
+- Storage engine with a slotted-page heap, a latch-crabbing B+ tree, an
+  extendible hash index, and an LRU buffer pool.
+- ACID transactions: MVCC snapshot isolation, write-ahead logging, and
+  ARIES-style crash recovery.
+- CRC-32 page checksums on by default catch torn writes and bit rot on read.
+- Deterministic, FoundationDB-style crash simulator: seeded fault injection,
+  replayable schedules, and post-recovery invariant checks.
 - Unit and integration tests wired to CTest + GoogleTest.
 - Benchmarks with optional SQLite comparison and reproducible scripts.
-- Cross-platform CMake build with Linux/macOS/Windows CI.
+- Cross-platform CMake build with Linux/macOS/Windows CI, AddressSanitizer,
+  UBSan, ThreadSanitizer, and a `find_package` consumer smoke test.
 
 ## Architecture
 
@@ -37,14 +46,17 @@ database pipeline. The system is split into layers with explicit boundaries.
 
 ### SQL Frontend
 
-- Lexer and parser build an AST for SELECT, INSERT, UPDATE, DELETE, and CREATE TABLE.
-- Binder resolves names and types using catalog metadata and column indexes.
+- Hand-written recursive-descent parser builds an AST for SELECT, INSERT, UPDATE,
+  DELETE, CREATE TABLE, CREATE INDEX, DROP TABLE, DROP INDEX, and EXPLAIN.
+- Binder resolves names and types against catalog metadata and rejects type
+  errors at bind time (for example comparing a string column to a numeric literal).
 
 ### Planning and Optimization
 
 - Statistics track row counts and simple selectivity estimates.
 - Cost model compares index scans and sequential scans for predicates.
 - Index selector chooses point lookup and range scan paths when an index exists.
+- Join method is chosen by cost: hash join for equi-joins, nested loop otherwise.
 
 ### Execution
 
@@ -53,16 +65,48 @@ database pipeline. The system is split into layers with explicit boundaries.
 
 ### Transactions and Recovery
 
-- MVCC version chains with timestamp visibility checks.
-- Lock manager enforces isolation with deadlock detection.
-- WAL records are flushed on commit and replayed on recovery.
+- MVCC version store with snapshot-isolation visibility and first-updater-wins
+  write-write conflict detection.
+- Lock manager with wait-for-graph deadlock detection and wait-die victim
+  selection. Rollback undoes writes through compensation log records.
+- Write-ahead log is fsync'd on commit. ARIES-style recovery runs analysis,
+  redo, and undo phases, anchored at the last checkpoint with page-LSN-gated redo.
 
 ### Storage and Buffering
 
 - Slotted pages back a table heap for variable length tuples.
 - B+ tree and extendible hash indexes support range and point access.
 - Buffer pool uses an LRU replacer with pin and dirty tracking.
-- Disk manager handles page and WAL IO.
+- Disk manager handles page and WAL IO and verifies a CRC-32 checksum on every
+  page read, so torn writes and bit rot surface as an explicit corruption error.
+
+## Crash Simulation
+
+Entropy ships with a deterministic, FoundationDB-style crash simulator that
+drives the engine through fault-injected storage and replays failures from a
+seed. Every run is reproducible: one 64-bit seed fans out into independent PRNG
+streams for the workload, the page device, and the log store, so a failing
+schedule replays byte for byte.
+
+- `SimDiskManager` and `SimLogStore` stand in for the file backend and model a
+  durability boundary at `fsync`. On a simulated crash, unsynced page and log
+  writes resolve to lost, torn, or durably-kept outcomes, and transient write
+  errors can be injected on the way there.
+- Named, replayable schedules place the crash at specific points, for example
+  between the WAL flush and the page flush, or partway through the WAL tail.
+- After each crash the harness reopens the database, runs recovery, and checks
+  invariants against an oracle: every committed row is present byte for byte,
+  and no uncommitted or rolled-back write is visible.
+
+Run a sweep of seeds:
+
+```bash
+entropy-sim --seeds 100 --schedule mixed
+entropy-sim --list          # list available schedules
+```
+
+Each run appends one JSONL line (faults fired, redo/undo work, invariant
+results) so a whole sweep is machine-checkable. The suite runs in CI.
 
 ## Performance Snapshot (vs SQLite)
 
@@ -73,6 +117,7 @@ Run file: `docs/benchmarks/runs/bench-20251226-214051.json`
 - Build: Release (`-O3`)
 SQLite baselines are collected when `ENTROPY_BENCH_COMPARE_SQLITE=ON`.
 
+<!-- numbers pending re-measure: durable-vs-durable run in progress -->
 Per-iteration ns/op (ratio = Entropy / SQLite, lower is better):
 
 | Case | Rows | Entropy (ns/op) | SQLite (ns/op) | Ratio |
@@ -170,11 +215,28 @@ ctest --preset dev
 | `ENTROPY_BUILD_BENCHMARKS` | &#10007; | Build benchmarks |
 | `ENTROPY_BENCH_COMPARE_SQLITE` | &#10007; | Build SQLite comparison benchmarks |
 | `ENTROPY_BUILD_EXAMPLES` | &#10003; | Build example programs |
+| `ENTROPY_ENABLE_ASAN` | &#10007; | Build with AddressSanitizer |
+| `ENTROPY_ENABLE_TSAN` | &#10007; | Build with ThreadSanitizer |
 
 ## CI/CD and Releases
 
 - CI builds and tests on Linux/macOS/Windows via GitHub Actions.
+- AddressSanitizer + UBSan and ThreadSanitizer jobs run the full suite on Linux.
+- A downstream job installs the package and consumes it through
+  `find_package(entropy)` linking `entropy::entropy`, proving the exported
+  package config is usable.
 - Releases are created automatically on `v*` tags with OS-specific binaries.
+
+## Roadmap
+
+The primary-key and heap path is the source of truth and always reflects
+writes, so sequential scans and the transactional engine are always correct.
+Secondary indexes are scoped roadmap work:
+
+- Equality on a non-unique indexed column returns a single row, and index build
+  drops duplicate keys ([#8](https://github.com/ShreeChaturvedi/entropy/issues/8)).
+- INSERT, UPDATE, and DELETE do not yet maintain secondary indexes, so an index
+  can desync from the heap after writes ([#11](https://github.com/ShreeChaturvedi/entropy/issues/11)).
 
 ## Documentation
 
