@@ -53,16 +53,21 @@ static_assert(sizeof(PageHeader) == 32, "PageHeader must be 32 bytes");
 // A page's 4-byte header checksum (offset 12) lets the disk manager DETECT a
 // torn/partial write at read time instead of silently returning corrupt bytes.
 // The disk manager computes it over the whole page image on write and re-checks
-// it on read; a mismatch is surfaced as a Corruption Status. See the disk
-// manager for how the two backends opt in, and recovery for how a detected torn
-// page is treated (its contents are discarded and rebuilt from the WAL redo).
+// it on read; a mismatch is surfaced as a Corruption Status.
 //
-// NOTE: the checksum lives at the PageHeader offset, which only PageHeader-style
-// pages (table heap, catalog/header pages) reserve. B+ tree pages use a
-// different header whose bytes 12-15 hold parent_page_id, so checksumming is
-// applied only where every page carries a PageHeader (the simulator's page
-// store, and FileDiskManager when explicitly enabled) — never blanket-stamped
-// across a store that also holds B+ tree pages.
+// The checksum occupies bytes [12, 16) of the common 32-byte PageHeader, which
+// EVERY page carries at offset 0. That 4-byte slot is the one region no page
+// type overlays with payload, so stamping it corrupts nothing:
+//   - table heap / catalog data pages keep their slotted-page fields at [16, 22)
+//     and their heap next/prev links in reserved bytes [23, 31);
+//   - B+ tree internal and leaf nodes place their own BPTreeHeader at
+//     kPageHeaderSize (offset 32), so parent_page_id sits at offset 44, not 12,
+//     and their keys/children begin at offset 48 — bytes [12, 16) are untouched;
+//   - lsn [0, 8) and page_id [8, 12) precede the slot and are read, not payload.
+// Because the slot is universally free, both backends stamp/verify it on every
+// page: SimDiskManager always, and FileDiskManager by default (see disk
+// manager). Recovery treats a detected torn page as needing WAL redo: its
+// contents are discarded and rebuilt from the log.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Byte offset of PageHeader::checksum within a page image.
