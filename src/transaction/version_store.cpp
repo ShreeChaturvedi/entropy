@@ -27,6 +27,23 @@ VersionStore::VersionNode make_prehistory_base() {
   return base;
 }
 
+/// A version invalidated by rollback (begin_ts == TIMESTAMP_MAX). Kept on the
+/// chain as a tombstone so a reader that raced the abort's two-step teardown
+/// (heap bytes removed, then chain updated) still finds a marker proving the
+/// bytes it copied were never committed. Invisible to every snapshot forever.
+bool is_invalidated(const VersionInfo &info) noexcept {
+  return info.begin_ts == TIMESTAMP_MAX;
+}
+
+/// Drop trailing rollback tombstones so mutators and GC always operate on the
+/// last real version. Safe at any time: a tombstone's heap bytes were removed
+/// before the tombstone was created, so nothing can resurrect through it.
+void prune_invalidated_tail(std::vector<VersionStore::VersionNode> &chain) {
+  while (!chain.empty() && is_invalidated(chain.back().info)) {
+    chain.pop_back();
+  }
+}
+
 } // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -39,9 +56,11 @@ Status VersionStore::on_insert(const Transaction *txn, RID rid) {
   }
 
   std::unique_lock lock(latch_);
+  auto &chain = chains_[rid];
+  prune_invalidated_tail(chain);
   VersionNode node;
   mvcc_.init_version(node.info, txn); // created_by = txn, begin_ts = 0
-  chains_[rid].push_back(std::move(node));
+  chain.push_back(std::move(node));
   txn_touched_[txn->txn_id()].insert(rid);
   return Status::Ok();
 }
@@ -54,6 +73,7 @@ Status VersionStore::on_update(const Transaction *txn, RID rid,
 
   std::unique_lock lock(latch_);
   auto &chain = chains_[rid];
+  prune_invalidated_tail(chain);
   if (chain.empty()) {
     chain.push_back(make_prehistory_base());
   }
@@ -87,6 +107,7 @@ Status VersionStore::on_delete(const Transaction *txn, RID rid,
 
   std::unique_lock lock(latch_);
   auto &chain = chains_[rid];
+  prune_invalidated_tail(chain);
   if (chain.empty()) {
     chain.push_back(make_prehistory_base());
   }
@@ -119,7 +140,12 @@ VersionStore::read_visible(RID rid, std::span<const char> heap_bytes,
   std::shared_lock lock(latch_);
   auto it = chains_.find(rid);
   if (it == chains_.end()) {
-    // No MVCC metadata: treat the heap value as a committed, visible row.
+    // No MVCC metadata. An occupied slot is a committed, visible row (data
+    // that predates its chain, e.g. loaded from disk). An empty slot with no
+    // chain is simply a hole — nothing to see.
+    if (heap_bytes.empty()) {
+      return std::nullopt;
+    }
     return std::vector<char>(heap_bytes.begin(), heap_bytes.end());
   }
 
@@ -137,6 +163,11 @@ VersionStore::read_visible(RID rid, std::span<const char> heap_bytes,
     // concurrent gc()/rollback().
     const bool is_head = (rit == chain.rbegin());
     if (is_head && node.info.deleted_by == TXN_ID_NONE) {
+      if (heap_bytes.empty()) {
+        // A live head's bytes should be in the heap; an empty slot here means
+        // the reader raced a teardown mid-step. Nothing sound to return.
+        return std::nullopt;
+      }
       return std::vector<char>(heap_bytes.begin(),
                                heap_bytes.end()); // live head: heap bytes
     }
@@ -191,7 +222,7 @@ void VersionStore::rollback(const Transaction *txn) {
     }
     auto &chain = cit->second;
 
-    // Walk newest-first: remove uncommitted creations, revert uncommitted
+    // Walk newest-first: invalidate uncommitted creations, revert uncommitted
     // deletes. At most one node per chain is uncommitted by this transaction.
     for (size_t i = chain.size(); i-- > 0;) {
       VersionInfo &info = chain[i].info;
@@ -199,14 +230,21 @@ void VersionStore::rollback(const Transaction *txn) {
           (info.created_by == tid && info.begin_ts == 0);
       const bool deleted_here =
           (info.deleted_by == tid && info.end_ts == TIMESTAMP_MAX);
-      if (created_here) {
-        // Uncommitted creation (covers create and create+delete): drop it. If
-        // this was an update, the superseded version below becomes the head.
-        chain.erase(chain.begin() + static_cast<std::ptrdiff_t>(i));
-      } else if (deleted_here) {
-        // Uncommitted delete of a version this transaction did not create:
-        // undo just the delete; the committed version survives.
+      if (created_here || deleted_here) {
+        // rollback_version invalidates a created version (begin_ts = MAX) or
+        // reverts a bare delete. An invalidated creation is KEPT as a
+        // tombstone rather than erased: the abort's teardown is two steps
+        // (heap bytes removed, then the chain updated), and a reader that
+        // copied the bytes before step one must still find a chain entry
+        // proving they were never committed when it checks visibility after
+        // step two. The next writer on this RID prunes tombstones; GC prunes
+        // them once no snapshot old enough to have copied the doomed bytes
+        // is still active, using the invalidation timestamp stamped here
+        // into the (otherwise meaningless) end_ts.
         mvcc_.rollback_version(info, txn);
+        if (info.begin_ts == TIMESTAMP_MAX) {
+          info.end_ts = mvcc_.get_timestamp();
+        }
         chain[i].before_image.clear();
       }
     }
@@ -222,6 +260,17 @@ void VersionStore::gc(uint64_t min_active_start_ts) {
   std::unique_lock lock(latch_);
   for (auto it = chains_.begin(); it != chains_.end();) {
     auto &chain = it->second;
+    // Rollback tombstones are invisible to everyone, but they may only be
+    // ERASED once every transaction old enough to have copied the aborted
+    // bytes (before the abort's undo removed them) has ended — a younger
+    // reader consulting an already-erased chain would take stale bytes for a
+    // committed row. The invalidation time lives in the tombstone's end_ts.
+    // (Mutators prune unconditionally: they replace the tombstone with a
+    // real head, so the chain keeps marking the RID.)
+    while (!chain.empty() && is_invalidated(chain.back().info) &&
+           chain.back().info.end_ts < min_active_start_ts) {
+      chain.pop_back();
+    }
     if (chain.empty()) {
       it = chains_.erase(it);
       continue;
@@ -243,14 +292,33 @@ void VersionStore::gc(uint64_t min_active_start_ts) {
     }
 
     // 2. If the row is committed-deleted and the delete is visible to every
-    //    active snapshot, no one can observe it: drop the whole chain.
+    //    active snapshot, no one can observe it: drop the whole chain. A
+    //    surviving tombstone head is NOT a committed delete even though its
+    //    end_ts is stamped — skip such chains until the tombstone retires.
     const VersionInfo &head = chain.back().info;
-    if (is_committed_delete(head) && head.end_ts <= min_active_start_ts) {
+    if (!is_invalidated(head) && is_committed_delete(head) &&
+        head.end_ts <= min_active_start_ts) {
       it = chains_.erase(it);
       continue;
     }
     ++it;
   }
+}
+
+void VersionStore::purge_pages(const std::unordered_set<page_id_t> &pages) {
+  if (pages.empty()) {
+    return;
+  }
+  std::unique_lock lock(latch_);
+  for (auto it = chains_.begin(); it != chains_.end();) {
+    if (pages.contains(it->first.page_id)) {
+      it = chains_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  // txn_touched_ entries pointing at purged RIDs are harmless: finalize and
+  // rollback skip RIDs whose chains no longer exist.
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
