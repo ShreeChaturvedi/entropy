@@ -229,6 +229,12 @@ TEST_P(SchedulePassSweep, RecoversToACorrectStateAcrossSeeds) {
           << "schedule=" << GetParam() << " seed=" << seed
           << ": recovery's undo phase must be genuinely exercised";
     }
+    if (sched->expect_aborts) {
+      EXPECT_GT(r.aborts, 0u)
+          << "schedule=" << GetParam() << " seed=" << seed
+          << ": at least one transaction must abort during normal operation, "
+             "or the abort-recovery coverage is vacuous";
+    }
     if (sched->expect_zero_faults) {
       EXPECT_EQ(r.faults_injected, 0u)
           << "schedule=" << GetParam() << " seed=" << seed

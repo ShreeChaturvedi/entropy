@@ -52,6 +52,9 @@ PROGRESS.md
 docs/benchmarks/runs/*.json
 !docs/benchmarks/runs/bench-20251226-214051.json
 
+# Simulator run output (entropy-sim default results file)
+entropy-sim.jsonl
+
 # Dependencies (if manually added)
 third_party/*/
 !third_party/README.md
