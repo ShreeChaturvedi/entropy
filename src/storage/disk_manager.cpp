@@ -12,6 +12,15 @@
 #include "common/macros.hpp"
 
 namespace entropy {
+namespace {
+
+// Byte offset of a page within the database file.
+[[nodiscard]] std::streamoff page_offset(page_id_t page_id) {
+    return static_cast<std::streamoff>(page_id) *
+           static_cast<std::streamoff>(DiskManager::page_size());
+}
+
+}  // namespace
 
 FileDiskManager::FileDiskManager(const std::string& db_file,
                                  bool create_if_missing, bool error_if_exists)
@@ -73,9 +82,7 @@ Status FileDiskManager::read_page(page_id_t page_id, char* page_data) {
     // is not spuriously rejected (and so we do not latch all later I/O off).
     db_io_.clear();
 
-    const auto offset = static_cast<std::streamoff>(page_id) *
-                        static_cast<std::streamoff>(page_size());
-    db_io_.seekg(offset, std::ios::beg);
+    db_io_.seekg(page_offset(page_id), std::ios::beg);
 
     if (!db_io_) {
         return Status::IOError("Failed to seek to page");
@@ -113,9 +120,7 @@ Status FileDiskManager::write_page(page_id_t page_id, const char* page_data) {
     // Clear any leftover failbit/eofbit from a prior short read.
     db_io_.clear();
 
-    const auto offset = static_cast<std::streamoff>(page_id) *
-                        static_cast<std::streamoff>(page_size());
-    db_io_.seekp(offset, std::ios::beg);
+    db_io_.seekp(page_offset(page_id), std::ios::beg);
 
     if (!db_io_) {
         return Status::IOError("Failed to seek to page");
@@ -168,9 +173,7 @@ void FileDiskManager::deallocate_page(page_id_t page_id) {
 
     // Zero the page on disk so a reused id reads back like a fresh page.
     db_io_.clear();
-    const auto offset = static_cast<std::streamoff>(page_id) *
-                        static_cast<std::streamoff>(page_size());
-    db_io_.seekp(offset, std::ios::beg);
+    db_io_.seekp(page_offset(page_id), std::ios::beg);
     const std::vector<char> zeros(page_size(), 0);
     db_io_.write(zeros.data(), static_cast<std::streamsize>(page_size()));
     if (db_io_.bad()) {
