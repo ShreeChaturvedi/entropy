@@ -12,6 +12,7 @@
 
 #include "entropy/database.hpp"
 
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -470,26 +471,42 @@ public:
   }
 
   // Drain @p executor and materialize the rows under @p output_schema.
+  //
+  // Expression evaluation (computed projections, aggregates) runs lazily as the
+  // executor tree is initialized and pulled here. An ill-typed but parseable
+  // expression (e.g. `name + 1` on a VARCHAR column, `SUM(name)`) can surface a
+  // type mismatch deep in evaluation as a thrown exception such as
+  // std::bad_variant_access. That must never escape the public execute() API and
+  // abort the host process: convert any such evaluation exception into a clean
+  // error Status here. This is a narrow guard: the caught exception is turned
+  // into a returned error (not silently swallowed), and the caller's error path
+  // aborts the transaction as it would for any other executor failure.
   Result collect_result(Executor *executor, const Schema *output_schema) {
-    executor->init();
     std::vector<std::string> column_names;
     column_names.reserve(output_schema->column_count());
     for (size_t i = 0; i < output_schema->column_count(); i++) {
       column_names.push_back(output_schema->column(i).name());
     }
 
-    std::vector<Row> rows;
-    while (auto tuple = executor->next()) {
-      std::vector<Value> values;
-      values.reserve(output_schema->column_count());
-      for (size_t i = 0; i < output_schema->column_count(); i++) {
-        TupleValue tv =
-            tuple->get_value(*output_schema, static_cast<uint32_t>(i));
-        values.push_back(tuple_value_to_value(tv));
+    try {
+      executor->init();
+      std::vector<Row> rows;
+      while (auto tuple = executor->next()) {
+        std::vector<Value> values;
+        values.reserve(output_schema->column_count());
+        for (size_t i = 0; i < output_schema->column_count(); i++) {
+          TupleValue tv =
+              tuple->get_value(*output_schema, static_cast<uint32_t>(i));
+          values.push_back(tuple_value_to_value(tv));
+        }
+        rows.emplace_back(std::move(values), column_names);
       }
-      rows.emplace_back(std::move(values), column_names);
+      return Result(std::move(rows), std::move(column_names));
+    } catch (const std::exception &) {
+      // std::bad_variant_access and friends from ill-typed expression
+      // evaluation: report a clean type error instead of aborting the process.
+      return Result(Status::InvalidArgument("type error in expression"));
     }
-    return Result(std::move(rows), std::move(column_names));
   }
 
   // Turn a scan/join physical plan node into an executor tree. Only scan and
