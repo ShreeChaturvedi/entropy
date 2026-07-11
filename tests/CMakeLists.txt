@@ -68,6 +68,7 @@ gtest_discover_tests(catalog_tests)
 
 add_executable(transaction_tests
     transaction/transaction_test.cpp
+    transaction/version_store_test.cpp
 )
 
 target_link_libraries(transaction_tests

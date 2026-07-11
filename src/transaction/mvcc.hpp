@@ -112,7 +112,12 @@ public:
   // ─────────────────────────────────────────────────────────────────────────
 
   /**
-   * @brief Get the next timestamp for a new transaction
+   * @brief Advance and return the single monotonic logical clock
+   *
+   * This is the one authoritative timestamp source for the engine. Both
+   * transaction start timestamps (snapshots) and commit timestamps are drawn
+   * from it, so all MVCC visibility comparisons are well-ordered. Each call
+   * returns a strictly larger value than the previous.
    */
   [[nodiscard]] uint64_t get_timestamp() noexcept;
 
@@ -130,18 +135,42 @@ public:
   /**
    * @brief Check if a version is visible to a transaction (Snapshot Isolation)
    *
-   * A version is visible if:
-   * 1. It was created by this transaction, OR
-   * 2. It was created by a committed transaction before this transaction
-   * started AND it's not deleted, or was deleted by a transaction after this
-   * one started
+   * A version is visible iff its creation is visible and its deletion is not:
+   *   is_visible == is_created_visible && !is_delete_visible
+   *
+   * All comparisons use the single logical clock (@ref get_timestamp): a
+   * version's begin_ts/end_ts are stamped from a committer's commit_ts, and a
+   * reader's snapshot is its start_ts, both drawn from the same monotonic
+   * counter. This keeps snapshot ordering well-defined.
    *
    * @param version The version to check
-   * @param txn The transaction checking visibility
+   * @param txn The transaction checking visibility (nullptr = latest committed)
    * @return true if the version is visible to the transaction
    */
   [[nodiscard]] bool is_visible(const VersionInfo &version,
                                 const Transaction *txn) const;
+
+  /**
+   * @brief Whether a version's creation is visible to a transaction's snapshot
+   *
+   * True if the transaction created it, or if it was committed by another
+   * transaction at a begin_ts <= the reader's start_ts. A version whose
+   * creation is not yet visible (uncommitted by another txn, committed after
+   * the reader started, or rolled back) is invisible; the reader should walk
+   * to an older version in the chain.
+   */
+  [[nodiscard]] bool is_created_visible(const VersionInfo &version,
+                                        const Transaction *txn) const;
+
+  /**
+   * @brief Whether a version's deletion is visible to a transaction's snapshot
+   *
+   * True if the transaction itself deleted it, or another transaction's delete
+   * committed at an end_ts <= the reader's start_ts. When the creation is
+   * visible but the deletion is too, the row is gone from the reader's view.
+   */
+  [[nodiscard]] bool is_delete_visible(const VersionInfo &version,
+                                       const Transaction *txn) const;
 
   /**
    * @brief Check if a version is visible (Read Committed isolation)
@@ -179,17 +208,33 @@ public:
   void mark_deleted(VersionInfo &version, const Transaction *txn);
 
   /**
-   * @brief Finalize version info when transaction commits
-   * @param version The version info to finalize
-   * @param commit_ts The commit timestamp
+   * @brief Finalize a version's timestamps when a transaction commits
+   *
+   * Distinguishes the creator of the version from its deleter, using @p txn's
+   * id: the creator's commit stamps begin_ts, the deleter's commit stamps
+   * end_ts. Finalizing a commit therefore never affects a version this
+   * transaction did not create or delete (fixes the creator/deleter
+   * conflation in #27).
+   *
+   * @param version   The version info to finalize
+   * @param txn       The committing transaction
+   * @param commit_ts The commit timestamp (from @ref get_timestamp)
    */
-  void finalize_commit(VersionInfo &version, uint64_t commit_ts);
+  void finalize_commit(VersionInfo &version, const Transaction *txn,
+                       uint64_t commit_ts);
 
   /**
-   * @brief Rollback version creation (for aborted transactions)
-   * @param version The version to invalidate
+   * @brief Roll back a version touched by an aborting transaction
+   *
+   * Distinguishes creator from deleter: if @p txn created the version it is
+   * invalidated (never visible); if @p txn only deleted a version created by
+   * a different, committed transaction, the delete is undone and the
+   * committed version survives (fixes aborted-DELETE data loss in #27).
+   *
+   * @param version The version to roll back
+   * @param txn     The aborting transaction
    */
-  void rollback_version(VersionInfo &version);
+  void rollback_version(VersionInfo &version, const Transaction *txn);
 
 private:
   /// Global monotonic timestamp counter
