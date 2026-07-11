@@ -46,6 +46,15 @@ public:
   /// this, append()/sync() are no-ops that draw no randomness.
   [[nodiscard]] std::vector<char> crash();
 
+  /// From now on every sync() fails with an IOError while appends still land.
+  /// This is the device state WALManager's retry path is written for: a failed
+  /// sync leaves record bytes handed to the store but not durable, so the
+  /// bytes appended after the last successful sync form a REAL unsynced tail
+  /// at the crash. Schedules arm this at the start of their in-flight
+  /// transaction so the crash lands between append and fsync. Deterministic:
+  /// arming draws no randomness.
+  void arm_sync_failures();
+
   /// Number of durable-sync boundaries crossed.
   [[nodiscard]] uint64_t fsync_count() const;
 
@@ -60,6 +69,7 @@ private:
   FaultConfig config_;
   FaultLog *log_ = nullptr;
   bool crashed_ = false;
+  bool syncs_fail_ = false;
   uint64_t fsync_count_ = 0;
 };
 

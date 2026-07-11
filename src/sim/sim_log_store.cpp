@@ -32,9 +32,19 @@ Status SimLogStore::sync() {
   if (crashed_) {
     return Status::Ok();
   }
+  if (syncs_fail_) {
+    // Appended bytes stay in the store but do NOT become durable: they are
+    // the unsynced tail the crash will resolve.
+    return Status::IOError("injected sync failure (armed)");
+  }
   durable_size_ = bytes_.size();
   ++fsync_count_;
   return Status::Ok();
+}
+
+void SimLogStore::arm_sync_failures() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  syncs_fail_ = true;
 }
 
 std::vector<char> SimLogStore::read_all() {
@@ -49,7 +59,10 @@ uint64_t SimLogStore::size() const {
 
 void SimLogStore::set_sync_hook_for_testing(std::function<Status()> /*hook*/) {
   // The simulator models durability directly, so the WAL test sync hook is
-  // intentionally ignored; sync() is the fsync boundary.
+  // intentionally ignored; sync() is the fsync boundary. The hook's contract
+  // is "run INSTEAD of the real durable sync", which would bypass the sim's
+  // exact durable-prefix accounting; sync-failure injection is provided as
+  // first-class harness control instead (arm_sync_failures, next to crash()).
 }
 
 std::vector<char> SimLogStore::crash() {
