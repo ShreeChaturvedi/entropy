@@ -1481,6 +1481,9 @@ Database::Database(const std::string &path,
 
 Database::~Database() = default;
 
+// Moving leaves the source's impl_ null (a valid, empty state). The noexcept
+// accessors below all tolerate a null impl_, so a moved-from Database answers
+// its queries without dereferencing through a null pimpl.
 Database::Database(Database &&) noexcept = default;
 Database &Database::operator=(Database &&) noexcept = default;
 
@@ -1493,17 +1496,19 @@ Status Database::commit() { return impl_->commit(); }
 Status Database::rollback() { return impl_->rollback(); }
 
 bool Database::in_transaction() const noexcept {
-  return impl_->in_transaction();
+  return impl_ && impl_->in_transaction();
 }
 
 Status Database::close() { return impl_->close(); }
 
-bool Database::is_open() const noexcept { return impl_->is_open(); }
+bool Database::is_open() const noexcept { return impl_ && impl_->is_open(); }
 
-std::string_view Database::path() const noexcept { return impl_->path(); }
+std::string_view Database::path() const noexcept {
+  return impl_ ? impl_->path() : std::string_view{};
+}
 
 Catalog *Database::catalog_for_testing() noexcept {
-  return impl_->catalog_for_testing();
+  return impl_ ? impl_->catalog_for_testing() : nullptr;
 }
 
 } // namespace entropy
