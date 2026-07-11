@@ -64,6 +64,14 @@ if(ENTROPY_ENABLE_TSAN)
 endif()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Install Layout
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Included before the source tree so target-level install(TARGETS ...) rules in
+# src/ can reference CMAKE_INSTALL_LIBDIR / INCLUDEDIR / BINDIR.
+include(GNUInstallDirs)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Source Directories
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -109,14 +117,57 @@ if(ENTROPY_BUILD_EXAMPLES)
 endif()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Installation
+# Installation & Package Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
+# Install location for the package config files, shared by the export rule, the
+# config-file generation, and their install rules below.
+set(ENTROPY_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/entropy")
+
+# Public headers. Exclude the version.hpp.in template; the generated
+# version.hpp is installed separately below.
 install(
     DIRECTORY include/
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    PATTERN "*.in" EXCLUDE
+)
+
+# Generated version header (configured into the build tree).
+install(
+    FILES "${ENTROPY_GENERATED_INCLUDE_DIR}/entropy/version.hpp"
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/entropy
+)
+
+# Library targets are added to the `entropyTargets` export set in src/. Install
+# and export it so downstream projects can `find_package(entropy)` and link
+# `entropy::entropy`.
+install(EXPORT entropyTargets
+    FILE entropyTargets.cmake
+    NAMESPACE entropy::
+    DESTINATION ${ENTROPY_INSTALL_CMAKEDIR}
+)
+
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/entropyConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/entropyConfig.cmake"
+    INSTALL_DESTINATION ${ENTROPY_INSTALL_CMAKEDIR}
+)
+
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/entropyConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    # Pre-1.0: treat the minor version as the compatibility boundary so a
+    # consumer pinning 0.1 does not silently accept a breaking 0.2.
+    COMPATIBILITY SameMinorVersion
+)
+
+install(
+    FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/entropyConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/entropyConfigVersion.cmake"
+    DESTINATION ${ENTROPY_INSTALL_CMAKEDIR}
 )
 
 # ─────────────────────────────────────────────────────────────────────────────

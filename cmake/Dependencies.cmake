@@ -25,7 +25,11 @@ FetchContent_Declare(
 
 set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
 set(SPDLOG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(SPDLOG_INSTALL OFF CACHE BOOL "" FORCE)
+# spdlog is a PUBLIC dependency of entropy_common, so its compiled target must
+# be installed and exported alongside Entropy for `find_package(entropy)` to
+# resolve at link time in a downstream consumer. entropyConfig.cmake pulls it
+# back in via find_dependency(spdlog).
+set(SPDLOG_INSTALL ON CACHE BOOL "" FORCE)
 
 FetchContent_MakeAvailable(spdlog)
 
