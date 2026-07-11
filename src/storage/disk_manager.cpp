@@ -6,10 +6,12 @@
 #include "storage/disk_manager.hpp"
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
 
 #include "common/logger.hpp"
 #include "common/macros.hpp"
+#include "storage/page.hpp"
 
 namespace entropy {
 namespace {
@@ -23,8 +25,9 @@ namespace {
 }  // namespace
 
 FileDiskManager::FileDiskManager(const std::string& db_file,
-                                 bool create_if_missing, bool error_if_exists)
-    : db_file_(db_file) {
+                                 bool create_if_missing, bool error_if_exists,
+                                 bool enable_checksums)
+    : db_file_(db_file), enable_checksums_(enable_checksums) {
     const bool exists = std::filesystem::exists(db_file_);
 
     if (exists && error_if_exists) {
@@ -105,6 +108,15 @@ Status FileDiskManager::read_page(page_id_t page_id, char* page_data) {
         std::memset(page_data + bytes_read_size, 0,
                     page_size() - bytes_read_size);
         db_io_.clear();
+        // A short (beyond-EOF) read is a fresh, zero-filled page, not stored
+        // data, so it carries no checksum to verify.
+        return Status::Ok();
+    }
+
+    // Verify the integrity stamp on a fully-read page: a torn/partial write is
+    // caught here rather than silently handed back as corrupt data.
+    if (enable_checksums_ && !verify_page_checksum(page_data)) {
+        return Status::Corruption("torn/corrupt page: checksum mismatch");
     }
 
     return Status::Ok();
@@ -126,7 +138,18 @@ Status FileDiskManager::write_page(page_id_t page_id, const char* page_data) {
         return Status::IOError("Failed to seek to page");
     }
 
-    db_io_.write(page_data, static_cast<std::streamsize>(page_size()));
+    // Stamp the integrity checksum into a private copy so the caller's buffer is
+    // never mutated. The on-disk image then carries a checksum that read_page
+    // re-verifies to catch a later torn write.
+    const char* out = page_data;
+    std::array<char, config::kDefaultPageSize> stamped;
+    if (enable_checksums_) {
+        std::memcpy(stamped.data(), page_data, stamped.size());
+        stamp_page_checksum(stamped.data());
+        out = stamped.data();
+    }
+
+    db_io_.write(out, static_cast<std::streamsize>(page_size()));
 
     if (db_io_.bad()) {
         return Status::IOError("Failed to write page");
