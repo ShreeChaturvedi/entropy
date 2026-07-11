@@ -39,14 +39,15 @@ void TablePage::init() {
 // Record Operations
 // ─────────────────────────────────────────────────────────────────────────────
 
-std::optional<slot_id_t> TablePage::insert_record(const char* data, uint16_t size) {
+std::optional<slot_id_t> TablePage::insert_record(
+    const char* data, uint16_t size, const SlotReservedFn& slot_reserved) {
     if (data == nullptr || size == 0) {
         return std::nullopt;
     }
 
     // Check if we have space for the record + possibly a new slot
     uint16_t space_needed = size;
-    slot_id_t slot_id = find_free_slot();
+    slot_id_t slot_id = find_free_slot(slot_reserved);
 
     // If no free slot exists, we need space for a new slot too
     if (slot_id == get_slot_count()) {
@@ -246,15 +247,17 @@ uint16_t TablePage::get_free_space() const noexcept {
     return header->free_space_end - header->free_space_offset;
 }
 
-bool TablePage::can_fit(uint16_t size) const noexcept {
+bool TablePage::can_fit(uint16_t size, const SlotReservedFn& slot_reserved) const {
     // Need space for record + possibly a new slot
     uint16_t space_needed = size;
 
-    // Check if there's a free (deleted) slot we can reuse
+    // Check if there's a free (deleted) slot we can reuse. A reserved slot does
+    // not count — insert_record would skip it and allocate a fresh slot, so
+    // page selection must budget for that extra slot too.
     bool has_free_slot = false;
     uint16_t slot_count = get_slot_count();
     for (uint16_t i = 0; i < slot_count; ++i) {
-        if (get_slot(i)->is_empty()) {
+        if (is_reusable_slot(i, slot_reserved)) {
             has_free_slot = true;
             break;
         }
@@ -422,17 +425,26 @@ void TablePage::set_slot_count(uint16_t count) noexcept {
     page_->header()->record_count = count;
 }
 
-slot_id_t TablePage::find_free_slot() {
+bool TablePage::is_reusable_slot(slot_id_t slot_index,
+                                 const SlotReservedFn& slot_reserved) const {
+    // A reserved slot was freed by an uncommitted DELETE whose rollback restores
+    // the committed row back into it, so it must never be reused (see
+    // SlotReservedFn / crash-safety F1).
+    return get_slot(slot_index)->is_empty() &&
+           !(slot_reserved && slot_reserved(RID(page_->page_id(), slot_index)));
+}
+
+slot_id_t TablePage::find_free_slot(const SlotReservedFn& slot_reserved) {
     uint16_t slot_count = get_slot_count();
 
-    // First, look for a deleted slot we can reuse
+    // First, look for a deleted slot we can reuse (never a reserved one).
     for (uint16_t i = 0; i < slot_count; ++i) {
-        if (get_slot(i)->is_empty()) {
+        if (is_reusable_slot(i, slot_reserved)) {
             return i;
         }
     }
 
-    // No free slot, return index for new slot
+    // No reusable free slot, return index for a new slot.
     return slot_count;
 }
 

@@ -74,14 +74,27 @@ public:
     /**
      * @brief Delete a page from the buffer pool
      * @param page_id The page to delete
+     * @param deallocate When true (default) the page id is also returned to the
+     *        DiskManager's free list for reuse. Pass false to only DISCARD the
+     *        buffered frame (drop it from the page table, reset it, reclaim the
+     *        frame) while leaving the id allocated — the caller then frees the
+     *        id itself once it is safe to reuse (see DROP TABLE's deferred
+     *        deallocation, crash-safety F2).
      * @return true if successful
      */
-    bool delete_page(page_id_t page_id);
+    bool delete_page(page_id_t page_id, bool deallocate = true);
 
     /**
      * @brief Flush all pages to disk
+     * @return Ok when every dirty page reached disk; otherwise the first
+     *         error encountered (remaining pages are still attempted, and a
+     *         page whose write failed stays dirty for a later retry).
+     *
+     * Deliberately not [[nodiscard]]: best-effort callers (the destructor,
+     * opportunistic flushes) legitimately ignore the result; durability-
+     * critical callers (clean shutdown, checkpoints) must check it.
      */
-    void flush_all_pages();
+    Status flush_all_pages();
 
     /**
      * @brief Get the pool size

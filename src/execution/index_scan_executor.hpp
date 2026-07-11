@@ -91,6 +91,10 @@ public:
   [[nodiscard]] const Schema *output_schema() const noexcept { return schema_; }
 
 private:
+  // Fetch the row at `rid` and resolve it against this snapshot. A missing
+  // slot is probed as a ghost: its retained before-image may still be visible.
+  [[nodiscard]] std::optional<Tuple> fetch_visible(RID rid);
+
   BPlusTree *index_;
   TableHeap *table_heap_;
   const Schema *schema_;

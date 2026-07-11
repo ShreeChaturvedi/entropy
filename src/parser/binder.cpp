@@ -7,18 +7,68 @@
 
 namespace entropy {
 
-Binder::Binder(Catalog *catalog) : catalog_(catalog) {}
+namespace {
+
+/// True if the SQL type belongs to the numeric family (ints and floats are
+/// mutually assignable with widening/narrowing conversions).
+[[nodiscard]] bool is_numeric_type(TypeId type) {
+  switch (type) {
+  case TypeId::TINYINT:
+  case TypeId::SMALLINT:
+  case TypeId::INTEGER:
+  case TypeId::BIGINT:
+  case TypeId::DECIMAL:
+  case TypeId::FLOAT:
+  case TypeId::DOUBLE:
+    return true;
+  default:
+    return false;
+  }
+}
+
+/// Human-readable kind of an INSERT literal, for strict-mode error messages.
+[[nodiscard]] const char *insert_value_kind(const InsertValue &value) {
+  if (std::holds_alternative<std::monostate>(value)) return "NULL";
+  if (std::holds_alternative<bool>(value)) return "boolean";
+  if (std::holds_alternative<int64_t>(value)) return "integer";
+  if (std::holds_alternative<double>(value)) return "floating-point";
+  return "string";
+}
+
+/// Whether a parsed literal may be stored in a column of @p target without a
+/// cross-family coercion. NULL is always allowed; numerics are one family.
+[[nodiscard]] bool insert_value_matches(const InsertValue &value,
+                                        TypeId target) {
+  if (std::holds_alternative<std::monostate>(value)) {
+    return true;
+  }
+  if (std::holds_alternative<bool>(value)) {
+    return target == TypeId::BOOLEAN;
+  }
+  if (std::holds_alternative<int64_t>(value) ||
+      std::holds_alternative<double>(value)) {
+    return is_numeric_type(target);
+  }
+  // string
+  return target == TypeId::VARCHAR;
+}
+
+} // namespace
+
+Binder::Binder(Catalog *catalog, bool strict_mode)
+    : catalog_(catalog), strict_mode_(strict_mode) {}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Table/Column Resolution
 // ─────────────────────────────────────────────────────────────────────────────
 
-Status Binder::resolve_table(const std::string &table_name, TableInfo **out) {
-  TableInfo *info = catalog_->get_table(table_name);
+Status Binder::resolve_table(const std::string &table_name,
+                             std::shared_ptr<TableInfo> *out) {
+  std::shared_ptr<TableInfo> info = catalog_->get_table_shared(table_name);
   if (info == nullptr) {
     return Status::NotFound("Table not found: " + table_name);
   }
-  *out = info;
+  *out = std::move(info);
   return Status::Ok();
 }
 
@@ -162,7 +212,7 @@ Status Binder::bind_select(SelectStatement *stmt, BoundSelectContext *context) {
 
   // Bind WHERE clause
   if (stmt->where_clause) {
-    status = bind_expression(stmt->where_clause.get(), context->table_info);
+    status = bind_expression(stmt->where_clause.get(), context->table_info.get());
     if (!status.ok()) {
       return status;
     }
@@ -207,6 +257,20 @@ Status Binder::bind_insert(InsertStatement *stmt, BoundInsertContext *context) {
           ") doesn't match column count (" +
           std::to_string(context->column_indices.size()) + ")");
     }
+
+    // Strict mode: reject literals whose kind does not belong to the target
+    // column's type family instead of silently coercing them.
+    if (strict_mode_) {
+      for (size_t i = 0; i < row.size(); i++) {
+        const Column &column = schema.column(context->column_indices[i]);
+        if (!insert_value_matches(row[i], column.type())) {
+          return Status::InvalidArgument(
+              std::string("strict mode: cannot insert ") +
+              insert_value_kind(row[i]) + " value into column '" +
+              column.name() + "'");
+        }
+      }
+    }
   }
 
   return Status::Ok();
@@ -233,7 +297,7 @@ Status Binder::bind_update(UpdateStatement *stmt, BoundUpdateContext *context) {
 
     // Bind the value expression
     if (set_clause.value) {
-      status = bind_expression(set_clause.value.get(), context->table_info);
+      status = bind_expression(set_clause.value.get(), context->table_info.get());
       if (!status.ok()) {
         return status;
       }
@@ -243,7 +307,7 @@ Status Binder::bind_update(UpdateStatement *stmt, BoundUpdateContext *context) {
 
   // Bind WHERE clause
   if (stmt->where_clause) {
-    status = bind_expression(stmt->where_clause.get(), context->table_info);
+    status = bind_expression(stmt->where_clause.get(), context->table_info.get());
     if (!status.ok()) {
       return status;
     }
@@ -262,7 +326,7 @@ Status Binder::bind_delete(DeleteStatement *stmt, BoundDeleteContext *context) {
 
   // Bind WHERE clause
   if (stmt->where_clause) {
-    status = bind_expression(stmt->where_clause.get(), context->table_info);
+    status = bind_expression(stmt->where_clause.get(), context->table_info.get());
     if (!status.ok()) {
       return status;
     }

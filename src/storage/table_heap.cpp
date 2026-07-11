@@ -14,6 +14,21 @@
 
 namespace entropy {
 
+namespace {
+
+// Acquire the checkpoint barrier in SHARED mode when the caller supplied one.
+// The returned lock must outlive the write's critical section; a null barrier
+// yields an unlocked (no-op) guard for the test/no-transaction path.
+std::shared_lock<std::shared_mutex>
+acquire_checkpoint_barrier(std::shared_mutex *checkpoint_barrier) {
+  if (checkpoint_barrier == nullptr) {
+    return {};
+  }
+  return std::shared_lock<std::shared_mutex>(*checkpoint_barrier);
+}
+
+} // namespace
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TableHeap Implementation
 // ─────────────────────────────────────────────────────────────────────────────
@@ -95,7 +110,7 @@ Status TableHeap::ensure_first_page() {
   return Status::Ok();
 }
 
-Status TableHeap::reclaim_all_pages() {
+Status TableHeap::reclaim_all_pages(bool deallocate_disk) {
   std::unique_lock lock(mutex_); // Exclusive lock for write
 
   std::unordered_set<page_id_t> visited;
@@ -117,9 +132,10 @@ Status TableHeap::reclaim_all_pages() {
     }
     page_id_t next_id = TablePage(page).get_next_page_id();
     buffer_pool_->unpin_page(current_id, false);
-    // delete_page forwards to DiskManager::deallocate_page so the page can
-    // be reused by a later allocation.
-    buffer_pool_->delete_page(current_id);
+    // delete_page discards the buffered frame; with deallocate_disk it also
+    // returns the id to DiskManager's free list for reuse. A deferred caller
+    // (DROP TABLE) passes false and frees the ids after its checkpoint.
+    buffer_pool_->delete_page(current_id, deallocate_disk);
 
     current_id = next_id;
   }
@@ -130,7 +146,10 @@ Status TableHeap::reclaim_all_pages() {
   return Status::Ok();
 }
 
-Status TableHeap::insert_tuple(const Tuple &tuple, RID *rid) {
+Status TableHeap::insert_tuple(const Tuple &tuple, RID *rid,
+                               const std::function<Status(RID)> &before_publish,
+                               std::shared_mutex *checkpoint_barrier,
+                               const SlotReservedFn &slot_reserved) {
   std::unique_lock lock(mutex_); // Exclusive lock for write
 
   if (rid == nullptr) {
@@ -153,7 +172,7 @@ Status TableHeap::insert_tuple(const Tuple &tuple, RID *rid) {
   }
 
   // Find a page with enough space
-  page_id_t target_page_id = find_page_with_space(tuple_size);
+  page_id_t target_page_id = find_page_with_space(tuple_size, slot_reserved);
 
   // If no page has space, create a new one
   if (target_page_id == INVALID_PAGE_ID) {
@@ -169,9 +188,15 @@ Status TableHeap::insert_tuple(const Tuple &tuple, RID *rid) {
     return Status::IOError("Failed to fetch page for insert");
   }
 
+  // Checkpoint barrier (shared): held across the heap mutation AND the
+  // publication hook (which appends the WAL record + stamps the page LSN), so a
+  // concurrent checkpoint cannot flush the mutated page ahead of its record.
+  // Acquired here, after the heap lock, so the order stays heap-lock → barrier.
+  auto barrier = acquire_checkpoint_barrier(checkpoint_barrier);
+
   TablePage table_page(page);
-  auto slot_id =
-      table_page.insert_record(tuple.data(), static_cast<uint16_t>(tuple_size));
+  auto slot_id = table_page.insert_record(
+      tuple.data(), static_cast<uint16_t>(tuple_size), slot_reserved);
 
   if (!slot_id.has_value()) {
     // This shouldn't happen if find_page_with_space worked correctly
@@ -184,12 +209,29 @@ Status TableHeap::insert_tuple(const Tuple &tuple, RID *rid) {
   rid->page_id = target_page_id;
   rid->slot_id = slot_id.value();
 
+  // Publication barrier: run the hook while the exclusive lock is still held
+  // and before the page is unpinned. Iterators take the shared lock to read
+  // slots, so no reader can observe the new record until the hook (typically
+  // MVCC version registration) has completed. On hook failure the record is
+  // removed — the insert never becomes visible.
+  if (before_publish) {
+    Status hook_status = before_publish(*rid);
+    if (!hook_status.ok()) {
+      TablePage(page).delete_record(rid->slot_id);
+      buffer_pool_->unpin_page(target_page_id, true);
+      *rid = RID();
+      return hook_status;
+    }
+  }
+
   buffer_pool_->unpin_page(target_page_id, true); // Mark as dirty
 
   return Status::Ok();
 }
 
-Status TableHeap::delete_tuple(const RID &rid) {
+Status TableHeap::delete_tuple(const RID &rid,
+                               const std::function<void()> &on_logged,
+                               std::shared_mutex *checkpoint_barrier) {
   std::unique_lock lock(mutex_); // Exclusive lock for write
 
   if (!rid.is_valid()) {
@@ -201,8 +243,17 @@ Status TableHeap::delete_tuple(const RID &rid) {
     return Status::NotFound("Page not found");
   }
 
+  // Barrier (shared) across the free + logging hook — see insert_tuple.
+  auto barrier = acquire_checkpoint_barrier(checkpoint_barrier);
+
   TablePage table_page(page);
   bool deleted = table_page.delete_record(rid.slot_id);
+
+  // Log while the mutation is still latched + barriered, so the record and its
+  // page-LSN stamp land before the freed page can be checkpoint-flushed.
+  if (deleted && on_logged) {
+    on_logged();
+  }
 
   buffer_pool_->unpin_page(rid.page_id, deleted); // Mark dirty if deleted
 
@@ -306,6 +357,47 @@ Status TableHeap::update_tuple(const Tuple &tuple, const RID &rid,
   return Status::Ok();
 }
 
+Status TableHeap::update_tuple_in_place(const Tuple &tuple, const RID &rid,
+                                        const std::function<void()> &on_logged,
+                                        std::shared_mutex *checkpoint_barrier) {
+  std::unique_lock lock(mutex_); // Exclusive lock for write
+
+  if (!rid.is_valid()) {
+    return Status::InvalidArgument("Invalid RID");
+  }
+  if (tuple.is_empty()) {
+    return Status::InvalidArgument("Cannot update with empty tuple");
+  }
+
+  Page *page = buffer_pool_->fetch_page(rid.page_id);
+  if (page == nullptr) {
+    return Status::NotFound("Page not found");
+  }
+
+  // Barrier (shared) across the in-place mutation + logging hook. Taken before
+  // update_record probes/mutates so a checkpoint cannot flush a mutated page
+  // ahead of its record — see insert_tuple. The no-side-effect failure paths
+  // below leave the page untouched, so holding it there is harmless.
+  auto barrier = acquire_checkpoint_barrier(checkpoint_barrier);
+
+  TablePage table_page(page);
+  if (table_page.update_record(rid.slot_id, tuple.data(),
+                               static_cast<uint16_t>(tuple.size()))) {
+    if (on_logged) {
+      on_logged();
+    }
+    buffer_pool_->unpin_page(rid.page_id, true);
+    return Status::Ok();
+  }
+
+  // Distinguish "row is gone" from "does not fit here" so callers can react
+  // (propagate vs. drive a relocation). No side effects on either path.
+  const bool missing = table_page.get_record(rid.slot_id).empty();
+  buffer_pool_->unpin_page(rid.page_id, false);
+  return missing ? Status::NotFound("Tuple not found at specified RID")
+                 : Status::OutOfMemory("Tuple does not fit in place");
+}
+
 Status TableHeap::get_tuple(const RID &rid, Tuple *tuple) {
   std::shared_lock lock(mutex_); // Shared lock for read
 
@@ -339,14 +431,36 @@ Status TableHeap::get_tuple(const RID &rid, Tuple *tuple) {
   return Status::Ok();
 }
 
-TableIterator TableHeap::begin() {
+std::unordered_set<page_id_t> TableHeap::page_ids() const {
+  std::shared_lock lock(mutex_);
+
+  std::unordered_set<page_id_t> ids;
+  page_id_t current_id = first_page_id_;
+  while (current_id != INVALID_PAGE_ID && !ids.contains(current_id)) {
+    ids.insert(current_id);
+
+    Page *page = buffer_pool_->fetch_page(current_id);
+    if (page == nullptr) {
+      break;
+    }
+    page_id_t next_id = INVALID_PAGE_ID;
+    if (page->page_type() == PageType::TABLE_PAGE) {
+      next_id = TablePage(page).get_next_page_id();
+    }
+    buffer_pool_->unpin_page(current_id, false);
+    current_id = next_id;
+  }
+  return ids;
+}
+
+TableIterator TableHeap::begin(bool include_empty_slots) {
   if (first_page_id_ == INVALID_PAGE_ID) {
     return end();
   }
 
   // Start at slot 0 of the first page
   RID start_rid(first_page_id_, 0);
-  return TableIterator(this, start_rid);
+  return TableIterator(this, start_rid, include_empty_slots);
 }
 
 TableIterator TableHeap::end() { return TableIterator(); }
@@ -387,13 +501,14 @@ page_id_t TableHeap::create_new_page() {
   return new_page_id;
 }
 
-page_id_t TableHeap::find_page_with_space(uint32_t size) {
+page_id_t TableHeap::find_page_with_space(uint32_t size,
+                                          const SlotReservedFn &slot_reserved) {
   // Fast path: append to the last page if it has space.
   if (last_page_id_ != INVALID_PAGE_ID) {
     Page *page = buffer_pool_->fetch_page(last_page_id_);
     if (page != nullptr) {
       TablePage table_page(page);
-      if (table_page.can_fit(static_cast<uint16_t>(size))) {
+      if (table_page.can_fit(static_cast<uint16_t>(size), slot_reserved)) {
         buffer_pool_->unpin_page(last_page_id_, false);
         return last_page_id_;
       }
@@ -422,7 +537,7 @@ page_id_t TableHeap::find_page_with_space(uint32_t size) {
 
     // Check if this page has enough space
     // Need space for the record + slot
-    if (table_page.can_fit(static_cast<uint16_t>(size))) {
+    if (table_page.can_fit(static_cast<uint16_t>(size), slot_reserved)) {
       buffer_pool_->unpin_page(current_id, false);
       return current_id;
     }
@@ -439,8 +554,10 @@ page_id_t TableHeap::find_page_with_space(uint32_t size) {
 // TableIterator Implementation
 // ─────────────────────────────────────────────────────────────────────────────
 
-TableIterator::TableIterator(TableHeap *table_heap, RID rid)
-    : table_heap_(table_heap), rid_(rid) {
+TableIterator::TableIterator(TableHeap *table_heap, RID rid,
+                             bool include_empty_slots)
+    : table_heap_(table_heap), rid_(rid),
+      include_empty_slots_(include_empty_slots) {
   if (table_heap_) {
     buffer_pool_ = table_heap_->buffer_pool();
   }
@@ -451,6 +568,7 @@ TableIterator::TableIterator(TableHeap *table_heap, RID rid)
 TableIterator::TableIterator(const TableIterator &other)
     : table_heap_(other.table_heap_),
       rid_(other.rid_),
+      include_empty_slots_(other.include_empty_slots_),
       current_tuple_(other.current_tuple_),
       buffer_pool_(other.buffer_pool_) {}
 
@@ -461,6 +579,7 @@ TableIterator &TableIterator::operator=(const TableIterator &other) {
   release_page();
   table_heap_ = other.table_heap_;
   rid_ = other.rid_;
+  include_empty_slots_ = other.include_empty_slots_;
   current_tuple_ = other.current_tuple_;
   buffer_pool_ = other.buffer_pool_;
   pinned_page_ = nullptr;
@@ -472,6 +591,7 @@ TableIterator &TableIterator::operator=(const TableIterator &other) {
 TableIterator::TableIterator(TableIterator &&other) noexcept
     : table_heap_(other.table_heap_),
       rid_(other.rid_),
+      include_empty_slots_(other.include_empty_slots_),
       current_tuple_(std::move(other.current_tuple_)),
       buffer_pool_(std::move(other.buffer_pool_)),
       pinned_page_(other.pinned_page_),
@@ -491,6 +611,7 @@ TableIterator &TableIterator::operator=(TableIterator &&other) noexcept {
   release_page();
   table_heap_ = other.table_heap_;
   rid_ = other.rid_;
+  include_empty_slots_ = other.include_empty_slots_;
   current_tuple_ = std::move(other.current_tuple_);
   buffer_pool_ = std::move(other.buffer_pool_);
   pinned_page_ = other.pinned_page_;
@@ -536,6 +657,13 @@ void TableIterator::advance_to_next_valid() {
     buffer_pool_ = table_heap_->buffer_pool();
   }
 
+  // Shared heap lock for the whole advance: a writer registers a new row's
+  // MVCC version while holding the exclusive lock (insert_tuple's
+  // before_publish hook), so under this lock a slot's bytes and its version
+  // metadata appear together or not at all. Released before returning control
+  // to the executor.
+  std::shared_lock<std::shared_mutex> heap_lock(table_heap_->mutex_);
+
   while (rid_.page_id != INVALID_PAGE_ID) {
     if (pinned_page_id_ != rid_.page_id || pinned_page_ == nullptr) {
       release_page();
@@ -570,6 +698,13 @@ void TableIterator::advance_to_next_valid() {
         // Found a valid record
         std::vector<char> data(record.begin(), record.end());
         current_tuple_ = Tuple(std::move(data), rid_);
+        return;
+      }
+      if (include_empty_slots_) {
+        // Ghost mode: yield the empty slot as an empty tuple with a valid
+        // RID so an MVCC scan can ask the version store whether a retained
+        // before-image is still visible to its snapshot.
+        current_tuple_ = Tuple(std::vector<char>{}, rid_);
         return;
       }
       rid_.slot_id++;

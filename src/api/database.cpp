@@ -1,15 +1,29 @@
 /**
  * @file database.cpp
  * @brief Database class implementation with SQL execution
+ *
+ * DatabaseImpl owns the full engine stack: storage (disk manager + buffer
+ * pool), durability (WAL + recovery on open), concurrency (lock manager,
+ * MVCC version store, transaction manager), and the query layers (catalog,
+ * binder, optimizer, executors). Every DML/query statement runs inside a
+ * transaction: an explicit one opened by begin_transaction() on the calling
+ * thread, or an implicit autocommit transaction spanning just that statement.
  */
 
 #include "entropy/database.hpp"
 
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "catalog/catalog.hpp"
+#include "common/config.hpp"
 #include "common/logger.hpp"
 #include "execution/delete_executor.hpp"
+#include "execution/executor_context.hpp"
 #include "execution/index_scan_executor.hpp"
 #include "execution/insert_executor.hpp"
 #include "execution/limit_executor.hpp"
@@ -25,29 +39,127 @@
 #include "parser/statement.hpp"
 #include "storage/buffer_pool.hpp"
 #include "storage/disk_manager.hpp"
+#include "storage/table_heap.hpp"
+#include "transaction/lock_manager.hpp"
+#include "transaction/mvcc.hpp"
+#include "transaction/recovery.hpp"
+#include "transaction/transaction_manager.hpp"
+#include "transaction/version_store.hpp"
+#include "transaction/wal.hpp"
 
 namespace entropy {
 
 class DatabaseImpl {
 public:
-  explicit DatabaseImpl(const std::string &path, const DatabaseOptions &options)
-      : path_(path), is_open_(false) {
+  // @param injected_disk When non-null, used as the storage backend instead of
+  //   opening a FileDiskManager on @p path (dependency injection for tests and
+  //   alternative backends; see DiskManager). The WAL/catalog file paths are
+  //   still derived from @p path.
+  explicit DatabaseImpl(const std::string &path, const DatabaseOptions &options,
+                        std::shared_ptr<DiskManager> injected_disk = nullptr)
+      : path_(path), strict_mode_(options.strict_mode), is_open_(false) {
     Logger::init();
     LOG_INFO("Opening database: {}", path);
 
-    // Initialize storage layer
-    disk_manager_ = std::make_shared<FileDiskManager>(path);
+    // The storage engine is compiled for a fixed page size (Page is a
+    // std::array<char, kDefaultPageSize>); any other request must fail loudly
+    // instead of silently running at the built-in size.
+    if (options.page_size != config::kDefaultPageSize) {
+      open_error_ = "Unsupported page_size " +
+                    std::to_string(options.page_size) +
+                    ": this build supports only " +
+                    std::to_string(config::kDefaultPageSize) +
+                    "-byte pages (compile-time constant)";
+      LOG_ERROR("{}", open_error_);
+      return;
+    }
+
+    // Storage layer. An injected backend wins; otherwise create_if_missing/
+    // error_if_exists route straight into the file-open logic; on violation the
+    // manager stays closed.
+    if (injected_disk != nullptr) {
+      disk_manager_ = std::move(injected_disk);
+    } else {
+      disk_manager_ = std::make_shared<FileDiskManager>(
+          path, options.create_if_missing, options.error_if_exists);
+    }
     if (!disk_manager_->is_open()) {
-      LOG_ERROR("Failed to open database file: {}", path);
+      open_error_ = "Failed to open database file: " + path;
+      LOG_ERROR("{}", open_error_);
       return;
     }
 
     buffer_pool_ = std::make_shared<BufferPoolManager>(options.buffer_pool_size,
                                                        disk_manager_);
 
-    // Initialize catalog
-    catalog_ = std::make_shared<Catalog>(buffer_pool_);
-    binder_ = std::make_unique<Binder>(catalog_.get());
+    // Concurrency control: one lock manager, one logical clock, one version
+    // store shared by every transaction.
+    lock_manager_ = std::make_unique<LockManager>();
+    mvcc_ = std::make_shared<MVCCManager>();
+    version_store_ = std::make_shared<VersionStore>(*mvcc_);
+
+    // Durability: WAL (gated on enable_wal — when off, no .wal file is ever
+    // created or written) and the WAL-before-page hook on the buffer pool.
+    if (options.enable_wal) {
+      wal_manager_ =
+          std::make_shared<WALManager>(path + config::kWALFileExtension);
+      // Steal rule: before any dirty page reaches disk, the log must be
+      // durable up to that page's LSN. The hook captures the WAL by
+      // shared_ptr so it outlives the buffer pool's final destructor flush.
+      buffer_pool_->set_wal_flush_hook([wal = wal_manager_](lsn_t lsn) {
+        if (lsn == INVALID_LSN) {
+          return Status::Ok(); // page carries no logged change
+        }
+        return wal->flush_to_lsn(lsn);
+      });
+      txn_manager_ = std::make_unique<TransactionManager>(wal_manager_);
+    } else {
+      txn_manager_ = std::make_unique<TransactionManager>();
+    }
+    txn_manager_->set_lock_manager(lock_manager_.get());
+    txn_manager_->set_mvcc(mvcc_);
+    txn_manager_->set_version_store(version_store_);
+    txn_manager_->set_buffer_pool(buffer_pool_.get());
+
+    // Crash recovery, BEFORE the catalog is constructed: recovery is
+    // catalog-independent (it replays raw pages by page id), and the
+    // catalog's heap-chain walk must observe recovered pages, not stale ones.
+    if (wal_manager_) {
+      RecoveryManager recovery(buffer_pool_, wal_manager_, disk_manager_);
+      Status recovered = recovery.recover();
+      if (!recovered.ok()) {
+        open_error_ =
+            "Crash recovery failed: " + std::string(recovered.message());
+        LOG_ERROR("{}", open_error_);
+        return;
+      }
+      // Post-restart transactions must never alias recovered ids (#19).
+      txn_manager_->seed_next_txn_id(recovery.next_txn_id());
+
+      // Startup checkpoint: makes the recovered state durable (flushing the
+      // pages recovery mutated, which also re-extends the on-disk file over
+      // recovered page ids) and anchors the next recovery past the records
+      // just replayed. Failure is non-fatal — the WAL still holds everything
+      // — so log and continue.
+      Status checkpointed = recovery.create_checkpoint({});
+      if (!checkpointed.ok()) {
+        LOG_WARN("Startup checkpoint failed (recovery unaffected): {}",
+                 checkpointed.message());
+      }
+    }
+
+    // Catalog (durable manifest alongside the database file) and binder.
+    catalog_ = std::make_shared<Catalog>(buffer_pool_,
+                                         path + config::kCatalogFileExtension);
+    binder_ = std::make_unique<Binder>(catalog_.get(), strict_mode_);
+
+    // Abort undo resolves table oids through the catalog. The shared_ptr
+    // keeps the TableInfo (and its heap) alive across a concurrent drop.
+    txn_manager_->set_table_resolver(
+        [catalog = catalog_](oid_t table_oid) -> TableHeap * {
+          auto info = catalog->get_table_shared(table_oid);
+          return info ? info->table_heap.get() : nullptr;
+        });
 
     // Initialize optimizer components
     statistics_ = std::make_shared<Statistics>(catalog_);
@@ -62,7 +174,8 @@ public:
 
   Result execute(std::string_view sql) {
     if (!is_open_) {
-      return Result(Status::InvalidArgument("Database is not open"));
+      return Result(Status::InvalidArgument(
+          open_error_.empty() ? "Database is not open" : open_error_));
     }
 
     // Parse SQL
@@ -73,16 +186,9 @@ public:
       return Result(status);
     }
 
-    // Execute based on statement type
+    // DDL and EXPLAIN run outside the transaction machinery: the catalog has
+    // its own durability (manifest fsync per DDL), and EXPLAIN only binds.
     switch (stmt->type()) {
-    case StatementType::SELECT:
-      return execute_select(dynamic_cast<SelectStatement *>(stmt.get()));
-    case StatementType::INSERT:
-      return execute_insert(dynamic_cast<InsertStatement *>(stmt.get()));
-    case StatementType::UPDATE:
-      return execute_update(dynamic_cast<UpdateStatement *>(stmt.get()));
-    case StatementType::DELETE_STMT:
-      return execute_delete(dynamic_cast<DeleteStatement *>(stmt.get()));
     case StatementType::CREATE_TABLE:
       return execute_create_table(
           dynamic_cast<CreateTableStatement *>(stmt.get()));
@@ -90,16 +196,82 @@ public:
       return execute_drop_table(dynamic_cast<DropTableStatement *>(stmt.get()));
     case StatementType::EXPLAIN:
       return execute_explain(dynamic_cast<ExplainStatement *>(stmt.get()));
+    case StatementType::SELECT:
+    case StatementType::INSERT:
+    case StatementType::UPDATE:
+    case StatementType::DELETE_STMT:
+      break;
     default:
       return Result(Status::NotSupported("Unsupported statement type"));
     }
+
+    // Every DML/query statement runs inside a transaction: the calling
+    // thread's explicit one if open, otherwise an implicit autocommit
+    // transaction spanning just this statement. A failed explicit
+    // transaction (aborted by an earlier error) rejects statements until the
+    // caller rolls it back — it must never fall through to autocommit.
+    const SessionState session = session_state();
+    if (session.bound && session.txn == nullptr) {
+      return Result(Status::Aborted(
+          "Current transaction is aborted; statements are rejected until "
+          "rollback"));
+    }
+    Transaction *txn = session.txn;
+    const bool autocommit = (txn == nullptr);
+    if (autocommit) {
+      txn = txn_manager_->begin();
+      if (txn == nullptr) {
+        return Result(Status::Internal("Failed to begin transaction"));
+      }
+    }
+
+    ExecutorContext exec_ctx{txn, txn_manager_.get(), lock_manager_.get(),
+                             version_store_.get(), catalog_.get()};
+
+    Result result = [&]() -> Result {
+      switch (stmt->type()) {
+      case StatementType::SELECT:
+        return execute_select(dynamic_cast<SelectStatement *>(stmt.get()),
+                              &exec_ctx);
+      case StatementType::INSERT:
+        return execute_insert(dynamic_cast<InsertStatement *>(stmt.get()),
+                              &exec_ctx);
+      case StatementType::UPDATE:
+        return execute_update(dynamic_cast<UpdateStatement *>(stmt.get()),
+                              &exec_ctx);
+      case StatementType::DELETE_STMT:
+        return execute_delete(dynamic_cast<DeleteStatement *>(stmt.get()),
+                              &exec_ctx);
+      default:
+        return Result(Status::Internal("Unreachable statement type"));
+      }
+    }();
+
+    if (!result.ok()) {
+      // Executor error or write-write conflict: the transaction's writes may
+      // be partially applied, so abort it (write-set undo + version rollback
+      // + lock release) and surface the error. An explicit transaction stays
+      // BOUND in a failed state: subsequent statements are rejected and only
+      // rollback (or commit, which errors) clears it, so the caller can
+      // never silently fall back to autocommit mid-transaction.
+      if (!autocommit) {
+        mark_thread_txn_failed();
+      }
+      txn_manager_->abort(txn);
+      return result;
+    }
+
+    if (autocommit) {
+      txn_manager_->commit(txn);
+    }
+    return result;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
   // Statement Execution
   // ─────────────────────────────────────────────────────────────────────────
 
-  Result execute_select(SelectStatement *stmt) {
+  Result execute_select(SelectStatement *stmt, ExecutorContext *exec_ctx) {
     if (!stmt->group_by.empty()) {
       return Result(Status::NotSupported(
           "GROUP BY is not yet supported for execution"));
@@ -127,13 +299,13 @@ public:
         switch (selection.scan_type) {
         case IndexScanPlanNode::ScanType::POINT_LOOKUP:
           scan = std::make_unique<IndexScanExecutor>(
-              nullptr, index_info->index.get(),
+              exec_ctx, index_info->index.get(),
               ctx.table_info->table_heap.get(), &ctx.table_info->schema,
               *selection.start_key);
           break;
         case IndexScanPlanNode::ScanType::RANGE_SCAN:
           scan = std::make_unique<IndexScanExecutor>(
-              nullptr, index_info->index.get(),
+              exec_ctx, index_info->index.get(),
               ctx.table_info->table_heap.get(), &ctx.table_info->schema,
               selection.start_key.value_or(
                   std::numeric_limits<BPTreeKey>::min()),
@@ -142,7 +314,7 @@ public:
           break;
         case IndexScanPlanNode::ScanType::FULL_SCAN:
           scan = std::make_unique<IndexScanExecutor>(
-              nullptr, index_info->index.get(),
+              exec_ctx, index_info->index.get(),
               ctx.table_info->table_heap.get(), &ctx.table_info->schema);
           break;
         }
@@ -152,7 +324,7 @@ public:
     // Fallback to SeqScan
     if (!scan) {
       scan = std::make_unique<SeqScanExecutor>(
-          nullptr, ctx.table_info->table_heap, &ctx.table_info->schema,
+          exec_ctx, ctx.table_info->table_heap, &ctx.table_info->schema,
           std::move(ctx.predicate));
     }
 
@@ -181,7 +353,7 @@ public:
         }
       }
       executor = std::make_unique<SortExecutor>(
-          nullptr, std::move(executor), input_schema, std::move(sort_keys));
+          exec_ctx, std::move(executor), input_schema, std::move(sort_keys));
     }
 
     // If not SELECT *, create projection (after ORDER BY, which may reference
@@ -191,7 +363,7 @@ public:
       output_schema = input_schema;
     } else {
       auto proj = std::make_unique<ProjectionExecutor>(
-          nullptr, std::move(executor), input_schema, ctx.column_indices);
+          exec_ctx, std::move(executor), input_schema, ctx.column_indices);
       output_schema = &proj->output_schema();
       executor = std::move(proj);
     }
@@ -199,7 +371,7 @@ public:
     // Add LIMIT/OFFSET if specified
     if (stmt->limit.has_value() || stmt->offset.has_value()) {
       executor = std::make_unique<LimitExecutor>(
-          nullptr, std::move(executor), stmt->limit, stmt->offset.value_or(0));
+          exec_ctx, std::move(executor), stmt->limit, stmt->offset.value_or(0));
     }
 
     // Execute and collect results
@@ -226,7 +398,7 @@ public:
     return Result(std::move(rows), std::move(column_names));
   }
 
-  Result execute_insert(InsertStatement *stmt) {
+  Result execute_insert(InsertStatement *stmt, ExecutorContext *exec_ctx) {
     BoundInsertContext ctx;
     Status status = binder_->bind_insert(stmt, &ctx);
     if (!status.ok()) {
@@ -254,16 +426,20 @@ public:
       tuples.emplace_back(std::move(values), ctx.table_info->schema);
     }
 
-    InsertExecutor insert(nullptr, ctx.table_info->table_heap,
-                          std::move(tuples));
+    InsertExecutor insert(exec_ctx, ctx.table_info->table_heap,
+                          std::move(tuples), ctx.table_info->oid);
     insert.init();
     (void)insert.next();
+
+    if (!insert.status().ok()) {
+      return Result(insert.status());
+    }
 
     statistics_->on_rows_inserted(ctx.table_info->oid, insert.rows_inserted());
     return Result(insert.rows_inserted());
   }
 
-  Result execute_update(UpdateStatement *stmt) {
+  Result execute_update(UpdateStatement *stmt, ExecutorContext *exec_ctx) {
     BoundUpdateContext ctx;
     Status status = binder_->bind_update(stmt, &ctx);
     if (!status.ok()) {
@@ -272,19 +448,24 @@ public:
 
     // Create child scan with predicate
     auto child = std::make_unique<SeqScanExecutor>(
-        nullptr, ctx.table_info->table_heap, &ctx.table_info->schema,
+        exec_ctx, ctx.table_info->table_heap, &ctx.table_info->schema,
         std::move(ctx.predicate));
 
-    UpdateExecutor update(nullptr, std::move(child), ctx.table_info->table_heap,
-                          &ctx.table_info->schema,
-                          std::move(ctx.column_indices), std::move(ctx.values));
+    UpdateExecutor update(exec_ctx, std::move(child),
+                          ctx.table_info->table_heap, &ctx.table_info->schema,
+                          std::move(ctx.column_indices), std::move(ctx.values),
+                          ctx.table_info->oid);
     update.init();
     (void)update.next();
+
+    if (!update.status().ok()) {
+      return Result(update.status());
+    }
 
     return Result(update.rows_updated());
   }
 
-  Result execute_delete(DeleteStatement *stmt) {
+  Result execute_delete(DeleteStatement *stmt, ExecutorContext *exec_ctx) {
     BoundDeleteContext ctx;
     Status status = binder_->bind_delete(stmt, &ctx);
     if (!status.ok()) {
@@ -293,12 +474,17 @@ public:
 
     // Create child scan with predicate
     auto child = std::make_unique<SeqScanExecutor>(
-        nullptr, ctx.table_info->table_heap, &ctx.table_info->schema,
+        exec_ctx, ctx.table_info->table_heap, &ctx.table_info->schema,
         std::move(ctx.predicate));
 
-    DeleteExecutor del(nullptr, std::move(child), ctx.table_info->table_heap);
+    DeleteExecutor del(exec_ctx, std::move(child), ctx.table_info->table_heap,
+                       ctx.table_info->oid);
     del.init();
     (void)del.next();
+
+    if (!del.status().ok()) {
+      return Result(del.status());
+    }
 
     statistics_->on_rows_deleted(ctx.table_info->oid, del.rows_deleted());
     return Result(del.rows_deleted());
@@ -325,14 +511,72 @@ public:
 
   Result execute_drop_table(DropTableStatement *stmt) {
     oid_t table_oid = catalog_->get_table_oid(stmt->table_name);
-    Status status = catalog_->drop_table(stmt->table_name);
+
+    // Snapshot the heap's page ids before the drop reclaims them: nothing
+    // can recover them afterwards.
+    std::unordered_set<page_id_t> dropped_pages;
+    if (auto info = catalog_->get_table_shared(stmt->table_name);
+        info && info->table_heap) {
+      dropped_pages = info->table_heap->page_ids();
+    }
+
+    // Logical drop: remove the table (and its indexes) from the catalog and
+    // DISCARD its heap pages from the buffer pool, but keep their ids ALLOCATED
+    // for now — deallocation is deferred until the checkpoint below succeeds
+    // (crash-safety F2). Discarding drops the dirty heap bytes without flushing
+    // them, so the checkpoint's page flush never persists the dropped rows onto
+    // a page a reuse will inherit.
+    Status status =
+        catalog_->drop_table(stmt->table_name, /*deallocate_heap_pages=*/false);
     if (!status.ok()) {
       return Result(status);
     }
 
+    // Version chains keyed by RIDs on the dropped pages — a later table reusing
+    // a page must not inherit visibility decisions from dropped rows.
+    version_store_->purge_pages(dropped_pages);
+
+    // The table is gone from the catalog regardless of how the checkpoint
+    // below fares, so retire its statistics on every path from here on.
     if (table_oid != INVALID_OID) {
       statistics_->on_table_dropped(table_oid);
     }
+
+    // Advance the redo anchor past the dropped table's WAL records. Redo
+    // replays records in LSN order onto pages by id; without a boundary, a
+    // reused page's fresh content would first be rebuilt from the dropped
+    // table's records (whose page LSNs are gone with the zeroed page) and the
+    // new table's own inserts would then collide with the resurrected slots. A
+    // checkpoint HERE advances the anchor past every record that targeted the
+    // freed pages, exactly like the startup checkpoint does after recovery. The
+    // writer barrier quiesces concurrent appends for the anchor capture.
+    if (wal_manager_) {
+      RecoveryManager recovery(buffer_pool_, wal_manager_, disk_manager_);
+      Status checkpointed = recovery.create_checkpoint(
+          txn_manager_->get_active_txn_ids(),
+          &txn_manager_->checkpoint_barrier());
+      if (!checkpointed.ok()) {
+        // The anchor did not advance, so the freed ids must NOT be reused: a
+        // reuse-then-crash would replay the dropped table's inserts into the
+        // new page. Leave the ids allocated (leaked — safe, an unreused id can
+        // never resurrect the dropped rows into a live table) and fail loudly
+        // instead of silently degrading to the original page-reuse corruption.
+        LOG_ERROR("Post-drop checkpoint failed; leaking {} freed page(s) to "
+                  "stay crash-safe rather than reuse them: {}",
+                  dropped_pages.size(), checkpointed.message());
+        return Result(Status::IOError(
+            "DROP TABLE: post-drop checkpoint failed; the table was dropped "
+            "but its pages were leaked to stay crash-safe: " +
+            std::string(checkpointed.message())));
+      }
+    }
+
+    // Checkpoint succeeded (or WAL is disabled and there is no recovery to
+    // anchor): the ids are now safe to return to the free list for reuse.
+    for (page_id_t page_id : dropped_pages) {
+      disk_manager_->deallocate_page(page_id);
+    }
+
     return Result(size_t(0)); // 0 rows affected
   }
 
@@ -347,7 +591,7 @@ public:
     }
 
     auto* select = dynamic_cast<SelectStatement*>(stmt->inner_statement.get());
-    
+
     // Bind to get table info
     BoundSelectContext ctx;
     Status status = binder_->bind_select(select, &ctx);
@@ -358,7 +602,7 @@ public:
     // Generate query plan description
     std::vector<std::string> plan_lines;
     plan_lines.push_back("Query Plan:");
-    
+
     // Check if index can be used
     auto selection = index_selector_->select_access_method(
         ctx.table_info->oid, ctx.predicate.get());
@@ -393,7 +637,7 @@ public:
     if (!select->order_by.empty()) {
       plan_lines.push_back("-> Sort");
       for (const auto& key : select->order_by) {
-        plan_lines.push_back("   Key: " + key.column_name + 
+        plan_lines.push_back("   Key: " + key.column_name +
                             (key.ascending ? " ASC" : " DESC"));
       }
     }
@@ -488,39 +732,71 @@ public:
   // ─────────────────────────────────────────────────────────────────────────
 
   Status begin_transaction() {
-    if (in_transaction_) {
+    if (!is_open_) {
+      return Status::InvalidArgument("Database is not open");
+    }
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    const auto tid = std::this_thread::get_id();
+    if (thread_txns_.count(tid) != 0) {
       return Status::Error("Already in a transaction");
     }
-    in_transaction_ = true;
+    Transaction *txn = txn_manager_->begin();
+    if (txn == nullptr) {
+      return Status::Internal("Failed to begin transaction");
+    }
+    thread_txns_[tid] = txn;
     return Status::Ok();
   }
 
   Status commit() {
-    if (!in_transaction_) {
+    SessionState state = unbind_thread_txn();
+    if (!state.bound) {
       return Status::Error("No active transaction");
     }
-    in_transaction_ = false;
+    if (state.txn == nullptr) {
+      // The transaction was already aborted by a failed statement; there is
+      // nothing to make durable. Clear the binding and tell the caller.
+      return Status::Aborted(
+          "Cannot commit: transaction was aborted and has been rolled back");
+    }
+    txn_manager_->commit(state.txn);
     return Status::Ok();
   }
 
   Status rollback() {
-    if (!in_transaction_) {
+    SessionState state = unbind_thread_txn();
+    if (!state.bound) {
       return Status::Error("No active transaction");
     }
-    in_transaction_ = false;
+    if (state.txn != nullptr) {
+      txn_manager_->abort(state.txn);
+    }
+    // A failed binding was already aborted; clearing it completes the
+    // rollback the caller owed.
     return Status::Ok();
   }
 
-  bool in_transaction() const noexcept { return in_transaction_; }
+  bool in_transaction() const noexcept { return session_state().bound; }
 
-  void close() {
+  Status close() {
+    Status result = Status::Ok();
     if (is_open_) {
       LOG_INFO("Closing database: {}", path_);
+      // Clean shutdown: WAL first, then every dirty page. Surface the first
+      // failure instead of swallowing it — a caller that checks close() must
+      // be able to tell durability was not achieved.
+      if (wal_manager_) {
+        result = wal_manager_->flush();
+      }
       if (buffer_pool_) {
-        buffer_pool_->flush_all_pages();
+        Status flushed = buffer_pool_->flush_all_pages();
+        if (result.ok() && !flushed.ok()) {
+          result = flushed;
+        }
       }
       is_open_ = false;
     }
+    return result;
   }
 
   bool is_open() const noexcept { return is_open_; }
@@ -530,13 +806,58 @@ public:
   Catalog *catalog_for_testing() noexcept { return catalog_.get(); }
 
 private:
+  /// Result of looking up the calling thread's explicit-transaction binding.
+  struct SessionState {
+    bool bound = false;          ///< an explicit transaction is open (or failed)
+    Transaction *txn = nullptr;  ///< live transaction; null when failed
+  };
+
+  [[nodiscard]] SessionState session_state() const {
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    auto it = thread_txns_.find(std::this_thread::get_id());
+    if (it == thread_txns_.end()) {
+      return {};
+    }
+    return {true, it->second};
+  }
+
+  /// Mark the calling thread's binding failed (its transaction was aborted);
+  /// the binding survives until rollback/commit so later statements error.
+  void mark_thread_txn_failed() {
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    auto it = thread_txns_.find(std::this_thread::get_id());
+    if (it != thread_txns_.end()) {
+      it->second = nullptr;
+    }
+  }
+
+  /// Remove the calling thread's binding, returning its state before removal.
+  SessionState unbind_thread_txn() {
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    auto it = thread_txns_.find(std::this_thread::get_id());
+    if (it == thread_txns_.end()) {
+      return {};
+    }
+    SessionState state{true, it->second};
+    thread_txns_.erase(it);
+    return state;
+  }
+
   std::string path_;
+  std::string open_error_;
+  bool strict_mode_ = false;
   bool is_open_ = false;
-  bool in_transaction_ = false;
 
   // Storage layer
   std::shared_ptr<DiskManager> disk_manager_;
   std::shared_ptr<BufferPoolManager> buffer_pool_;
+
+  // Durability & concurrency control
+  std::shared_ptr<WALManager> wal_manager_;
+  std::unique_ptr<LockManager> lock_manager_;
+  std::shared_ptr<MVCCManager> mvcc_;
+  std::shared_ptr<VersionStore> version_store_;
+  std::unique_ptr<TransactionManager> txn_manager_;
 
   // Catalog & Binder
   std::shared_ptr<Catalog> catalog_;
@@ -546,10 +867,24 @@ private:
   std::shared_ptr<Statistics> statistics_;
   std::shared_ptr<CostModel> cost_model_;
   std::unique_ptr<IndexSelector> index_selector_;
+
+  // Per-thread explicit transactions ("a connection is a thread"). A mapped
+  // null value is a FAILED binding: the transaction was aborted by a
+  // statement error or write-write conflict, and the entry stays until the
+  // caller issues rollback (or commit, which errors and clears) — statements
+  // meanwhile are rejected instead of silently autocommitting.
+  mutable std::mutex session_mutex_;
+  std::unordered_map<std::thread::id, Transaction *> thread_txns_;
 };
 
 Database::Database(const std::string &path, const DatabaseOptions &options)
     : impl_(std::make_unique<DatabaseImpl>(path, options)) {}
+
+Database::Database(const std::string &path,
+                   std::shared_ptr<DiskManager> disk_manager,
+                   const DatabaseOptions &options)
+    : impl_(std::make_unique<DatabaseImpl>(path, options,
+                                           std::move(disk_manager))) {}
 
 Database::~Database() = default;
 
@@ -568,7 +903,7 @@ bool Database::in_transaction() const noexcept {
   return impl_->in_transaction();
 }
 
-void Database::close() { impl_->close(); }
+Status Database::close() { return impl_->close(); }
 
 bool Database::is_open() const noexcept { return impl_->is_open(); }
 
