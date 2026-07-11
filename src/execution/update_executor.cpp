@@ -62,6 +62,13 @@ std::optional<Tuple> UpdateExecutor::next() {
     to_update.push_back(std::move(*tuple));
   }
 
+  // Loop-invariant transaction plumbing: the barrier keeps each mutation +
+  // log atomic against a checkpoint (F3); the slot-reserved predicate keeps a
+  // relocation's insert off a slot an uncommitted DELETE will restore into
+  // (F1). Both are null without a transaction context (executor unit tests).
+  std::shared_mutex *barrier = txn_checkpoint_barrier(ctx_);
+  const SlotReservedFn slot_reserved = txn_slot_reserved(ctx_);
+
   // Phase 2: apply SET expressions to the snapshotted rows only.
   for (const auto &tuple : to_update) {
     RID rid = tuple.rid();
@@ -97,11 +104,16 @@ std::optional<Tuple> UpdateExecutor::next() {
       break;
     }
 
-    status = table_heap_->update_tuple_in_place(new_tuple, rid);
+    // The in-place mutation + its UPDATE record run under one checkpoint-
+    // barrier hold so the page cannot be checkpoint-flushed ahead of its
+    // record (F3).
+    status = table_heap_->update_tuple_in_place(
+        new_tuple, rid,
+        [&] { txn_log_update(ctx_, table_oid_, rid, tuple, new_tuple); },
+        barrier);
     if (status.ok()) {
       // In-place update: one UPDATE record at the original RID.
       rows_updated_++;
-      txn_log_update(ctx_, table_oid_, rid, tuple, new_tuple);
       continue;
     }
     if (status.code() != StatusCode::kOutOfMemory) {
@@ -118,22 +130,24 @@ std::optional<Tuple> UpdateExecutor::next() {
     // reading the retained before-image through the chain), log the delete
     // AFTER the slot is freed (so the stamped page LSN never claims an
     // unapplied delete), then insert+publish the new location and lock it.
+    // Each heap step holds the checkpoint barrier across its mutate + log (F3).
     status = txn_acquire_write(ctx_, table_oid_, rid, tuple,
                                TxnWriteKind::kDelete);
     if (!status.ok()) {
       status_ = status;
       break;
     }
-    status = table_heap_->delete_tuple(rid);
+    status = table_heap_->delete_tuple(
+        rid, [&] { txn_log_delete(ctx_, table_oid_, rid, tuple); }, barrier);
     if (!status.ok()) {
       status_ = status;
       break;
     }
-    txn_log_delete(ctx_, table_oid_, rid, tuple);
 
     RID new_rid;
     status = table_heap_->insert_tuple(
-        new_tuple, &new_rid, txn_insert_hook(ctx_, table_oid_, new_tuple));
+        new_tuple, &new_rid, txn_insert_hook(ctx_, table_oid_, new_tuple),
+        barrier, slot_reserved);
     if (!status.ok()) {
       status_ = status;
       break;

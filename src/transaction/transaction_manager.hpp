@@ -206,16 +206,19 @@ public:
     }
 
     /**
-     * @brief Barrier that quiesces logging writers against a checkpoint
+     * @brief Barrier that quiesces heap writers against a checkpoint
      *
-     * Each log_insert/log_update/log_delete holds this in SHARED mode across the
-     * whole append + page-LSN-stamp it performs. A checkpoint takes it
-     * EXCLUSIVELY around its redo-anchor capture + page flush (see
-     * RecoveryManager::create_checkpoint), so no writer can appear with a
-     * sub-anchor LSN whose page is not yet stamped/flushed. Row locks are
-     * acquired by the executor BEFORE it calls the log methods, so a writer
-     * never blocks on another transaction while holding this shared latch and
-     * the checkpoint's exclusive wait is bounded.
+     * The heap write path (TableHeap::insert_tuple/delete_tuple/
+     * update_tuple_in_place) holds this SHARED across its ENTIRE critical
+     * section — the page mutation plus the logging hook that appends the WAL
+     * record and stamps the page LSN. A checkpoint takes it EXCLUSIVELY around
+     * its redo-anchor capture + page flush (see
+     * RecoveryManager::create_checkpoint), so it can never flush a mutated page
+     * whose record is not yet appended and stamped (crash-safety F3). The
+     * barrier is acquired AFTER the heap's own lock (heap-lock → barrier), and
+     * row locks + first-updater-wins run BEFORE the mutation, so a writer never
+     * blocks on another transaction while holding this shared latch and the
+     * checkpoint's exclusive wait is bounded.
      */
     [[nodiscard]] std::shared_mutex& checkpoint_barrier() noexcept {
         return checkpoint_latch_;
@@ -250,9 +253,10 @@ private:
     /// bound, because nothing new can become collectible until it advances.
     uint64_t last_gc_bound_ = 0;
     mutable std::mutex mutex_;
-    // Quiesces logging writers against a concurrent checkpoint (see
-    // checkpoint_barrier()). Separate from mutex_: the log methods do not hold
-    // mutex_, so the two never nest.
+    // Quiesces heap writers against a concurrent checkpoint (see
+    // checkpoint_barrier()). This class only stores and hands the latch out:
+    // TableHeap's write paths hold it SHARED across mutate + log, and
+    // create_checkpoint takes it EXCLUSIVELY. It never nests with mutex_.
     std::shared_mutex checkpoint_latch_;
 };
 

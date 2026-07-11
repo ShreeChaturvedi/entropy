@@ -51,7 +51,12 @@ namespace entropy {
 
 class DatabaseImpl {
 public:
-  explicit DatabaseImpl(const std::string &path, const DatabaseOptions &options)
+  // @param injected_disk When non-null, used as the storage backend instead of
+  //   opening a FileDiskManager on @p path (dependency injection for tests and
+  //   alternative backends; see DiskManager). The WAL/catalog file paths are
+  //   still derived from @p path.
+  explicit DatabaseImpl(const std::string &path, const DatabaseOptions &options,
+                        std::shared_ptr<DiskManager> injected_disk = nullptr)
       : path_(path), strict_mode_(options.strict_mode), is_open_(false) {
     Logger::init();
     LOG_INFO("Opening database: {}", path);
@@ -69,10 +74,15 @@ public:
       return;
     }
 
-    // Storage layer. create_if_missing/error_if_exists route straight into
-    // the file-open logic; on violation the manager stays closed.
-    disk_manager_ = std::make_shared<FileDiskManager>(
-        path, options.create_if_missing, options.error_if_exists);
+    // Storage layer. An injected backend wins; otherwise create_if_missing/
+    // error_if_exists route straight into the file-open logic; on violation the
+    // manager stays closed.
+    if (injected_disk != nullptr) {
+      disk_manager_ = std::move(injected_disk);
+    } else {
+      disk_manager_ = std::make_shared<FileDiskManager>(
+          path, options.create_if_missing, options.error_if_exists);
+    }
     if (!disk_manager_->is_open()) {
       open_error_ = "Failed to open database file: " + path;
       LOG_ERROR("{}", open_error_);
@@ -510,44 +520,63 @@ public:
       dropped_pages = info->table_heap->page_ids();
     }
 
-    Status status = catalog_->drop_table(stmt->table_name);
+    // Logical drop: remove the table (and its indexes) from the catalog and
+    // DISCARD its heap pages from the buffer pool, but keep their ids ALLOCATED
+    // for now — deallocation is deferred until the checkpoint below succeeds
+    // (crash-safety F2). Discarding drops the dirty heap bytes without flushing
+    // them, so the checkpoint's page flush never persists the dropped rows onto
+    // a page a reuse will inherit.
+    Status status =
+        catalog_->drop_table(stmt->table_name, /*deallocate_heap_pages=*/false);
     if (!status.ok()) {
       return Result(status);
     }
 
-    // The dropped table's pages return to the disk manager's free list and
-    // may be handed to a different table. Two kinds of stale state must not
-    // outlive the drop:
-    //
-    // 1. Version chains keyed by RIDs on those pages — a later table reusing
-    //    a page would inherit visibility decisions from dropped rows.
+    // Version chains keyed by RIDs on the dropped pages — a later table reusing
+    // a page must not inherit visibility decisions from dropped rows.
     version_store_->purge_pages(dropped_pages);
 
-    // 2. The dropped table's WAL records. Redo replays records in LSN order
-    //    onto pages by id; without a boundary, a reused page's fresh content
-    //    would first be rebuilt from the dropped table's records (whose page
-    //    LSNs are gone with the zeroed page) and the new table's own inserts
-    //    would then collide with the resurrected slots. A checkpoint HERE
-    //    advances the redo anchor past every record that targeted the freed
-    //    pages, exactly like the startup checkpoint does after recovery. The
-    //    writer barrier quiesces concurrent appends for the anchor capture.
-    //    On failure the anchor simply does not advance — correctness after a
-    //    crash-without-reuse is unaffected, so log loudly and continue.
+    // The table is gone from the catalog regardless of how the checkpoint
+    // below fares, so retire its statistics on every path from here on.
+    if (table_oid != INVALID_OID) {
+      statistics_->on_table_dropped(table_oid);
+    }
+
+    // Advance the redo anchor past the dropped table's WAL records. Redo
+    // replays records in LSN order onto pages by id; without a boundary, a
+    // reused page's fresh content would first be rebuilt from the dropped
+    // table's records (whose page LSNs are gone with the zeroed page) and the
+    // new table's own inserts would then collide with the resurrected slots. A
+    // checkpoint HERE advances the anchor past every record that targeted the
+    // freed pages, exactly like the startup checkpoint does after recovery. The
+    // writer barrier quiesces concurrent appends for the anchor capture.
     if (wal_manager_) {
       RecoveryManager recovery(buffer_pool_, wal_manager_, disk_manager_);
       Status checkpointed = recovery.create_checkpoint(
           txn_manager_->get_active_txn_ids(),
           &txn_manager_->checkpoint_barrier());
       if (!checkpointed.ok()) {
-        LOG_ERROR("Post-drop checkpoint failed; freed pages must not be "
-                  "reused before the next successful checkpoint: {}",
-                  checkpointed.message());
+        // The anchor did not advance, so the freed ids must NOT be reused: a
+        // reuse-then-crash would replay the dropped table's inserts into the
+        // new page. Leave the ids allocated (leaked — safe, an unreused id can
+        // never resurrect the dropped rows into a live table) and fail loudly
+        // instead of silently degrading to the original page-reuse corruption.
+        LOG_ERROR("Post-drop checkpoint failed; leaking {} freed page(s) to "
+                  "stay crash-safe rather than reuse them: {}",
+                  dropped_pages.size(), checkpointed.message());
+        return Result(Status::IOError(
+            "DROP TABLE: post-drop checkpoint failed; the table was dropped "
+            "but its pages were leaked to stay crash-safe: " +
+            std::string(checkpointed.message())));
       }
     }
 
-    if (table_oid != INVALID_OID) {
-      statistics_->on_table_dropped(table_oid);
+    // Checkpoint succeeded (or WAL is disabled and there is no recovery to
+    // anchor): the ids are now safe to return to the free list for reuse.
+    for (page_id_t page_id : dropped_pages) {
+      disk_manager_->deallocate_page(page_id);
     }
+
     return Result(size_t(0)); // 0 rows affected
   }
 
@@ -850,6 +879,12 @@ private:
 
 Database::Database(const std::string &path, const DatabaseOptions &options)
     : impl_(std::make_unique<DatabaseImpl>(path, options)) {}
+
+Database::Database(const std::string &path,
+                   std::shared_ptr<DiskManager> disk_manager,
+                   const DatabaseOptions &options)
+    : impl_(std::make_unique<DatabaseImpl>(path, options,
+                                           std::move(disk_manager))) {}
 
 Database::~Database() = default;
 

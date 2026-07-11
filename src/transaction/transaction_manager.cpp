@@ -350,10 +350,9 @@ lsn_t TransactionManager::log_insert(Transaction* txn, oid_t table_oid, RID rid,
         return INVALID_LSN;
     }
 
-    // Hold the checkpoint barrier (shared) across append + page-LSN stamp so a
-    // concurrent checkpoint cannot capture its redo anchor between the two.
-    std::shared_lock<std::shared_mutex> barrier(checkpoint_latch_);
-
+    // The checkpoint barrier is held (shared) by the heap write path across the
+    // whole mutate + append + page-LSN stamp, so this method does not take it —
+    // see TableHeap::insert_tuple / checkpoint_barrier().
     lsn_t lsn = INVALID_LSN;
     if (wal_manager_) {
         LogRecord record =
@@ -375,8 +374,7 @@ lsn_t TransactionManager::log_delete(Transaction* txn, oid_t table_oid, RID rid,
         return INVALID_LSN;
     }
 
-    std::shared_lock<std::shared_mutex> barrier(checkpoint_latch_);
-
+    // Barrier held by TableHeap::delete_tuple's logging hook — see log_insert.
     lsn_t lsn = INVALID_LSN;
     if (wal_manager_) {
         LogRecord record =
@@ -399,8 +397,8 @@ lsn_t TransactionManager::log_update(Transaction* txn, oid_t table_oid, RID rid,
         return INVALID_LSN;
     }
 
-    std::shared_lock<std::shared_mutex> barrier(checkpoint_latch_);
-
+    // Barrier held by TableHeap::update_tuple_in_place's logging hook — see
+    // log_insert.
     lsn_t lsn = INVALID_LSN;
     if (wal_manager_) {
         LogRecord record = LogRecord::make_update(txn->txn_id(), txn->prev_lsn(), table_oid, rid,

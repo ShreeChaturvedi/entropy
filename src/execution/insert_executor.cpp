@@ -19,16 +19,23 @@ std::optional<Tuple> InsertExecutor::next() {
     return std::nullopt;
   }
 
+  // Loop-invariant transaction plumbing: the barrier keeps each mutation +
+  // log atomic against a checkpoint (F3); the slot-reserved predicate keeps
+  // the insert off a slot an uncommitted DELETE will restore into (F1). Both
+  // are null without a transaction context (executor unit tests).
+  std::shared_mutex *barrier = txn_checkpoint_barrier(ctx_);
+  const SlotReservedFn slot_reserved = txn_slot_reserved(ctx_);
+
   // Insert all tuples
   while (current_idx_ < tuples_.size()) {
     const Tuple &tuple = tuples_[current_idx_];
     RID rid;
     // The publication hook registers the uncommitted version and logs the
     // insert inside the heap's critical section, so no concurrent reader can
-    // observe the bytes before their version metadata exists. A no-op hook
-    // without a transaction context (executor unit tests).
+    // observe the bytes before their version metadata exists.
     Status status = table_heap_->insert_tuple(
-        tuple, &rid, txn_insert_hook(ctx_, table_oid_, tuple));
+        tuple, &rid, txn_insert_hook(ctx_, table_oid_, tuple), barrier,
+        slot_reserved);
     if (!status.ok()) {
       status_ = status;
       break;

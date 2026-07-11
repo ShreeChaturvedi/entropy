@@ -133,6 +133,21 @@ public:
   read_visible(RID rid, std::span<const char> heap_bytes,
                const Transaction *txn) const;
 
+  /**
+   * @brief True if @p rid's current version is deleted by an as-yet-uncommitted
+   *        transaction.
+   *
+   * The insert free-slot search consults this: a slot freed by a still-live
+   * DELETE must NOT be reused, because the deleter's rollback restores the
+   * committed row back into that exact slot (heap restore + chain revert). If a
+   * concurrent insert had already taken the slot, the restore is silently
+   * skipped and the committed row is lost (crash-safety F1). A COMMITTED delete
+   * is safe to reuse — its before-image stays reachable through the chain, so an
+   * older snapshot still resolves the old value even after the slot holds new
+   * bytes.
+   */
+  [[nodiscard]] bool has_pending_delete(RID rid) const;
+
   // ───────────────────────────────────────────────────────────────────────
   // Commit / abort / GC
   // ───────────────────────────────────────────────────────────────────────

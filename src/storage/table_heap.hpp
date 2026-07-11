@@ -77,6 +77,15 @@ public:
    *        before their version exists. If the hook fails, the record is
    *        removed and the hook's error returned: the insert never becomes
    *        visible.
+   * @param checkpoint_barrier Optional writer-quiesce latch
+   *        (TransactionManager::checkpoint_barrier()). Held SHARED across the
+   *        heap mutation + the publication hook (which appends the WAL record
+   *        and stamps the page LSN), so a concurrent checkpoint — which takes
+   *        it EXCLUSIVELY around its page flush — can never capture/flush the
+   *        mutated page before its log record is stamped (crash-safety F3).
+   *        Acquired AFTER the heap's own lock, preserving heap-lock → barrier.
+   * @param slot_reserved Optional predicate that keeps the free-slot search off
+   *        slots reserved by an uncommitted DELETE (see SlotReservedFn).
    * @return Status::Ok() on success
    *
    * The hook runs under the heap's exclusive lock: it must not re-enter this
@@ -84,14 +93,24 @@ public:
    */
   [[nodiscard]] Status
   insert_tuple(const Tuple &tuple, RID *rid,
-               const std::function<Status(RID)> &before_publish = nullptr);
+               const std::function<Status(RID)> &before_publish = nullptr,
+               std::shared_mutex *checkpoint_barrier = nullptr,
+               const SlotReservedFn &slot_reserved = nullptr);
 
   /**
    * @brief Delete a tuple from the table
    * @param rid Record ID of tuple to delete
+   * @param on_logged Optional hook run after the slot is freed while the heap
+   *        lock (and the checkpoint barrier, if given) is still held. Used to
+   *        append the DELETE's WAL record and stamp the page LSN inside the
+   *        same critical section as the mutation (crash-safety F3).
+   * @param checkpoint_barrier Optional writer-quiesce latch held SHARED across
+   *        the free + @p on_logged (see insert_tuple).
    * @return Status::Ok() on success, Status::NotFound() if RID invalid
    */
-  [[nodiscard]] Status delete_tuple(const RID &rid);
+  [[nodiscard]] Status
+  delete_tuple(const RID &rid, const std::function<void()> &on_logged = nullptr,
+               std::shared_mutex *checkpoint_barrier = nullptr);
 
   /**
    * @brief Restore a previously deleted tuple at its original RID
@@ -129,9 +148,19 @@ public:
    * transactional caller drive the relocation itself (as a logged
    * delete+insert with version metadata). Returns Status::NotFound when no
    * record exists at @p rid.
+   *
+   * @param on_logged Optional hook run after the in-place mutation while the
+   *        heap lock (and barrier) is still held — appends the UPDATE's WAL
+   *        record and stamps the page LSN in the same critical section as the
+   *        mutation (crash-safety F3). Not run on the no-side-effect failure
+   *        paths.
+   * @param checkpoint_barrier Optional writer-quiesce latch held SHARED across
+   *        the mutation + @p on_logged (see insert_tuple).
    */
-  [[nodiscard]] Status update_tuple_in_place(const Tuple &tuple,
-                                             const RID &rid);
+  [[nodiscard]] Status
+  update_tuple_in_place(const Tuple &tuple, const RID &rid,
+                        const std::function<void()> &on_logged = nullptr,
+                        std::shared_mutex *checkpoint_barrier = nullptr);
 
   /**
    * @brief Get a tuple by RID
@@ -183,8 +212,13 @@ public:
    * (which forwards to DiskManager::deallocate_page). Used by drop_table so
    * a dropped table's heap pages are not orphaned. After this call the heap
    * is empty (first_page_id() == INVALID_PAGE_ID).
+   *
+   * @param deallocate_disk When false, the pages are only DISCARDED from the
+   *        buffer pool (their dirty bytes dropped, not flushed) while their ids
+   *        stay allocated; the caller frees the ids later, once it is crash-safe
+   *        to reuse them. DROP TABLE defers this past its checkpoint (F2).
    */
-  [[nodiscard]] Status reclaim_all_pages();
+  [[nodiscard]] Status reclaim_all_pages(bool deallocate_disk = true);
 
   /**
    * @brief Collect the ids of every page currently owned by the heap
@@ -235,9 +269,12 @@ private:
   /**
    * @brief Find a page with enough space for a tuple
    * @param size Required space in bytes
+   * @param slot_reserved Predicate forwarded to can_fit so a page whose only
+   *        free slot is reserved is not treated as having reusable space.
    * @return Page ID, or INVALID_PAGE_ID if none found
    */
-  page_id_t find_page_with_space(uint32_t size);
+  page_id_t find_page_with_space(uint32_t size,
+                                 const SlotReservedFn &slot_reserved);
 
   std::shared_ptr<BufferPoolManager> buffer_pool_;
   page_id_t first_page_id_ = INVALID_PAGE_ID;
