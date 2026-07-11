@@ -165,9 +165,14 @@ public:
 
   /**
    * @brief Get the root page ID
+   *
+   * Acquire load, paired with change_root's release store: a reader that
+   * observes a new root id also observes every write the publishing thread
+   * made to that root page before publishing it (the grown root is installed
+   * without holding its page latch, so this pairing is what orders its bytes).
    */
   [[nodiscard]] page_id_t root_page_id() const noexcept {
-    return root_page_id_.load(std::memory_order_relaxed);
+    return root_page_id_.load(std::memory_order_acquire);
   }
 
   /**
@@ -231,12 +236,18 @@ private:
                                            KeyType up_key, page_id_t up_child);
 
   /// Point every child of @p internal at @p parent_id (fixes parent pointers
-  /// after a split moves children to a new node).
-  void reparent_children(WriteSet &ws, page_id_t parent_id,
-                         BPTreeInternalPage &internal);
+  /// after a split/merge moves children between nodes).
+  void reparent_children(page_id_t parent_id, BPTreeInternalPage &internal);
 
   /// Set @p child_id's parent pointer to @p parent_id (no-op for INVALID).
-  void set_parent(WriteSet &ws, page_id_t child_id, page_id_t parent_id);
+  ///
+  /// Deliberately latch-free (pin, write the field, unpin): parent_page_id is
+  /// written and read ONLY by structural writers, which write_mutex_
+  /// serializes, and readers never access the field. Latching here would have
+  /// to write-latch children LEFT of leaf latches the operation already holds
+  /// (e.g. a merged node's child 0), inverting the global left-to-right order
+  /// against leaf-chain scans -- the deadlock found in review.
+  void set_parent(page_id_t child_id, page_id_t parent_id);
 
   /// Rebalance an underfull leaf (path.back()) by borrowing from or merging with
   /// a sibling, then propagate any resulting parent underflow.
@@ -252,6 +263,14 @@ private:
   /// merging with a sibling, then recurse upward.
   [[nodiscard]] Status handle_internal_underflow(WriteSet &ws,
                                                  std::vector<page_id_t> &path);
+
+  /// Release @p id from @p ws and delete it from the pool; if the pool refuses
+  /// (a reader in its unlatch-then-unpin window still holds a pin), queue the
+  /// id so a later structural write retries instead of leaking it on disk.
+  void free_page_or_defer(WriteSet &ws, page_id_t id);
+
+  /// Retry deallocation of pages refused earlier. Caller holds write_mutex_.
+  void drain_deferred_free();
 
   /**
    * @brief Assign a new root page id and notify the root-change callback
@@ -273,11 +292,15 @@ private:
 
   /// Serializes structural writers (insert / remove / reclaim). Readers do NOT
   /// take this; they synchronize with writers through per-page latches acquired
-  /// via crabbing. Serializing writers keeps the crabbing protocol deadlock
-  /// free: the only remaining latch-ordering interactions are reader-vs-writer,
-  /// which the top-down descent (and a left-to-right sibling rule) order
-  /// consistently. See the design notes in b_plus_tree.cpp.
+  /// via crabbing. Serialization removes writer-vs-writer latch interactions;
+  /// reader-vs-writer deadlock freedom comes from the single global latch order
+  /// (ancestors before descendants, left before right) that every code path
+  /// honors. See the design notes in b_plus_tree.cpp.
   std::mutex write_mutex_;
+
+  /// Page ids whose delete_page was refused by a transient reader pin.
+  /// Guarded by write_mutex_ (only structural writers touch it).
+  std::vector<page_id_t> deferred_free_;
 
   // Maximum sizes for nodes (computed once)
   uint32_t leaf_max_size_;
