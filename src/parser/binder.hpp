@@ -26,11 +26,16 @@ namespace entropy {
 // Bound Statement Types
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Bound contexts hold a shared_ptr to the resolved TableInfo (not a raw
+// pointer): the owning handle keeps the table alive for the whole statement
+// even if another thread drops it concurrently, so executors never dereference
+// freed metadata.
+
 /**
  * @brief Context for a bound SELECT statement
  */
 struct BoundSelectContext {
-  TableInfo *table_info = nullptr;       ///< Resolved table
+  std::shared_ptr<TableInfo> table_info; ///< Resolved table
   std::vector<size_t> column_indices;    ///< Indices of selected columns
   bool select_all = false;               ///< SELECT *
   std::unique_ptr<Expression> predicate; ///< Bound WHERE clause
@@ -40,16 +45,16 @@ struct BoundSelectContext {
  * @brief Context for a bound INSERT statement
  */
 struct BoundInsertContext {
-  TableInfo *table_info = nullptr;    ///< Resolved table
-  std::vector<size_t> column_indices; ///< Indices of columns to insert
+  std::shared_ptr<TableInfo> table_info; ///< Resolved table
+  std::vector<size_t> column_indices;    ///< Indices of columns to insert
 };
 
 /**
  * @brief Context for a bound UPDATE statement
  */
 struct BoundUpdateContext {
-  TableInfo *table_info = nullptr;    ///< Resolved table
-  std::vector<size_t> column_indices; ///< Indices of columns to update
+  std::shared_ptr<TableInfo> table_info; ///< Resolved table
+  std::vector<size_t> column_indices;    ///< Indices of columns to update
   std::vector<std::unique_ptr<Expression>> values; ///< Values to set
   std::unique_ptr<Expression> predicate;           ///< Bound WHERE clause
 };
@@ -58,7 +63,7 @@ struct BoundUpdateContext {
  * @brief Context for a bound DELETE statement
  */
 struct BoundDeleteContext {
-  TableInfo *table_info = nullptr;       ///< Resolved table
+  std::shared_ptr<TableInfo> table_info; ///< Resolved table
   std::unique_ptr<Expression> predicate; ///< Bound WHERE clause
 };
 
@@ -79,8 +84,11 @@ public:
   /**
    * @brief Construct a binder with catalog access
    * @param catalog Catalog for name resolution
+   * @param strict_mode When true, INSERT values whose literal kind does not
+   *        match the target column's type family are rejected instead of
+   *        silently coerced (DatabaseOptions::strict_mode).
    */
-  explicit Binder(Catalog *catalog);
+  explicit Binder(Catalog *catalog, bool strict_mode = false);
 
   // ─────────────────────────────────────────────────────────────────────────
   // Statement Binding
@@ -137,10 +145,10 @@ public:
 
 private:
   /**
-   * @brief Resolve a table name to TableInfo
+   * @brief Resolve a table name to an owning TableInfo handle
    */
   [[nodiscard]] Status resolve_table(const std::string &table_name,
-                                     TableInfo **out);
+                                     std::shared_ptr<TableInfo> *out);
 
   /**
    * @brief Resolve a column name to its index in the schema
@@ -150,6 +158,7 @@ private:
                                       TypeId *out_type);
 
   Catalog *catalog_;
+  bool strict_mode_ = false;
 };
 
 } // namespace entropy
