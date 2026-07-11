@@ -301,7 +301,13 @@ public:
 
     /**
      * @brief Release all locks held by a transaction
-     * @note Called during commit or abort
+     * @note Called during commit or abort.
+     * @warning Must be called from the transaction's OWN thread (or when the
+     *          transaction is provably not parked inside a lock/upgrade wait
+     *          loop). It erases the transaction's requests, and those wait
+     *          loops retain list iterators into the queues — erasing them from
+     *          another thread is undefined behaviour. This is the same hazard
+     *          abort_victim_locked avoids by only marking and notifying.
      */
     void release_all_locks(Transaction* txn);
 
@@ -343,6 +349,19 @@ private:
     void grant_waiting_locks(LockRequestQueue* queue);
 
     /**
+     * @brief Erase one request from a queue and wake the queue (latch held).
+     *
+     * Removing ANY request can unblock others: a granted request blocks
+     * incompatible modes, and a WAITING request FIFO-gates later compatible
+     * requests (H holds S, V waits X, W waits S behind V — erasing V leaves W
+     * grantable). Every erase path must therefore re-evaluate grants and
+     * notify; if the queue becomes empty it is removed from the lock table.
+     */
+    void erase_request_locked(LockRequestQueue* queue,
+                              std::list<LockRequest>::iterator req_it,
+                              const LockTarget& target);
+
+    /**
      * @brief Release every lock held or waited on by a transaction (latch held).
      * @note Safe only when called on the transaction's OWN thread (it erases the
      *       transaction's requests, including any it is actively waiting on).
@@ -354,10 +373,12 @@ private:
      *
      * Marks the victim ABORTED (with the deadlock mark, so
      * TransactionManager::abort() still finalizes it) and wakes every queue it
-     * participates in. The victim's own thread then releases all of its locks
-     * and returns Aborted, so survivors acquire immediately instead of stalling
-     * until timeout. Its requests are never erased cross-thread: the victim's
-     * wait loops retain list iterators into the queues.
+     * participates in. The victim's own thread then erases only its WAITING
+     * request and returns Aborted; its GRANTED locks stay held until
+     * TransactionManager::abort() releases them AFTER write-set undo, so
+     * survivors can never observe (or overwrite) not-yet-rolled-back data.
+     * Requests are never erased cross-thread: the victim's wait loops retain
+     * list iterators into the queues.
      */
     void abort_victim_locked(Transaction* victim);
 

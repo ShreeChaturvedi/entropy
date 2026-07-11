@@ -87,12 +87,13 @@ Status LockManager::upgrade_lock(Transaction* txn, oid_t table_oid, const RID& r
     if (queue->upgrading && queue->upgrading_txn_id != txn->txn_id()) {
         deadlock_count_.fetch_add(1, std::memory_order_relaxed);
         if (txn->txn_id() > queue->upgrading_txn_id) {
-            // Younger requester loses.
+            // Younger requester loses. We KEEP our granted locks: they are
+            // released by TransactionManager::abort() only after write-set
+            // undo, so survivors can never observe not-yet-rolled-back data.
             LOG_DEBUG("Deadlock: txn {} loses upgrade race with {} (wait-die)",
                       txn->txn_id(), queue->upgrading_txn_id);
             txn->set_aborted_by_deadlock();
             txn->set_state(TransactionState::ABORTED);
-            release_all_locks_locked(txn);
             return Status::Aborted(
                 "Deadlock detected during lock upgrade (wait-die victim)");
         }
@@ -132,16 +133,27 @@ Status LockManager::upgrade_lock(Transaction* txn, oid_t table_oid, const RID& r
     //
     // NOTE on the upgrade slot: an OLDER upgrader that aborts us (wait-die)
     // takes the slot for itself, so on any exit path where we may already be
-    // aborted the slot must only be cleared if it is still ours. The aborted
-    // exits below rely on release_all_locks_locked, which performs exactly that
-    // guarded clear.
+    // aborted the slot must only be cleared if it is still ours.
+    //
+    // NOTE on aborted exits: we KEEP our granted locks (only the upgrade slot
+    // is relinquished). TransactionManager::abort() releases them AFTER
+    // write-set undo, so survivors can never acquire our locks and observe
+    // (or overwrite) not-yet-rolled-back data. Nothing becomes grantable from
+    // dropping the slot alone while our SHARED lock is still held, so no
+    // re-grant pass is needed here.
+    const auto abandon_upgrade_slot = [&]() {
+        if (queue->upgrading && queue->upgrading_txn_id == txn->txn_id()) {
+            queue->upgrading = false;
+            queue->upgrading_txn_id = INVALID_TXN_ID;
+        }
+    };
+
     auto deadline = std::chrono::steady_clock::now() + lock_timeout_;
     while (true) {
         // Aborted by another thread as a deadlock victim: never complete the
-        // upgrade. Release everything we hold so the transactions blocked on us
-        // proceed immediately.
+        // upgrade.
         if (!txn->is_active()) {
-            release_all_locks_locked(txn);
+            abandon_upgrade_slot();
             return Status::Aborted("Transaction was aborted");
         }
 
@@ -170,7 +182,7 @@ Status LockManager::upgrade_lock(Transaction* txn, oid_t table_oid, const RID& r
                 if (victim == txn->txn_id()) {
                     txn->set_aborted_by_deadlock();
                     txn->set_state(TransactionState::ABORTED);
-                    release_all_locks_locked(txn);  // clears our upgrade slot
+                    abandon_upgrade_slot();
                     return Status::Aborted(
                         "Deadlock detected during lock upgrade (wait-die victim)");
                 }
@@ -183,14 +195,10 @@ Status LockManager::upgrade_lock(Transaction* txn, oid_t table_oid, const RID& r
 
         // Wait with timeout
         if (queue->cv.wait_until(lock, deadline) == std::cv_status::timeout) {
+            abandon_upgrade_slot();
             if (!txn->is_active()) {
                 // Aborted right as the deadline passed; take the abort path.
-                release_all_locks_locked(txn);
                 return Status::Aborted("Transaction was aborted");
-            }
-            if (queue->upgrading && queue->upgrading_txn_id == txn->txn_id()) {
-                queue->upgrading = false;
-                queue->upgrading_txn_id = INVALID_TXN_ID;
             }
             LOG_DEBUG("Txn {} timed out waiting for lock upgrade", txn->txn_id());
             return Status::Timeout("Lock upgrade timed out");
@@ -218,7 +226,6 @@ void LockManager::release_all_locks_locked(Transaction* txn) {
     for (auto& [target, queue] : lock_table_) {
         auto req_it = queue->find_request(txn->txn_id());
         if (req_it != queue->request_queue.end()) {
-            bool was_granted = req_it->granted;
             queue->request_queue.erase(req_it);
 
             // If this was the upgrading transaction, clear upgrade flag
@@ -227,14 +234,13 @@ void LockManager::release_all_locks_locked(Transaction* txn) {
                 queue->upgrading_txn_id = INVALID_TXN_ID;
             }
 
-            // If we removed a granted request, try to grant waiting requests
-            if (was_granted && !queue->request_queue.empty()) {
+            // Re-evaluate grants whether the erased request was granted or
+            // waiting: a waiting request FIFO-gates later compatible requests,
+            // so its removal can unblock them too.
+            if (!queue->request_queue.empty()) {
                 grant_waiting_locks(queue.get());
                 queue->cv.notify_all();
-            }
-
-            // Mark empty queues for removal
-            if (queue->request_queue.empty()) {
+            } else {
                 targets_to_remove.push_back(target);
             }
         }
@@ -248,15 +254,32 @@ void LockManager::release_all_locks_locked(Transaction* txn) {
     LOG_DEBUG("Released all locks for txn {}", txn->txn_id());
 }
 
+void LockManager::erase_request_locked(LockRequestQueue* queue,
+                                       std::list<LockRequest>::iterator req_it,
+                                       const LockTarget& target) {
+    queue->request_queue.erase(req_it);
+    if (queue->request_queue.empty()) {
+        lock_table_.erase(target);
+        return;
+    }
+    // Erasing either a granted or a waiting request can unblock others (a
+    // waiting request FIFO-gates later compatible requests).
+    grant_waiting_locks(queue);
+    queue->cv.notify_all();
+}
+
 void LockManager::abort_victim_locked(Transaction* victim) {
     // A deadlock-cycle victim is, by definition, blocked inside one of its own
     // wait loops (lock_internal or upgrade_lock). We do NOT touch its requests
     // from here: those loops retain list iterators into the queues, so erasing
     // cross-thread would be undefined behaviour. Instead we mark it ABORTED and
     // wake every queue it participates in. Its own thread then observes the
-    // aborted state, releases all of its locks (release_all_locks_locked, on its
-    // own thread), and the survivors it was blocking are granted immediately —
-    // no 5s timeout stall.
+    // aborted state, erases only its WAITING request, and returns Aborted; its
+    // GRANTED locks stay held until TransactionManager::abort() releases them
+    // AFTER write-set undo. Survivors therefore unblock as soon as the victim's
+    // rollback completes (microseconds, not the multi-second wait timeout) and
+    // can never acquire the victim's locks while aborted data is still in the
+    // heap.
     //
     // The deadlock mark tells TransactionManager::abort() that this ABORTED
     // state still needs finalization (write-set undo, WAL ABORT, removal from
@@ -389,7 +412,14 @@ Status LockManager::lock_internal(Transaction* txn, const LockTarget& target,
     // same resource intact (e.g. we wait on a lock held under S by two txns,
     // each closing its own cycle with us), and new cycles can form while we
     // sleep. The request is already queued as a (not-yet-granted) waiter, so
-    // the wait-for graph reflects our edge.
+    // the wait-for graph reflects our edge. Rebuilding the full graph and
+    // running a DFS under latch_ on every wake is a deliberate
+    // simplicity-over-throughput trade-off at this engine's scale.
+    //
+    // Aborted exits below erase ONLY our waiting request; our granted locks
+    // stay held until TransactionManager::abort() releases them AFTER
+    // write-set undo, so survivors can never acquire our locks and observe
+    // (or overwrite) not-yet-rolled-back data.
     auto deadline = std::chrono::steady_clock::now() + lock_timeout_;
     while (!new_req_it->granted) {
         if (enable_deadlock_detection_) {
@@ -397,13 +427,12 @@ Status LockManager::lock_internal(Transaction* txn, const LockTarget& target,
             if (victim != INVALID_TXN_ID) {
                 deadlock_count_.fetch_add(1, std::memory_order_relaxed);
                 if (victim == txn->txn_id()) {
-                    // Wait-die: this (younger) requester loses. Abort ourselves,
-                    // releasing every lock we hold so the survivors proceed.
+                    // Wait-die: this (younger) requester loses.
                     LOG_DEBUG("Deadlock: txn {} aborts itself (wait-die victim)",
                               txn->txn_id());
                     txn->set_aborted_by_deadlock();
                     txn->set_state(TransactionState::ABORTED);
-                    release_all_locks_locked(txn);  // erases new_req_it too
+                    erase_request_locked(queue, new_req_it, target);
                     return Status::Aborted("Deadlock detected (wait-die victim)");
                 }
                 // Wait-die: an older transaction wins over a younger holder in
@@ -413,32 +442,28 @@ Status LockManager::lock_internal(Transaction* txn, const LockTarget& target,
                 if (Transaction* victim_txn = find_transaction_locked(victim)) {
                     abort_victim_locked(victim_txn);
                 }
-                // The victim releases on its own thread; the wait below returns
-                // as soon as our request is granted.
+                // The victim's rollback releases its locks on its own thread;
+                // the wait below returns as soon as our request is granted.
             }
         }
 
         if (queue->cv.wait_until(lock, deadline) == std::cv_status::timeout) {
-            if (!txn->is_active()) {
-                // Aborted right as the deadline passed; take the abort path so
-                // our held locks are released immediately.
-                release_all_locks_locked(txn);  // erases new_req_it too
+            const bool aborted = !txn->is_active();
+            // Timeout (or an abort racing the deadline) - remove our waiting
+            // request and return.
+            erase_request_locked(queue, new_req_it, target);
+            if (aborted) {
                 return Status::Aborted("Transaction was aborted");
-            }
-            // Timeout - remove request and return
-            queue->request_queue.erase(new_req_it);
-            if (queue->request_queue.empty()) {
-                lock_table_.erase(target);
             }
             LOG_DEBUG("Txn {} timed out waiting for lock", txn->txn_id());
             return Status::Timeout("Lock acquisition timed out");
         }
 
-        // Check if transaction was aborted while waiting (e.g. selected as a
-        // deadlock victim by another thread). Release everything we hold so the
-        // transactions blocked on us proceed immediately.
+        // Aborted while waiting (selected as a deadlock victim by another
+        // thread): withdraw our waiting request and let the caller's
+        // TransactionManager::abort() undo-then-release.
         if (!txn->is_active()) {
-            release_all_locks_locked(txn);  // erases new_req_it too
+            erase_request_locked(queue, new_req_it, target);
             return Status::Aborted("Transaction was aborted");
         }
     }
@@ -471,11 +496,9 @@ Status LockManager::unlock_internal(Transaction* txn, const LockTarget& target) 
     }
 
     if (!req_it->granted) {
-        // Remove waiting request
-        queue->request_queue.erase(req_it);
-        if (queue->request_queue.empty()) {
-            lock_table_.erase(target);
-        }
+        // Remove waiting request; this can unblock requests FIFO-gated behind
+        // it, so erase_request_locked re-evaluates grants.
+        erase_request_locked(queue, req_it, target);
         return Status::Ok();
     }
 
@@ -485,17 +508,8 @@ Status LockManager::unlock_internal(Transaction* txn, const LockTarget& target) 
         LOG_DEBUG("Txn {} transitioning to SHRINKING phase", txn->txn_id());
     }
 
-    // Remove the request
-    queue->request_queue.erase(req_it);
-
-    // Try to grant waiting requests
-    if (!queue->request_queue.empty()) {
-        grant_waiting_locks(queue);
-        queue->cv.notify_all();
-    } else {
-        // No more requests - remove queue
-        lock_table_.erase(target);
-    }
+    // Remove the request and grant whatever became unblocked
+    erase_request_locked(queue, req_it, target);
 
     LOG_DEBUG("Txn {} released lock on table {} row ({},{})",
               txn->txn_id(), target.table_oid, target.rid.page_id, target.rid.slot_id);
