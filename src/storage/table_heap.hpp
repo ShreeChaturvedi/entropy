@@ -18,10 +18,12 @@
  * - Write operations (insert/update/delete) hold exclusive lock
  */
 
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <vector>
 
 #include "common/types.hpp"
 #include "entropy/status.hpp"
@@ -66,9 +68,22 @@ public:
    * @brief Insert a tuple into the table
    * @param tuple Tuple to insert
    * @param[out] rid Record ID where tuple was inserted
+   * @param before_publish Optional hook invoked with the new RID after the
+   *        record is placed but before the insert is published (the heap's
+   *        exclusive lock is still held, so iterators — which take the shared
+   *        lock — cannot yet observe the slot). Used to register MVCC
+   *        metadata atomically with the insert so no reader can see the bytes
+   *        before their version exists. If the hook fails, the record is
+   *        removed and the hook's error returned: the insert never becomes
+   *        visible.
    * @return Status::Ok() on success
+   *
+   * The hook runs under the heap's exclusive lock: it must not re-enter this
+   * TableHeap and must not block on other transactions (e.g. lock waits).
    */
-  [[nodiscard]] Status insert_tuple(const Tuple &tuple, RID *rid);
+  [[nodiscard]] Status
+  insert_tuple(const Tuple &tuple, RID *rid,
+               const std::function<Status(RID)> &before_publish = nullptr);
 
   /**
    * @brief Delete a tuple from the table
@@ -106,6 +121,18 @@ public:
                                     RID *new_rid = nullptr);
 
   /**
+   * @brief Update a tuple only if the new bytes fit at its current location
+   *
+   * Unlike update_tuple, never relocates: when the new tuple does not fit in
+   * place this returns Status::OutOfMemory with NO side effects, letting a
+   * transactional caller drive the relocation itself (as a logged
+   * delete+insert with version metadata). Returns Status::NotFound when no
+   * record exists at @p rid.
+   */
+  [[nodiscard]] Status update_tuple_in_place(const Tuple &tuple,
+                                             const RID &rid);
+
+  /**
    * @brief Get a tuple by RID
    * @param rid Record ID of tuple to retrieve
    * @param[out] tuple Retrieved tuple
@@ -119,8 +146,13 @@ public:
 
   /**
    * @brief Get an iterator to the beginning of the table
+   * @param include_empty_slots When true, the iterator also yields empty
+   *        slots as empty tuples carrying a valid RID. MVCC scans use this to
+   *        consult the version store for "ghost" rows — RIDs whose heap slot
+   *        was freed by an in-flight or later-committed DELETE but whose
+   *        retained before-image is still visible to an older snapshot.
    */
-  [[nodiscard]] TableIterator begin();
+  [[nodiscard]] TableIterator begin(bool include_empty_slots = false);
 
   /**
    * @brief Get an iterator to the end of the table
@@ -153,6 +185,14 @@ public:
    */
   [[nodiscard]] Status reclaim_all_pages();
 
+  /**
+   * @brief Collect the ids of every page currently owned by the heap
+   *
+   * Used when dropping a table to purge version-store chains keyed by RIDs on
+   * these pages before the pages are reclaimed for reuse.
+   */
+  [[nodiscard]] std::vector<page_id_t> page_ids() const;
+
   // ─────────────────────────────────────────────────────────────────────────
   // Accessors
   // ─────────────────────────────────────────────────────────────────────────
@@ -179,6 +219,11 @@ public:
   }
 
 private:
+  // The iterator takes the heap's shared lock while reading slots so an
+  // in-flight insert (bytes + MVCC registration under the exclusive lock) is
+  // observed atomically or not at all.
+  friend class TableIterator;
+
   /**
    * @brief Create a new page and append it to the heap
    * @return Page ID of the new page, or INVALID_PAGE_ID on failure
@@ -212,8 +257,10 @@ public:
 
   /**
    * @brief Construct an iterator starting at a specific position
+   * @param include_empty_slots See TableHeap::begin
    */
-  TableIterator(TableHeap *table_heap, RID rid);
+  TableIterator(TableHeap *table_heap, RID rid,
+                bool include_empty_slots = false);
 
   TableIterator(const TableIterator &other);
   TableIterator &operator=(const TableIterator &other);
@@ -274,6 +321,7 @@ private:
 
   TableHeap *table_heap_ = nullptr;
   RID rid_;
+  bool include_empty_slots_ = false;
   Tuple current_tuple_;
   std::shared_ptr<BufferPoolManager> buffer_pool_;
   Page *pinned_page_ = nullptr;

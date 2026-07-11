@@ -130,7 +130,8 @@ Status TableHeap::reclaim_all_pages() {
   return Status::Ok();
 }
 
-Status TableHeap::insert_tuple(const Tuple &tuple, RID *rid) {
+Status TableHeap::insert_tuple(const Tuple &tuple, RID *rid,
+                               const std::function<Status(RID)> &before_publish) {
   std::unique_lock lock(mutex_); // Exclusive lock for write
 
   if (rid == nullptr) {
@@ -183,6 +184,21 @@ Status TableHeap::insert_tuple(const Tuple &tuple, RID *rid) {
   // Set the RID
   rid->page_id = target_page_id;
   rid->slot_id = slot_id.value();
+
+  // Publication barrier: run the hook while the exclusive lock is still held
+  // and before the page is unpinned. Iterators take the shared lock to read
+  // slots, so no reader can observe the new record until the hook (typically
+  // MVCC version registration) has completed. On hook failure the record is
+  // removed — the insert never becomes visible.
+  if (before_publish) {
+    Status hook_status = before_publish(*rid);
+    if (!hook_status.ok()) {
+      TablePage(page).delete_record(rid->slot_id);
+      buffer_pool_->unpin_page(target_page_id, true);
+      *rid = RID();
+      return hook_status;
+    }
+  }
 
   buffer_pool_->unpin_page(target_page_id, true); // Mark as dirty
 
@@ -306,6 +322,36 @@ Status TableHeap::update_tuple(const Tuple &tuple, const RID &rid,
   return Status::Ok();
 }
 
+Status TableHeap::update_tuple_in_place(const Tuple &tuple, const RID &rid) {
+  std::unique_lock lock(mutex_); // Exclusive lock for write
+
+  if (!rid.is_valid()) {
+    return Status::InvalidArgument("Invalid RID");
+  }
+  if (tuple.is_empty()) {
+    return Status::InvalidArgument("Cannot update with empty tuple");
+  }
+
+  Page *page = buffer_pool_->fetch_page(rid.page_id);
+  if (page == nullptr) {
+    return Status::NotFound("Page not found");
+  }
+
+  TablePage table_page(page);
+  if (table_page.update_record(rid.slot_id, tuple.data(),
+                               static_cast<uint16_t>(tuple.size()))) {
+    buffer_pool_->unpin_page(rid.page_id, true);
+    return Status::Ok();
+  }
+
+  // Distinguish "row is gone" from "does not fit here" so callers can react
+  // (propagate vs. drive a relocation). No side effects on either path.
+  const bool missing = table_page.get_record(rid.slot_id).empty();
+  buffer_pool_->unpin_page(rid.page_id, false);
+  return missing ? Status::NotFound("Tuple not found at specified RID")
+                 : Status::OutOfMemory("Tuple does not fit in place");
+}
+
 Status TableHeap::get_tuple(const RID &rid, Tuple *tuple) {
   std::shared_lock lock(mutex_); // Shared lock for read
 
@@ -339,14 +385,38 @@ Status TableHeap::get_tuple(const RID &rid, Tuple *tuple) {
   return Status::Ok();
 }
 
-TableIterator TableHeap::begin() {
+std::vector<page_id_t> TableHeap::page_ids() const {
+  std::shared_lock lock(mutex_);
+
+  std::vector<page_id_t> ids;
+  std::unordered_set<page_id_t> visited;
+  page_id_t current_id = first_page_id_;
+  while (current_id != INVALID_PAGE_ID && !visited.contains(current_id)) {
+    visited.insert(current_id);
+    ids.push_back(current_id);
+
+    Page *page = buffer_pool_->fetch_page(current_id);
+    if (page == nullptr) {
+      break;
+    }
+    page_id_t next_id = INVALID_PAGE_ID;
+    if (page->page_type() == PageType::TABLE_PAGE) {
+      next_id = TablePage(page).get_next_page_id();
+    }
+    buffer_pool_->unpin_page(current_id, false);
+    current_id = next_id;
+  }
+  return ids;
+}
+
+TableIterator TableHeap::begin(bool include_empty_slots) {
   if (first_page_id_ == INVALID_PAGE_ID) {
     return end();
   }
 
   // Start at slot 0 of the first page
   RID start_rid(first_page_id_, 0);
-  return TableIterator(this, start_rid);
+  return TableIterator(this, start_rid, include_empty_slots);
 }
 
 TableIterator TableHeap::end() { return TableIterator(); }
@@ -439,8 +509,10 @@ page_id_t TableHeap::find_page_with_space(uint32_t size) {
 // TableIterator Implementation
 // ─────────────────────────────────────────────────────────────────────────────
 
-TableIterator::TableIterator(TableHeap *table_heap, RID rid)
-    : table_heap_(table_heap), rid_(rid) {
+TableIterator::TableIterator(TableHeap *table_heap, RID rid,
+                             bool include_empty_slots)
+    : table_heap_(table_heap), rid_(rid),
+      include_empty_slots_(include_empty_slots) {
   if (table_heap_) {
     buffer_pool_ = table_heap_->buffer_pool();
   }
@@ -451,6 +523,7 @@ TableIterator::TableIterator(TableHeap *table_heap, RID rid)
 TableIterator::TableIterator(const TableIterator &other)
     : table_heap_(other.table_heap_),
       rid_(other.rid_),
+      include_empty_slots_(other.include_empty_slots_),
       current_tuple_(other.current_tuple_),
       buffer_pool_(other.buffer_pool_) {}
 
@@ -461,6 +534,7 @@ TableIterator &TableIterator::operator=(const TableIterator &other) {
   release_page();
   table_heap_ = other.table_heap_;
   rid_ = other.rid_;
+  include_empty_slots_ = other.include_empty_slots_;
   current_tuple_ = other.current_tuple_;
   buffer_pool_ = other.buffer_pool_;
   pinned_page_ = nullptr;
@@ -472,6 +546,7 @@ TableIterator &TableIterator::operator=(const TableIterator &other) {
 TableIterator::TableIterator(TableIterator &&other) noexcept
     : table_heap_(other.table_heap_),
       rid_(other.rid_),
+      include_empty_slots_(other.include_empty_slots_),
       current_tuple_(std::move(other.current_tuple_)),
       buffer_pool_(std::move(other.buffer_pool_)),
       pinned_page_(other.pinned_page_),
@@ -491,6 +566,7 @@ TableIterator &TableIterator::operator=(TableIterator &&other) noexcept {
   release_page();
   table_heap_ = other.table_heap_;
   rid_ = other.rid_;
+  include_empty_slots_ = other.include_empty_slots_;
   current_tuple_ = std::move(other.current_tuple_);
   buffer_pool_ = std::move(other.buffer_pool_);
   pinned_page_ = other.pinned_page_;
@@ -536,6 +612,13 @@ void TableIterator::advance_to_next_valid() {
     buffer_pool_ = table_heap_->buffer_pool();
   }
 
+  // Shared heap lock for the whole advance: a writer registers a new row's
+  // MVCC version while holding the exclusive lock (insert_tuple's
+  // before_publish hook), so under this lock a slot's bytes and its version
+  // metadata appear together or not at all. Released before returning control
+  // to the executor.
+  std::shared_lock<std::shared_mutex> heap_lock(table_heap_->mutex_);
+
   while (rid_.page_id != INVALID_PAGE_ID) {
     if (pinned_page_id_ != rid_.page_id || pinned_page_ == nullptr) {
       release_page();
@@ -570,6 +653,13 @@ void TableIterator::advance_to_next_valid() {
         // Found a valid record
         std::vector<char> data(record.begin(), record.end());
         current_tuple_ = Tuple(std::move(data), rid_);
+        return;
+      }
+      if (include_empty_slots_) {
+        // Ghost mode: yield the empty slot as an empty tuple with a valid
+        // RID so an MVCC scan can ask the version store whether a retained
+        // before-image is still visible to its snapshot.
+        current_tuple_ = Tuple(std::vector<char>{}, rid_);
         return;
       }
       rid_.slot_id++;
