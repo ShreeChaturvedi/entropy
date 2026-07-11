@@ -12,6 +12,7 @@
 #include <optional>
 #include <type_traits>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "catalog/catalog.hpp"
@@ -38,42 +39,6 @@ struct TupleValueHash {
   }
 };
 
-// Extract a numeric value for ordering (min/max). Returns false for
-// non-numeric types (e.g. VARCHAR), which are ordered separately.
-bool numeric_value(const TupleValue &v, double *out) {
-  if (v.is_bool()) {
-    *out = v.as_bool() ? 1.0 : 0.0;
-  } else if (v.is_tinyint()) {
-    *out = static_cast<double>(v.as_tinyint());
-  } else if (v.is_smallint()) {
-    *out = static_cast<double>(v.as_smallint());
-  } else if (v.is_integer()) {
-    *out = static_cast<double>(v.as_integer());
-  } else if (v.is_bigint()) {
-    *out = static_cast<double>(v.as_bigint());
-  } else if (v.is_float()) {
-    *out = static_cast<double>(v.as_float());
-  } else if (v.is_double()) {
-    *out = v.as_double();
-  } else {
-    return false;
-  }
-  return true;
-}
-
-// Order two non-null values (numeric by magnitude, strings lexicographically).
-bool value_less(const TupleValue &a, const TupleValue &b) {
-  double da = 0.0;
-  double db = 0.0;
-  if (numeric_value(a, &da) && numeric_value(b, &db)) {
-    return da < db;
-  }
-  if (a.is_string() && b.is_string()) {
-    return a.as_string() < b.as_string();
-  }
-  return false; // Incomparable: leave the current extremum in place.
-}
-
 // Extract an integer key from a value for range-selectivity math. Only integer
 // domains index into a B+ tree (BPTreeKey == int64_t), so non-integral types
 // (float/double/string) are rejected.
@@ -92,6 +57,39 @@ bool value_as_int(const TupleValue &v, int64_t *out) {
     return false;
   }
   return true;
+}
+
+// Extract a numeric value for ordering (min/max). Integer domains reuse
+// value_as_int; float/double add the non-integer magnitudes. Returns false for
+// non-numeric types (e.g. VARCHAR), which are ordered separately.
+bool numeric_value(const TupleValue &v, double *out) {
+  int64_t as_int = 0;
+  if (value_as_int(v, &as_int)) {
+    *out = static_cast<double>(as_int);
+    return true;
+  }
+  if (v.is_float()) {
+    *out = static_cast<double>(v.as_float());
+    return true;
+  }
+  if (v.is_double()) {
+    *out = v.as_double();
+    return true;
+  }
+  return false;
+}
+
+// Order two non-null values (numeric by magnitude, strings lexicographically).
+bool value_less(const TupleValue &a, const TupleValue &b) {
+  double da = 0.0;
+  double db = 0.0;
+  if (numeric_value(a, &da) && numeric_value(b, &db)) {
+    return da < db;
+  }
+  if (a.is_string() && b.is_string()) {
+    return a.as_string() < b.as_string();
+  }
+  return false; // Incomparable: leave the current extremum in place.
 }
 
 // The column referenced by a comparison, whichever side it is on (col OP const
@@ -213,32 +211,33 @@ double Statistics::estimate_selectivity(oid_t table_oid,
 double Statistics::range_selectivity(oid_t table_oid, column_id_t column_id,
                                      std::optional<BPTreeKey> lower,
                                      std::optional<BPTreeKey> upper) const {
+  // No usable histogram: fall back to the Selinger range default (1/3).
   const TableStatistics *ts = get_table_stats(table_oid);
-  if (ts != nullptr) {
-    auto it = ts->columns.find(column_id);
-    if (it != ts->columns.end() && it->second.min_value.has_value() &&
-        it->second.max_value.has_value()) {
-      int64_t mn = 0;
-      int64_t mx = 0;
-      if (value_as_int(*it->second.min_value, &mn) &&
-          value_as_int(*it->second.max_value, &mx) && mx >= mn) {
-        // Clamp the (inclusive) query bounds to the observed domain.
-        int64_t lo = lower.has_value() ? std::max<int64_t>(*lower, mn) : mn;
-        int64_t hi = upper.has_value() ? std::min<int64_t>(*upper, mx) : mx;
-        if (hi < lo) {
-          return 0.0;
-        }
-        // Compute in double to avoid overflow across a wide integer domain.
-        double span = (static_cast<double>(mx) - static_cast<double>(mn)) + 1.0;
-        double covered =
-            (static_cast<double>(hi) - static_cast<double>(lo)) + 1.0;
-        return std::clamp(covered / span, 0.0, 1.0);
-      }
-    }
+  if (ts == nullptr) {
+    return RANGE_SELECTIVITY;
+  }
+  auto it = ts->columns.find(column_id);
+  if (it == ts->columns.end() || !it->second.min_value.has_value() ||
+      !it->second.max_value.has_value()) {
+    return RANGE_SELECTIVITY;
+  }
+  int64_t mn = 0;
+  int64_t mx = 0;
+  if (!value_as_int(*it->second.min_value, &mn) ||
+      !value_as_int(*it->second.max_value, &mx) || mx < mn) {
+    return RANGE_SELECTIVITY;
   }
 
-  // No usable histogram: fall back to the Selinger range default (1/3).
-  return RANGE_SELECTIVITY;
+  // Clamp the (inclusive) query bounds to the observed domain.
+  int64_t lo = lower.has_value() ? std::max<int64_t>(*lower, mn) : mn;
+  int64_t hi = upper.has_value() ? std::min<int64_t>(*upper, mx) : mx;
+  if (hi < lo) {
+    return 0.0;
+  }
+  // Compute in double to avoid overflow across a wide integer domain.
+  double span = (static_cast<double>(mx) - static_cast<double>(mn)) + 1.0;
+  double covered = (static_cast<double>(hi) - static_cast<double>(lo)) + 1.0;
+  return std::clamp(covered / span, 0.0, 1.0);
 }
 
 void Statistics::collect_statistics(oid_t table_oid) {
@@ -278,14 +277,16 @@ void Statistics::collect_statistics(oid_t table_oid) {
         ++null_counts[i];
         continue;
       }
-      // Count exact distinct values instead of assuming ~90% are unique.
-      distinct_sets[i].insert(val);
+      // Update min/max (which read val) before moving val into the distinct
+      // set, so a VARCHAR value is moved rather than copied on first insert.
       if (!col_min[i] || value_less(val, *col_min[i])) {
         col_min[i] = val;
       }
       if (!col_max[i] || value_less(*col_max[i], val)) {
         col_max[i] = val;
       }
+      // Count exact distinct values instead of assuming ~90% are unique.
+      distinct_sets[i].insert(std::move(val));
     }
   }
 
