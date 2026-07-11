@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 
 #include "entropy/status.hpp"
 #include "storage/tuple.hpp"
@@ -94,6 +95,27 @@ txn_insert_hook(const ExecutorContext *ctx, oid_t table_oid,
  */
 [[nodiscard]] Status txn_lock_row(const ExecutorContext *ctx, oid_t table_oid,
                                   RID rid);
+
+/**
+ * @brief The checkpoint writer-quiesce barrier for @p ctx, or nullptr
+ *
+ * Passed into the heap write methods so the page mutation + WAL append + page-
+ * LSN stamp run under one shared-barrier hold, mutually exclusive with a
+ * checkpoint's page flush (crash-safety F3). Null (no barrier) without a
+ * transaction context or transaction manager — the executor-unit-test path.
+ */
+[[nodiscard]] std::shared_mutex *
+txn_checkpoint_barrier(const ExecutorContext *ctx);
+
+/**
+ * @brief Predicate that keeps an INSERT's free-slot search off slots reserved
+ *        by an uncommitted DELETE (crash-safety F1), or nullptr
+ *
+ * Null without a transaction context or version store, so executor unit tests
+ * reuse freed slots exactly as before.
+ */
+[[nodiscard]] std::function<bool(RID)>
+txn_slot_reserved(const ExecutorContext *ctx);
 
 /// Log an in-place UPDATE to the WAL and the write set (undo = restore
 /// @p before). Called after the heap mutation succeeded.

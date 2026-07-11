@@ -269,7 +269,8 @@ Status Catalog::create_table(const std::string &table_name,
   return Status::Ok();
 }
 
-Status Catalog::drop_table(const std::string &table_name) {
+Status Catalog::drop_table(const std::string &table_name,
+                           bool deallocate_heap_pages) {
   std::unique_lock lock(mutex_);
 
   auto name_it = table_names_.find(table_name);
@@ -314,9 +315,12 @@ Status Catalog::drop_table(const std::string &table_name) {
   }
 
   // Reclaim the heap's and the indexes' pages through the buffer pool
-  // (DiskManager::deallocate_page) so they are not orphaned on disk.
+  // (DiskManager::deallocate_page) so they are not orphaned on disk. When the
+  // caller defers heap-page deallocation (DROP TABLE, past its checkpoint), the
+  // heap pages are only discarded from the buffer here; their ids are freed by
+  // the caller afterwards (crash-safety F2).
   if (info && info->table_heap) {
-    (void)info->table_heap->reclaim_all_pages();
+    (void)info->table_heap->reclaim_all_pages(deallocate_heap_pages);
   }
   for (auto &idx : dropped_indexes) {
     if (idx->index) {

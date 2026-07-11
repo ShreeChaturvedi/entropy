@@ -121,6 +121,22 @@ Status txn_lock_row(const ExecutorContext *ctx, oid_t table_oid, RID rid) {
   return lock_row_exclusive(ctx, table_oid, rid);
 }
 
+std::shared_mutex *txn_checkpoint_barrier(const ExecutorContext *ctx) {
+  if (!transactional(ctx) || ctx->txn_mgr == nullptr) {
+    return nullptr;
+  }
+  return &ctx->txn_mgr->checkpoint_barrier();
+}
+
+std::function<bool(RID)> txn_slot_reserved(const ExecutorContext *ctx) {
+  if (!transactional(ctx) || ctx->version_store == nullptr) {
+    return nullptr;
+  }
+  return [vs = ctx->version_store](RID rid) {
+    return vs->has_pending_delete(rid);
+  };
+}
+
 void txn_log_update(const ExecutorContext *ctx, oid_t table_oid, RID rid,
                     const Tuple &before, const Tuple &after) {
   if (transactional(ctx) && ctx->txn_mgr != nullptr) {

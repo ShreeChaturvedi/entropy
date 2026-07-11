@@ -26,6 +26,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <optional>
 #include <span>
 
@@ -34,6 +35,16 @@
 #include "storage/page.hpp"
 
 namespace entropy {
+
+/**
+ * @brief Predicate marking a candidate empty slot unusable for a new insert.
+ *
+ * Given the RID a reuse would land on, returns true when that slot must be
+ * skipped — e.g. it was freed by a still-uncommitted DELETE whose rollback will
+ * restore the committed row back into it (crash-safety F1). Never reuse such a
+ * slot; allocate a fresh one instead. A null predicate reserves nothing.
+ */
+using SlotReservedFn = std::function<bool(RID)>;
 
 /**
  * @brief Slot directory entry
@@ -92,9 +103,14 @@ public:
      * @brief Insert a record into the page
      * @param data Pointer to record data
      * @param size Size of record in bytes
+     * @param slot_reserved Optional predicate: an empty slot whose RID it
+     *        marks reserved is skipped, forcing allocation of a fresh slot
+     *        (see SlotReservedFn).
      * @return Slot ID if successful, nullopt if no space
      */
-    [[nodiscard]] std::optional<slot_id_t> insert_record(const char* data, uint16_t size);
+    [[nodiscard]] std::optional<slot_id_t> insert_record(
+        const char* data, uint16_t size,
+        const SlotReservedFn& slot_reserved = nullptr);
 
     /**
      * @brief Restore a record into a specific (empty) slot
@@ -155,9 +171,13 @@ public:
     /**
      * @brief Check if a record of given size can fit
      * @param size Record size in bytes
+     * @param slot_reserved Optional predicate: a reserved empty slot does not
+     *        count as reusable free space, so page selection stays consistent
+     *        with insert_record's slot search (see SlotReservedFn).
      * @return true if record can be inserted
      */
-    [[nodiscard]] bool can_fit(uint16_t size) const noexcept;
+    [[nodiscard]] bool can_fit(uint16_t size,
+                               const SlotReservedFn& slot_reserved = nullptr) const;
 
     /**
      * @brief Get the number of slots (including deleted)
@@ -225,8 +245,15 @@ private:
     void set_free_space_end(uint16_t offset) noexcept;
     void set_slot_count(uint16_t count) noexcept;
 
-    /// Find a free slot (deleted or new)
-    [[nodiscard]] slot_id_t find_free_slot();
+    /// True when slot @p slot_index is empty and not marked reserved by the
+    /// predicate — a deleted slot a new insert may reuse (see SlotReservedFn /
+    /// crash-safety F1). A null predicate reserves nothing.
+    [[nodiscard]] bool is_reusable_slot(slot_id_t slot_index,
+                                        const SlotReservedFn& slot_reserved) const;
+
+    /// Find a free slot (deleted or new). Skips empty slots the predicate
+    /// marks reserved, returning the append index instead.
+    [[nodiscard]] slot_id_t find_free_slot(const SlotReservedFn& slot_reserved);
 
     Page* page_;
 };

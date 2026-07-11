@@ -210,7 +210,7 @@ Page* BufferPoolManager::new_page(page_id_t* page_id) {
     return page;
 }
 
-bool BufferPoolManager::delete_page(page_id_t page_id) {
+bool BufferPoolManager::delete_page(page_id_t page_id, bool deallocate) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     auto it = page_table_.find(page_id);
@@ -234,7 +234,12 @@ bool BufferPoolManager::delete_page(page_id_t page_id) {
     page->reset();
     free_list_.push_back(frame_id);
 
-    disk_manager_->deallocate_page(page_id);
+    // The buffered frame is always discarded (its dirty bytes dropped, NOT
+    // flushed). The on-disk id is returned to the free list only when the
+    // caller allows it; a deferred caller frees it later itself.
+    if (deallocate) {
+        disk_manager_->deallocate_page(page_id);
+    }
     return true;
 }
 

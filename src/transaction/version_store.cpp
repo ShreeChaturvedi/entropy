@@ -176,6 +176,26 @@ VersionStore::read_visible(RID rid, std::span<const char> heap_bytes,
   return std::nullopt;
 }
 
+bool VersionStore::has_pending_delete(RID rid) const {
+  std::shared_lock lock(latch_);
+  auto it = chains_.find(rid);
+  if (it == chains_.end()) {
+    return false;
+  }
+  const auto &chain = it->second;
+  // The current version is the newest node that is not a rollback tombstone.
+  for (auto rit = chain.rbegin(); rit != chain.rend(); ++rit) {
+    if (is_invalidated(rit->info)) {
+      continue;
+    }
+    // Uncommitted delete: a deleter is stamped but its end_ts has not been
+    // finalized to a real commit timestamp yet.
+    return rit->info.deleted_by != TXN_ID_NONE &&
+           rit->info.end_ts == TIMESTAMP_MAX;
+  }
+  return false;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Commit / abort / GC
 // ─────────────────────────────────────────────────────────────────────────────

@@ -17,6 +17,7 @@ namespace entropy {
 // Forward declarations
 class DatabaseImpl;
 class Catalog;
+class DiskManager;
 
 /**
  * @brief Configuration options for opening a database
@@ -81,6 +82,19 @@ public:
      * @param options Configuration options
      */
     explicit Database(const std::string& path, const DatabaseOptions& options = {});
+
+    /**
+     * @brief Open a database on an injected storage backend
+     * @param path Path used to derive the WAL and catalog file locations
+     * @param disk_manager Storage backend to use instead of a file on @p path
+     * @param options Configuration options
+     *
+     * Dependency-injection entry point (see DiskManager): lets a caller supply
+     * an alternative or fault-injecting page store. When @p disk_manager is
+     * null this behaves like the path-only constructor.
+     */
+    Database(const std::string& path, std::shared_ptr<DiskManager> disk_manager,
+             const DatabaseOptions& options = {});
 
     /**
      * @brief Destructor - closes the database

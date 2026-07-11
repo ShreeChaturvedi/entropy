@@ -30,6 +30,10 @@ std::optional<Tuple> DeleteExecutor::next() {
     to_delete.push_back(std::move(*tuple));
   }
 
+  // Loop-invariant: the barrier keeps each free + WAL log atomic against a
+  // checkpoint (F3). Null without a transaction context (executor unit tests).
+  std::shared_mutex *barrier = txn_checkpoint_barrier(ctx_);
+
   for (const auto &tuple : to_delete) {
     RID rid = tuple.rid();
 
@@ -42,14 +46,15 @@ std::optional<Tuple> DeleteExecutor::next() {
       break;
     }
 
-    status = table_heap_->delete_tuple(rid);
+    // The free + WAL log run under one checkpoint-barrier hold so the freed
+    // slot cannot be checkpoint-flushed ahead of its DELETE record (F3).
+    status = table_heap_->delete_tuple(
+        rid, [&] { txn_log_delete(ctx_, table_oid_, rid, tuple); }, barrier);
     if (!status.ok()) {
       status_ = status;
       break;
     }
     rows_deleted_++;
-
-    txn_log_delete(ctx_, table_oid_, rid, tuple);
   }
 
   done_ = true;

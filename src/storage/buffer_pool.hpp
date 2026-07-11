@@ -74,9 +74,15 @@ public:
     /**
      * @brief Delete a page from the buffer pool
      * @param page_id The page to delete
+     * @param deallocate When true (default) the page id is also returned to the
+     *        DiskManager's free list for reuse. Pass false to only DISCARD the
+     *        buffered frame (drop it from the page table, reset it, reclaim the
+     *        frame) while leaving the id allocated — the caller then frees the
+     *        id itself once it is safe to reuse (see DROP TABLE's deferred
+     *        deallocation, crash-safety F2).
      * @return true if successful
      */
-    bool delete_page(page_id_t page_id);
+    bool delete_page(page_id_t page_id, bool deallocate = true);
 
     /**
      * @brief Flush all pages to disk

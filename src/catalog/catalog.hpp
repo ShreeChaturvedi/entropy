@@ -93,7 +93,20 @@ public:
 
   [[nodiscard]] Status create_table(const std::string &table_name,
                                     const Schema &schema);
-  [[nodiscard]] Status drop_table(const std::string &table_name);
+
+  /**
+   * @brief Drop a table, its indexes, and (by default) reclaim their pages
+   *
+   * @param deallocate_heap_pages When false, the heap's pages are DISCARDED
+   *        from the buffer pool but their ids are NOT returned to the free
+   *        list — the caller (DROP TABLE) frees them itself only after a
+   *        checkpoint has advanced the redo anchor past the dropped table's WAL
+   *        records, so a checkpoint failure cannot leave the ids reusable while
+   *        still redoable (crash-safety F2). Index pages are always reclaimed
+   *        (they are not WAL-redone, so their reuse is not a recovery hazard).
+   */
+  [[nodiscard]] Status drop_table(const std::string &table_name,
+                                  bool deallocate_heap_pages = true);
 
   /**
    * @brief Look up a table, returning a stable owning handle

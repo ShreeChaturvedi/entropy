@@ -14,6 +14,21 @@
 
 namespace entropy {
 
+namespace {
+
+// Acquire the checkpoint barrier in SHARED mode when the caller supplied one.
+// The returned lock must outlive the write's critical section; a null barrier
+// yields an unlocked (no-op) guard for the test/no-transaction path.
+std::shared_lock<std::shared_mutex>
+acquire_checkpoint_barrier(std::shared_mutex *checkpoint_barrier) {
+  if (checkpoint_barrier == nullptr) {
+    return {};
+  }
+  return std::shared_lock<std::shared_mutex>(*checkpoint_barrier);
+}
+
+} // namespace
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TableHeap Implementation
 // ─────────────────────────────────────────────────────────────────────────────
@@ -95,7 +110,7 @@ Status TableHeap::ensure_first_page() {
   return Status::Ok();
 }
 
-Status TableHeap::reclaim_all_pages() {
+Status TableHeap::reclaim_all_pages(bool deallocate_disk) {
   std::unique_lock lock(mutex_); // Exclusive lock for write
 
   std::unordered_set<page_id_t> visited;
@@ -117,9 +132,10 @@ Status TableHeap::reclaim_all_pages() {
     }
     page_id_t next_id = TablePage(page).get_next_page_id();
     buffer_pool_->unpin_page(current_id, false);
-    // delete_page forwards to DiskManager::deallocate_page so the page can
-    // be reused by a later allocation.
-    buffer_pool_->delete_page(current_id);
+    // delete_page discards the buffered frame; with deallocate_disk it also
+    // returns the id to DiskManager's free list for reuse. A deferred caller
+    // (DROP TABLE) passes false and frees the ids after its checkpoint.
+    buffer_pool_->delete_page(current_id, deallocate_disk);
 
     current_id = next_id;
   }
@@ -131,7 +147,9 @@ Status TableHeap::reclaim_all_pages() {
 }
 
 Status TableHeap::insert_tuple(const Tuple &tuple, RID *rid,
-                               const std::function<Status(RID)> &before_publish) {
+                               const std::function<Status(RID)> &before_publish,
+                               std::shared_mutex *checkpoint_barrier,
+                               const SlotReservedFn &slot_reserved) {
   std::unique_lock lock(mutex_); // Exclusive lock for write
 
   if (rid == nullptr) {
@@ -154,7 +172,7 @@ Status TableHeap::insert_tuple(const Tuple &tuple, RID *rid,
   }
 
   // Find a page with enough space
-  page_id_t target_page_id = find_page_with_space(tuple_size);
+  page_id_t target_page_id = find_page_with_space(tuple_size, slot_reserved);
 
   // If no page has space, create a new one
   if (target_page_id == INVALID_PAGE_ID) {
@@ -170,9 +188,15 @@ Status TableHeap::insert_tuple(const Tuple &tuple, RID *rid,
     return Status::IOError("Failed to fetch page for insert");
   }
 
+  // Checkpoint barrier (shared): held across the heap mutation AND the
+  // publication hook (which appends the WAL record + stamps the page LSN), so a
+  // concurrent checkpoint cannot flush the mutated page ahead of its record.
+  // Acquired here, after the heap lock, so the order stays heap-lock → barrier.
+  auto barrier = acquire_checkpoint_barrier(checkpoint_barrier);
+
   TablePage table_page(page);
-  auto slot_id =
-      table_page.insert_record(tuple.data(), static_cast<uint16_t>(tuple_size));
+  auto slot_id = table_page.insert_record(
+      tuple.data(), static_cast<uint16_t>(tuple_size), slot_reserved);
 
   if (!slot_id.has_value()) {
     // This shouldn't happen if find_page_with_space worked correctly
@@ -205,7 +229,9 @@ Status TableHeap::insert_tuple(const Tuple &tuple, RID *rid,
   return Status::Ok();
 }
 
-Status TableHeap::delete_tuple(const RID &rid) {
+Status TableHeap::delete_tuple(const RID &rid,
+                               const std::function<void()> &on_logged,
+                               std::shared_mutex *checkpoint_barrier) {
   std::unique_lock lock(mutex_); // Exclusive lock for write
 
   if (!rid.is_valid()) {
@@ -217,8 +243,17 @@ Status TableHeap::delete_tuple(const RID &rid) {
     return Status::NotFound("Page not found");
   }
 
+  // Barrier (shared) across the free + logging hook — see insert_tuple.
+  auto barrier = acquire_checkpoint_barrier(checkpoint_barrier);
+
   TablePage table_page(page);
   bool deleted = table_page.delete_record(rid.slot_id);
+
+  // Log while the mutation is still latched + barriered, so the record and its
+  // page-LSN stamp land before the freed page can be checkpoint-flushed.
+  if (deleted && on_logged) {
+    on_logged();
+  }
 
   buffer_pool_->unpin_page(rid.page_id, deleted); // Mark dirty if deleted
 
@@ -322,7 +357,9 @@ Status TableHeap::update_tuple(const Tuple &tuple, const RID &rid,
   return Status::Ok();
 }
 
-Status TableHeap::update_tuple_in_place(const Tuple &tuple, const RID &rid) {
+Status TableHeap::update_tuple_in_place(const Tuple &tuple, const RID &rid,
+                                        const std::function<void()> &on_logged,
+                                        std::shared_mutex *checkpoint_barrier) {
   std::unique_lock lock(mutex_); // Exclusive lock for write
 
   if (!rid.is_valid()) {
@@ -337,9 +374,18 @@ Status TableHeap::update_tuple_in_place(const Tuple &tuple, const RID &rid) {
     return Status::NotFound("Page not found");
   }
 
+  // Barrier (shared) across the in-place mutation + logging hook. Taken before
+  // update_record probes/mutates so a checkpoint cannot flush a mutated page
+  // ahead of its record — see insert_tuple. The no-side-effect failure paths
+  // below leave the page untouched, so holding it there is harmless.
+  auto barrier = acquire_checkpoint_barrier(checkpoint_barrier);
+
   TablePage table_page(page);
   if (table_page.update_record(rid.slot_id, tuple.data(),
                                static_cast<uint16_t>(tuple.size()))) {
+    if (on_logged) {
+      on_logged();
+    }
     buffer_pool_->unpin_page(rid.page_id, true);
     return Status::Ok();
   }
@@ -455,13 +501,14 @@ page_id_t TableHeap::create_new_page() {
   return new_page_id;
 }
 
-page_id_t TableHeap::find_page_with_space(uint32_t size) {
+page_id_t TableHeap::find_page_with_space(uint32_t size,
+                                          const SlotReservedFn &slot_reserved) {
   // Fast path: append to the last page if it has space.
   if (last_page_id_ != INVALID_PAGE_ID) {
     Page *page = buffer_pool_->fetch_page(last_page_id_);
     if (page != nullptr) {
       TablePage table_page(page);
-      if (table_page.can_fit(static_cast<uint16_t>(size))) {
+      if (table_page.can_fit(static_cast<uint16_t>(size), slot_reserved)) {
         buffer_pool_->unpin_page(last_page_id_, false);
         return last_page_id_;
       }
@@ -490,7 +537,7 @@ page_id_t TableHeap::find_page_with_space(uint32_t size) {
 
     // Check if this page has enough space
     // Need space for the record + slot
-    if (table_page.can_fit(static_cast<uint16_t>(size))) {
+    if (table_page.can_fit(static_cast<uint16_t>(size), slot_reserved)) {
       buffer_pool_->unpin_page(current_id, false);
       return current_id;
     }
