@@ -56,6 +56,10 @@ struct Schedule {
   /// The sweep asserts undo_ops > 0 for every seed (recovery's undo phase is
   /// genuinely exercised, not vacuously green).
   bool expect_undo = false;
+  /// The sweep asserts at least one transaction aborted during normal operation
+  /// for every seed, so an abort schedule can never regress into vacuous
+  /// coverage (aborts silently stop firing).
+  bool expect_aborts = false;
   /// The sweep asserts faults_injected == 0 for every seed (clean-baseline
   /// control schedules).
   bool expect_zero_faults = false;
@@ -72,6 +76,7 @@ struct RunResult {
   size_t ops = 0;
   size_t redo_ops = 0;  ///< recovery redo operations actually applied
   size_t undo_ops = 0;  ///< recovery undo operations actually applied
+  size_t aborts = 0;    ///< transactions aborted during normal operation
   double recovery_ms = 0.0;  ///< wall time; excluded from JSONL by default
   bool recovery_ok = true;
   std::vector<std::string> invariants_failed;

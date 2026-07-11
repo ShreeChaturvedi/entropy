@@ -231,6 +231,20 @@ private:
     void undo_write_record(const WriteRecord& record);
 
     /**
+     * @brief Append a redoable compensation record for an undone write-set entry
+     *
+     * Called for each entry after undo_write_record during abort(). Logs the
+     * inverse operation (DELETE for an undone INSERT, INSERT of the before-image
+     * for an undone DELETE, UPDATE back to the before-image for an undone UPDATE)
+     * as an ordinary data record and stamps its LSN onto the page. Recovery's
+     * repeat-history redo then reproduces the rollback of a transaction that
+     * aborted during normal operation even when its compensated pages were lost
+     * at a crash — the undo phase never revisits it once its ABORT is durable
+     * (#75/#81). No-op without a WAL manager.
+     */
+    void log_compensation(Transaction* txn, const WriteRecord& record);
+
+    /**
      * @brief Stamp @p lsn onto the page holding @p rid (WAL-before-page / redo)
      *
      * The page LSN records the highest log record whose effect the page
