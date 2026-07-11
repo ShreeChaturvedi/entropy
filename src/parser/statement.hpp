@@ -247,6 +247,46 @@ public:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CREATE INDEX Statement
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * @brief CREATE INDEX statement: CREATE INDEX name ON table (col1, col2, ...)
+ *
+ * The parser accepts a general (multi-column) key list. The current catalog
+ * indexes a single column, so binding is expected to enforce that constraint;
+ * the AST does not lose information.
+ */
+class CreateIndexStatement : public Statement {
+public:
+  CreateIndexStatement() : Statement(StatementType::CREATE_INDEX) {}
+
+  std::string index_name;
+  std::string table_name;
+  std::vector<std::string> columns;
+  bool if_not_exists = false;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DROP INDEX Statement
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * @brief DROP INDEX statement: DROP INDEX name [ON table]
+ *
+ * The optional ON clause mirrors the MySQL-style form; table_name is empty when
+ * omitted.
+ */
+class DropIndexStatement : public Statement {
+public:
+  DropIndexStatement() : Statement(StatementType::DROP_INDEX) {}
+
+  std::string index_name;
+  std::string table_name; // Optional (empty if no ON clause)
+  bool if_exists = false;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // EXPLAIN Statement
 // ─────────────────────────────────────────────────────────────────────────────
 
