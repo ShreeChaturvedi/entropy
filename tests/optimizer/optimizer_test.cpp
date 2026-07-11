@@ -64,6 +64,36 @@ protected:
     }
   }
 
+  // Highest key value present in a scaled indexed table's `k` column.
+  static constexpr BPTreeKey kDomainMax = 99900;
+
+  // Build an indexed table whose column `k` (index 1) spans [0, kDomainMax],
+  // then scale the cached row count to `simulated_rows`. An index scan only
+  // beats a sequential scan on a large table, so the two boundary rows pin the
+  // selectivity domain while the scaled row count drives the cost comparison.
+  TableInfo *make_scaled_indexed_table(const std::string &name,
+                                       size_t simulated_rows) {
+    Schema schema(
+        {Column("id", TypeId::INTEGER), Column("k", TypeId::INTEGER)});
+    EXPECT_TRUE(catalog_->create_table(name, schema).ok());
+    TableInfo *info = catalog_->get_table(name);
+    EXPECT_NE(info, nullptr);
+
+    for (int k : {0, static_cast<int>(kDomainMax)}) {
+      std::vector<TupleValue> values = {TupleValue(k), TupleValue(k)};
+      Tuple tuple(values, schema);
+      RID rid;
+      EXPECT_TRUE(info->table_heap->insert_tuple(tuple, &rid).ok());
+    }
+    EXPECT_TRUE(catalog_->create_index("idx_" + name + "_k", name, "k").ok());
+
+    statistics_->collect_statistics(info->oid);
+    if (simulated_rows > 2) {
+      statistics_->on_rows_inserted(info->oid, simulated_rows - 2);
+    }
+    return info;
+  }
+
   std::shared_ptr<DiskManager> disk_manager_;
   std::shared_ptr<BufferPoolManager> buffer_pool_;
   std::shared_ptr<Catalog> catalog_;
@@ -449,6 +479,119 @@ TEST_F(OptimizerTest, IndexScanResolvesByOidNotColumnId) {
   ASSERT_TRUE(wrong_row.has_value());
   EXPECT_NE(wrong_row->get_value(output_schema_, 0).as_integer(), 42);
   EXPECT_EQ(wrong_row->get_value(output_schema_, 2).as_integer(), 42);
+}
+
+// Issue #12: the range branch was gated on `Statistics::RANGE_SELECTIVITY < 0.3`
+// (0.33 < 0.3), always false, so a range scan was never selected regardless of
+// how selective the predicate was. A selective range on a large indexed table
+// must now choose the index range scan.
+TEST_F(OptimizerTest, SelectiveRangeChoosesIndexRangeScan) {
+  TableInfo *big = make_scaled_indexed_table("big", 10'000'000);
+
+  // k < 100 covers ~0.1% of the [0, 99900] domain: index is far cheaper.
+  auto pred = make_cmp(ComparisonType::LESS_THAN, "k", 1, TupleValue(100));
+  auto sel = index_selector_->select_access_method(big->oid, pred.get());
+
+  ASSERT_TRUE(sel.use_index);
+  EXPECT_EQ(sel.scan_type, IndexScanPlanNode::ScanType::RANGE_SCAN);
+}
+
+// Issue #12: the flip side of the dead branch -- a broad range must stay on the
+// sequential scan because random per-tuple fetches cost more than a heap scan.
+TEST_F(OptimizerTest, BroadRangeStaysOnSeqScan) {
+  TableInfo *big = make_scaled_indexed_table("big", 10'000'000);
+
+  // k < 50000 covers ~half the domain: sequential scan wins.
+  auto pred = make_cmp(ComparisonType::LESS_THAN, "k", 1, TupleValue(50000));
+  auto sel = index_selector_->select_access_method(big->oid, pred.get());
+
+  EXPECT_FALSE(sel.use_index);
+}
+
+// Issue #12: `<` and `>` were treated identically to `<=`/`>=` (both bounds
+// inclusive), so `k < 100` incorrectly included k == 100. Bounds are now
+// returned as inclusive integer keys, so the exclusive operators are adjusted
+// by 1.
+TEST_F(OptimizerTest, RangeBoundsTrackInclusiveExclusive) {
+  TableInfo *big = make_scaled_indexed_table("big", 10'000'000);
+  auto choose = [&](std::unique_ptr<Expression> pred) {
+    return index_selector_->select_access_method(big->oid, pred.get());
+  };
+
+  // k < 100  -> inclusive end 99, no lower bound.
+  auto lt = choose(make_cmp(ComparisonType::LESS_THAN, "k", 1, TupleValue(100)));
+  ASSERT_TRUE(lt.use_index);
+  EXPECT_FALSE(lt.start_key.has_value());
+  ASSERT_TRUE(lt.end_key.has_value());
+  EXPECT_EQ(*lt.end_key, 99);
+
+  // k <= 100 -> inclusive end 100.
+  auto le =
+      choose(make_cmp(ComparisonType::LESS_EQUAL, "k", 1, TupleValue(100)));
+  ASSERT_TRUE(le.use_index);
+  ASSERT_TRUE(le.end_key.has_value());
+  EXPECT_EQ(*le.end_key, 100);
+
+  // k > 99800 -> inclusive start 99801, no upper bound.
+  auto gt =
+      choose(make_cmp(ComparisonType::GREATER_THAN, "k", 1, TupleValue(99800)));
+  ASSERT_TRUE(gt.use_index);
+  EXPECT_FALSE(gt.end_key.has_value());
+  ASSERT_TRUE(gt.start_key.has_value());
+  EXPECT_EQ(*gt.start_key, 99801);
+
+  // k >= 99800 -> inclusive start 99800.
+  auto ge = choose(
+      make_cmp(ComparisonType::GREATER_EQUAL, "k", 1, TupleValue(99800)));
+  ASSERT_TRUE(ge.use_index);
+  ASSERT_TRUE(ge.start_key.has_value());
+  EXPECT_EQ(*ge.start_key, 99800);
+}
+
+// Issue #12: only `column OP const` was recognized (`30 < age` was missed) and
+// there was no conjunction support. Both are now handled.
+TEST_F(OptimizerTest, RangeScanHandlesConstOpColumnAndConjunction) {
+  TableInfo *big = make_scaled_indexed_table("big", 10'000'000);
+
+  // `50 > k`  ==  k < 50  -> inclusive end 49 (constant on the left).
+  auto k_col = std::make_unique<ColumnRefExpression>("k");
+  k_col->set_column_index(1);
+  auto const_op = std::make_unique<ComparisonExpression>(
+      ComparisonType::GREATER_THAN,
+      std::make_unique<ConstantExpression>(TupleValue(50)), std::move(k_col));
+  auto s1 = index_selector_->select_access_method(big->oid, const_op.get());
+  ASSERT_TRUE(s1.use_index);
+  EXPECT_EQ(s1.scan_type, IndexScanPlanNode::ScanType::RANGE_SCAN);
+  EXPECT_FALSE(s1.start_key.has_value());
+  ASSERT_TRUE(s1.end_key.has_value());
+  EXPECT_EQ(*s1.end_key, 49);
+
+  // k >= 100 AND k < 200 -> inclusive [100, 199].
+  auto conj = std::make_unique<LogicalExpression>(
+      LogicalOpType::AND,
+      make_cmp(ComparisonType::GREATER_EQUAL, "k", 1, TupleValue(100)),
+      make_cmp(ComparisonType::LESS_THAN, "k", 1, TupleValue(200)));
+  auto s2 = index_selector_->select_access_method(big->oid, conj.get());
+  ASSERT_TRUE(s2.use_index);
+  EXPECT_EQ(s2.scan_type, IndexScanPlanNode::ScanType::RANGE_SCAN);
+  ASSERT_TRUE(s2.start_key.has_value());
+  ASSERT_TRUE(s2.end_key.has_value());
+  EXPECT_EQ(*s2.start_key, 100);
+  EXPECT_EQ(*s2.end_key, 199);
+}
+
+// Issue #12: a point lookup on a high-NDV indexed column of a large table must
+// prefer the index over a full sequential scan.
+TEST_F(OptimizerTest, EqualityOnLargeIndexedTablePrefersIndex) {
+  TableInfo *big = make_scaled_indexed_table("big", 10'000'000);
+
+  auto eq = make_cmp(ComparisonType::EQUAL, "k", 1, TupleValue(500));
+  auto sel = index_selector_->select_access_method(big->oid, eq.get());
+
+  ASSERT_TRUE(sel.use_index);
+  EXPECT_EQ(sel.scan_type, IndexScanPlanNode::ScanType::POINT_LOOKUP);
+  ASSERT_TRUE(sel.start_key.has_value());
+  EXPECT_EQ(*sel.start_key, 500);
 }
 
 // PlanNode Tests
