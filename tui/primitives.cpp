@@ -124,6 +124,16 @@ Element GalaxyMark(int cell_cols, int cell_rows, double sweep_phase) {
   const double sweep_center = -1.7 + 3.4 * std::clamp(sweep_phase, 0.0, 1.0);
   constexpr double kSweepWidth = 0.17;
 
+  // Point-field geometry (see the per-pixel field below): a mid-radius torus
+  // ring and two log-spiral arms r = a*exp(b*theta) that peel off it. A bright
+  // ring pushed out to r ~ 0.56 leaves a dark elliptical void between it and the
+  // tight nucleus, and the arms trace two clearly-separated curves off the ring.
+  constexpr double kPi = 3.14159265358979323846;
+  constexpr double kRingRadius = 0.56;  // torus radius; opens a dark inner hole
+  constexpr double kArmRef = 0.16;      // a: radius where the arm crosses 0
+  constexpr double kArmPitch = 0.70;    // b: larger = looser winding
+  constexpr double kArmWidth = 0.070;   // perpendicular half-width of an arm
+
   for (int y = 0; y < h; ++y) {
     for (int x = 0; x < w; ++x) {
       const double fx = (static_cast<double>(x) - cx) * norm;
@@ -138,20 +148,46 @@ Element GalaxyMark(int cell_cols, int cell_rows, double sweep_phase) {
       }
       const double theta = std::atan2(dy, dx);
 
-      // Radial luminance field: a sharp Gaussian nucleus (a small hot white
-      // center), an exponential disc that keeps the surrounding cells in the
-      // mid-gray steel/silver band, two gentle log-spiral arms modulating the
-      // disc, and a faint outer halo. Keeping the disc off pure white leaves
-      // headroom for the diagonal sheen to read as a highlight.
-      const double core = gaussian(r, 0.0, 0.185);
-      const double disc = std::exp(-r / 0.44);
-      const double arm =
-          0.5 + 0.5 * std::cos(2.0 * theta - 5.0 * std::log(r + 0.14));
-      // clamp guards pow() against a tiny negative from cos() rounding past -1.
-      const double arm_lum = std::pow(std::clamp(arm, 0.0, 1.0), 1.4);
-      const double body = disc * (0.55 + 0.45 * arm_lum);
-      const double halo = 0.06 * std::exp(-r / 0.60);
-      double base = core + 0.74 * body + halo;
+      // Luminance field built from INTENTIONAL structure, not dithered scatter:
+      // a tight bright nucleus with a compact bulge hugging it, a mid-radius
+      // torus ring that opens a dark elliptical void, and two logarithmic-spiral
+      // arms traced deliberately out of that ring. The background stays
+      // near-empty so the geometry reads at this low resolution, and everything
+      // is kept off pure white to leave headroom for the diagonal sheen.
+
+      // (1) A tight, very sharp nucleus so only the very center saturates to
+      // white (the mark's single brightest point), with a compact silver bulge
+      // hugging it. High weight and small sigma give the core its punch.
+      const double core = 1.45 * gaussian(r, 0.0, 0.068);
+      const double bulge = 0.12 * gaussian(r, 0.0, 0.085);
+
+      // (2) The torus ring at mid-radius, so a real dark elliptical hole opens
+      // between it and the nucleus (that void, not more dots, is what makes the
+      // mark read as a spiral disc). Thin and bright so it lights near-continuous
+      // around the ellipse, but kept below the nucleus so the core still wins.
+      const double ring = 0.80 * gaussian(r, kRingRadius, 0.040);
+
+      // (3) Two log-spiral arms that peel off the ring. The spiral angle at
+      // radius r is phi(r) = ln(r/a)/b; the arms sit at phi and phi+pi. Fold
+      // theta onto the nearest arm, measure the (chord) perpendicular distance,
+      // and light a narrow band along it. A smoothstep inner edge makes the arms
+      // grow out of the ring instead of filling the hole, and they dim outward.
+      double arm_lum = 0.0;
+      if (r > 0.52) {  // arms start at the ring shoulder (where `inner` opens up)
+        const double phi = std::log(r / kArmRef) / kArmPitch;
+        double d = theta - phi;
+        d -= kPi * std::round(d / kPi);  // fold onto nearest of the two arms
+        const double perp = r * d;       // ~perpendicular distance to the arm
+        const double inner = smoothstep((r - 0.52) / 0.10);  // grow from ring
+        const double outward = std::exp(-r / 0.82);          // dim outward
+        arm_lum = 1.05 * gaussian(perp, 0.0, kArmWidth) * inner * outward;
+      }
+
+      // (4) Near-empty background: only a whisper of halo so the void between
+      // the arms is not dead black.
+      const double halo = 0.015 * std::exp(-r / 0.5);
+
+      double base = core + bulge + ring + arm_lum + halo;
 
       // Diagonal projection shared by the static luster and the moving sweep,
       // with a radial presence mask so both fade with the disc.
@@ -179,7 +215,7 @@ Element GalaxyMark(int cell_cols, int cell_rows, double sweep_phase) {
       // Density tracks luminance: the near-white core lights every sub-pixel (a
       // solid mass) while the rim dissolves into sparse dots. A halftone dither
       // keeps the dot-matrix texture without the field reading as random noise.
-      const double thresh = 0.80 * bayer(x, y) + 0.20 * hash01(x, y);
+      const double thresh = 0.90 * bayer(x, y) + 0.06 * hash01(x, y);
       if (lum * 1.06 <= thresh) {
         continue;
       }
