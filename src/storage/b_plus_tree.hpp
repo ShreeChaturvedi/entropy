@@ -18,6 +18,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -28,8 +29,10 @@
 
 namespace entropy {
 
-// Forward declaration
+// Forward declarations
 class BPlusTreeIterator;
+/// Per-operation set of write-latched + pinned pages; defined in b_plus_tree.cpp.
+class WriteSet;
 
 /**
  * @brief B+ Tree index for efficient key-value lookups
@@ -180,11 +183,25 @@ private:
   // ─────────────────────────────────────────────────────────────────────────
 
   /**
-   * @brief Find the leaf page that should contain the key
-   * @param key The key to search for
-   * @return Page ID of the leaf, or INVALID_PAGE_ID if tree is empty
+   * @brief Pin and read-latch the current root page.
+   *
+   * A writer can only move the root while holding the old root's write latch,
+   * so after latching we re-check root_page_id_ and retry if it moved between
+   * the snapshot and the latch. Returns the root pinned and read-latched (the
+   * caller must runlatch() then unpin_page()), or nullptr on an empty tree or
+   * fetch failure.
    */
-  [[nodiscard]] page_id_t find_leaf(KeyType key);
+  [[nodiscard]] Page *latch_root_read() const;
+
+  /**
+   * @brief Descend to the leaf that should contain @p key, read-latch-crabbing.
+   *
+   * Starts from latch_root_read(), then hand-over-hand takes each child's read
+   * latch and releases the parent. Returns the leaf pinned and holding its READ
+   * latch; the caller must runlatch() then unpin_page(). Returns nullptr on an
+   * empty tree or fetch failure.
+   */
+  [[nodiscard]] Page *descend_to_leaf_read(KeyType key);
 
   /**
    * @brief Create a new leaf page
@@ -198,56 +215,43 @@ private:
    */
   [[nodiscard]] Page *create_internal_page(page_id_t *page_id);
 
-  /**
-   * @brief Insert into a leaf, splitting if necessary
-   * @param leaf_page The leaf page
-   * @param key Key to insert
-   * @param value Value to insert
-   * @return Status and optional (split_key, new_page_id) if split occurred
-   */
-  struct InsertResult {
-    Status status;
-    bool did_split = false;
-    KeyType split_key = 0;
-    page_id_t new_page_id = INVALID_PAGE_ID;
-  };
-  [[nodiscard]] InsertResult insert_into_leaf(Page *leaf_page, KeyType key,
-                                              const ValueType &value);
+  // ─────────────────────────────────────────────────────────────────────────
+  // Structural-write helpers (latch-crabbing)
+  //
+  // These run while write_mutex_ is held and operate on the retained ancestor
+  // chain `path` (root-first, leaf-last) whose pages are write-latched in `ws`.
+  // Siblings and new pages are latched through `ws` on demand.
+  // ─────────────────────────────────────────────────────────────────────────
 
-  /**
-   * @brief Insert a new key into parent after a child split
-   */
-  [[nodiscard]] Status insert_into_parent(Page *old_page, KeyType key,
-                                          page_id_t new_page_id);
+  /// Propagate a split (@p up_key separating the node at path.back() from its
+  /// new right sibling @p up_child) up the retained @p path, splitting internal
+  /// nodes and growing a new root as needed.
+  [[nodiscard]] Status insert_into_parents(WriteSet &ws,
+                                           std::vector<page_id_t> &path,
+                                           KeyType up_key, page_id_t up_child);
 
-  /**
-   * @brief Update parent pointers for all children of an internal node
-   */
-  void update_children_parent(page_id_t parent_id,
-                              BPTreeInternalPage *internal);
+  /// Point every child of @p internal at @p parent_id (fixes parent pointers
+  /// after a split moves children to a new node).
+  void reparent_children(WriteSet &ws, page_id_t parent_id,
+                         BPTreeInternalPage &internal);
 
-  /**
-   * @brief Handle underflow in a leaf node after deletion
-   *
-   * Tries to borrow from siblings first, then merges if necessary.
-   * @param leaf_page The underfull leaf (still pinned by caller)
-   * @param page_to_delete_out If non-null, set to a page the caller must
-   *        delete_page after unpinning (the merged-away leaf on left-merge)
-   */
-  [[nodiscard]] Status handle_leaf_underflow(Page *leaf_page,
-                                             page_id_t *page_to_delete_out);
+  /// Set @p child_id's parent pointer to @p parent_id (no-op for INVALID).
+  void set_parent(WriteSet &ws, page_id_t child_id, page_id_t parent_id);
 
-  /**
-   * @brief Handle underflow in an internal node after a child merge
-   *
-   * Tries to borrow from siblings first, then merges if necessary.
-   * @param internal_page The underfull internal node (still pinned by caller)
-   * @param page_to_delete_out If non-null, set to a page the caller must
-   *        delete_page after unpinning (the merged-away node on left-merge)
-   */
-  [[nodiscard]] Status
-  handle_internal_underflow(Page *internal_page,
-                            page_id_t *page_to_delete_out);
+  /// Rebalance an underfull leaf (path.back()) by borrowing from or merging with
+  /// a sibling, then propagate any resulting parent underflow.
+  [[nodiscard]] Status handle_leaf_underflow(WriteSet &ws,
+                                             std::vector<page_id_t> &path);
+
+  /// After a child merge removed a key from the node at path.back(), collapse
+  /// the root if it emptied, or rebalance the node if it underflowed.
+  [[nodiscard]] Status handle_parent_after_merge(WriteSet &ws,
+                                                 std::vector<page_id_t> &path);
+
+  /// Rebalance an underfull internal node (path.back()) by borrowing from or
+  /// merging with a sibling, then recurse upward.
+  [[nodiscard]] Status handle_internal_underflow(WriteSet &ws,
+                                                 std::vector<page_id_t> &path);
 
   /**
    * @brief Assign a new root page id and notify the root-change callback
@@ -263,9 +267,17 @@ private:
   [[nodiscard]] std::vector<page_id_t> collect_tree_pages();
 
   std::shared_ptr<BufferPoolManager> buffer_pool_;
-  /// Atomic so the catalog can snapshot the root while a writer moves it.
+  /// Atomic so a reader can snapshot the root while a writer moves it.
   std::atomic<page_id_t> root_page_id_;
   std::function<void(page_id_t)> root_change_callback_;
+
+  /// Serializes structural writers (insert / remove / reclaim). Readers do NOT
+  /// take this; they synchronize with writers through per-page latches acquired
+  /// via crabbing. Serializing writers keeps the crabbing protocol deadlock
+  /// free: the only remaining latch-ordering interactions are reader-vs-writer,
+  /// which the top-down descent (and a left-to-right sibling rule) order
+  /// consistently. See the design notes in b_plus_tree.cpp.
+  std::mutex write_mutex_;
 
   // Maximum sizes for nodes (computed once)
   uint32_t leaf_max_size_;
