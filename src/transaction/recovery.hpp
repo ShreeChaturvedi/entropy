@@ -84,6 +84,14 @@ public:
    * setups) no pages can be flushed and the record carries no anchor,
    * which makes recovery fall back to a full page-LSN-gated scan.
    *
+   * IMPORTANT: the recorded anchor is only sound when no writer runs
+   * concurrently with this call. A writer that obtained an LSN before the
+   * anchor was captured but dirtied its page after flush_all_pages would be
+   * skipped by anchored redo yet not be durable on disk. Concurrency is not
+   * wired yet; when WP7 wires concurrent writers, checkpointing must either
+   * quiesce writers for the flush window or record a real dirty-page-table
+   * anchor (min recLSN) instead.
+   *
    * @param active_txn_ids List of currently active transaction IDs
    * @return Status indicating success or failure
    */
@@ -157,7 +165,9 @@ private:
    * @brief Undo phase: Rollback uncommitted transactions
    *
    * Applies inverse operations for all loser transactions in one merged
-   * descending-LSN scan, flushes every page the undo mutated, and only then
+   * descending-LSN scan, flushes the page of every loser record examined (a
+   * superset of the pages mutated this run, covering compensations that a
+   * previous failed recovery attempt left dirty in the pool), and only then
    * appends (and flushes) an ABORT record per loser. That ordering makes the
    * ABORT a durable promise that its compensation is already on disk; a crash
    * at any point re-runs a state-checked, idempotent undo.
@@ -177,17 +187,18 @@ private:
   /**
    * @brief Undo a single log record (state-checked, idempotent)
    * @param record The log record to undo
-   * @param[out] applied Set to true iff the page was actually mutated
    * @return Status indicating success or failure
    *
    * Each inverse op verifies the slot still reflects the logged operation
-   * before touching it: undo-INSERT deletes only if the slot holds the
-   * inserted bytes, undo-UPDATE restores only if the slot holds the
-   * after-image, undo-DELETE re-inserts only into an empty slot. Slots
-   * already undone (recovery re-run) or reused by a committed transaction
-   * are left untouched.
+   * before touching it: undo-INSERT deletes only if the slot holds exactly
+   * the inserted bytes (length included, so a longer committed row sharing a
+   * prefix is never destroyed), undo-UPDATE restores only if the slot holds
+   * the after-image (re-stamping the before-image's exact length), and
+   * undo-DELETE re-inserts only into an empty slot. Slots already undone
+   * (recovery re-run) or reused by a committed transaction are left
+   * untouched.
    */
-  Status undo_record(const LogRecord &record, bool *applied);
+  Status undo_record(const LogRecord &record);
 
   // ─────────────────────────────────────────────────────────────────────────
   // Member Variables

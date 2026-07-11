@@ -47,6 +47,16 @@ namespace {
          std::memcmp(rec.data(), image.data(), image.size()) == 0;
 }
 
+/// True when the slot's stored record is byte-for-byte exactly `image`,
+/// length included. Undo-INSERT uses this so a longer committed row that
+/// merely shares a prefix with the loser's insert is never mistaken for it.
+[[nodiscard]] bool slot_holds_exactly(const TablePage &page, slot_id_t slot_id,
+                                      const std::vector<char> &image) {
+  std::span<const char> rec = page.get_record(slot_id);
+  return !image.empty() && rec.size() == image.size() &&
+         std::memcmp(rec.data(), image.data(), image.size()) == 0;
+}
+
 } // namespace
 
 RecoveryManager::RecoveryManager(std::shared_ptr<BufferPoolManager> buffer_pool,
@@ -117,13 +127,17 @@ Status RecoveryManager::create_checkpoint(
   }
 
   // The redo anchor is only safe when every record older than it is durably
-  // reflected on disk pages. Capture the anchor candidate first: records
-  // appended concurrently after this point get LSN >= begin_lsn and stay
-  // inside the redo scan. Then flush the WAL (so all pre-anchor records are
-  // durable for analysis/undo) and flush all dirty pages (so all pre-anchor
-  // effects are durable). Without a buffer pool no pages can be flushed, so
-  // no anchor is recorded and recovery falls back to a full page-LSN-gated
-  // scan.
+  // reflected on disk pages. Capture the anchor candidate first, then flush
+  // the WAL (so all pre-anchor records are durable for analysis/undo), then
+  // flush all dirty pages (so all pre-anchor effects are durable). Without a
+  // buffer pool no pages can be flushed, so no anchor is recorded and
+  // recovery falls back to a full page-LSN-gated scan.
+  //
+  // SINGLE-THREADED ONLY: this ordering assumes no writer runs concurrently
+  // (see the class doc). A writer holding a pre-anchor LSN that dirties its
+  // page after flush_all_pages would be skipped by anchored redo without
+  // being durable. WP7's concurrent wiring must quiesce writers here or
+  // switch to a real dirty-page-table (min recLSN) anchor.
   lsn_t begin_lsn = INVALID_LSN;
   if (buffer_pool_) {
     begin_lsn = wal_->next_lsn();
@@ -333,7 +347,7 @@ Status RecoveryManager::undo_phase(const std::vector<LogRecord> &records) {
   // Undo every loser operation in one merged scan in global reverse-LSN order
   // (not per-transaction chains), so interleaved losers unwind in the exact
   // inverse of the order their effects were applied.
-  std::unordered_set<page_id_t> touched_pages;
+  std::unordered_set<page_id_t> loser_pages;
   for (auto it = records.rbegin(); it != records.rend(); ++it) {
     const LogRecord &record = *it;
     if (!is_data_record(record.type()) ||
@@ -341,13 +355,18 @@ Status RecoveryManager::undo_phase(const std::vector<LogRecord> &records) {
       continue;
     }
 
-    bool applied = false;
-    Status status = undo_record(record, &applied);
+    // Track EVERY examined loser page, not only pages mutated in this run: a
+    // prior recover() attempt may have applied a compensation in-pool and then
+    // failed the flush; on retry the state-checked undo skips the op, but that
+    // compensation still sits only dirty in the pool and must reach disk
+    // before any ABORT becomes durable.
+    if (record.rid().page_id >= 0) {
+      loser_pages.insert(record.rid().page_id);
+    }
+
+    Status status = undo_record(record);
     if (!status.ok()) {
       LOG_WARN("Undo failed for LSN {}: {}", record.lsn(), status.message());
-    }
-    if (applied) {
-      touched_pages.insert(record.rid().page_id);
     }
   }
 
@@ -355,7 +374,7 @@ Status RecoveryManager::undo_phase(const std::vector<LogRecord> &records) {
   // becomes durable. Once an ABORT is durable, a later recovery no longer
   // treats the transaction as a loser, so an unflushed compensation would be
   // lost forever if we crashed here with the ABORT already in the log.
-  for (page_id_t page_id : touched_pages) {
+  for (page_id_t page_id : loser_pages) {
     // fetch_page pins the page (re-reading it if it was evicted, in which case
     // its state is already on disk), so a false from flush_page can only mean
     // a real write failure.
@@ -382,9 +401,7 @@ Status RecoveryManager::undo_phase(const std::vector<LogRecord> &records) {
   return wal_->flush();
 }
 
-Status RecoveryManager::undo_record(const LogRecord &record, bool *applied) {
-  *applied = false;
-
+Status RecoveryManager::undo_record(const LogRecord &record) {
   const RID rid = record.rid();
   if (rid.page_id < 0) {
     return Status::InvalidArgument("Undo record has invalid page id");
@@ -396,15 +413,20 @@ Status RecoveryManager::undo_record(const LogRecord &record, bool *applied) {
   }
 
   TablePage table_page(page);
+  bool applied = false;
 
   switch (record.type()) {
   case LogRecordType::INSERT:
-    // Undo INSERT: remove the row, but only while the slot still holds this
-    // insert's bytes. A mismatch means the insert was already undone (re-run
-    // after a crash) or the slot was legitimately reused by a committed
-    // transaction; blindly deleting would destroy committed data.
-    if (slot_holds(table_page, rid.slot_id, record.new_tuple_data())) {
-      *applied = table_page.delete_record(rid.slot_id);
+    // Undo INSERT: remove the row, but only while the slot holds EXACTLY this
+    // insert's bytes (length included). A mismatch means the insert was
+    // already undone (re-run after a crash) or the slot was reused by a
+    // committed transaction; prefix matching here would let a longer
+    // committed row that merely starts with the loser's bytes be destroyed.
+    // Exact matching is sufficient because both insert paths store the exact
+    // length, and undo-UPDATE below re-normalizes the slot length when it
+    // restores a before-image.
+    if (slot_holds_exactly(table_page, rid.slot_id, record.new_tuple_data())) {
+      applied = table_page.delete_record(rid.slot_id);
     }
     break;
 
@@ -415,21 +437,34 @@ Status RecoveryManager::undo_record(const LogRecord &record, bool *applied) {
     uint16_t size = 0;
     if (table_page.get_record(rid.slot_id).empty() &&
         to_record_size(record.old_tuple_data().size(), &size)) {
-      *applied = table_page.insert_record_at(rid.slot_id,
-                                             record.old_tuple_data().data(), size);
+      applied = table_page.insert_record_at(rid.slot_id,
+                                            record.old_tuple_data().data(), size);
     }
     break;
   }
 
   case LogRecordType::UPDATE: {
     // Undo UPDATE: restore the before-image, but only while the slot holds
-    // the after-image. A slot already holding the before-image (re-run after
-    // a crash) or holding a committed successor is left untouched.
+    // the after-image. This check stays prefix-based: an in-place shrink
+    // leaves the slot's stale (longer) length over the after-image. A slot
+    // already holding the before-image (re-run after a crash) or a committed
+    // successor is left untouched.
     uint16_t size = 0;
     if (slot_holds(table_page, rid.slot_id, record.new_tuple_data()) &&
         to_record_size(record.old_tuple_data().size(), &size)) {
-      *applied = table_page.update_record(rid.slot_id,
-                                          record.old_tuple_data().data(), size);
+      // Restore via delete + insert-at rather than update_record: that stamps
+      // the before-image's EXACT length back onto the slot (update_record
+      // keeps a stale longer length on shrink), so the transaction's earlier
+      // INSERT undo can rely on exact matching. Space always suffices: the
+      // slot's stored record is at least as long as the before-image it once
+      // held, and insert_record_at compacts to reclaim the freed hole.
+      applied = table_page.delete_record(rid.slot_id) &&
+                table_page.insert_record_at(rid.slot_id,
+                                            record.old_tuple_data().data(), size);
+      if (!applied) {
+        buffer_pool_->unpin_page(rid.page_id, true);
+        return Status::Internal("Undo UPDATE failed to restore before-image");
+      }
     }
     break;
   }
@@ -438,7 +473,7 @@ Status RecoveryManager::undo_record(const LogRecord &record, bool *applied) {
     break;
   }
 
-  if (*applied) {
+  if (applied) {
     ++undo_count_;
   } else {
     LOG_DEBUG("Undo skipped {} at ({},{}): slot no longer reflects the "
@@ -447,7 +482,7 @@ Status RecoveryManager::undo_record(const LogRecord &record, bool *applied) {
               rid.slot_id);
   }
 
-  buffer_pool_->unpin_page(rid.page_id, *applied);
+  buffer_pool_->unpin_page(rid.page_id, applied);
   return Status::Ok();
 }
 
