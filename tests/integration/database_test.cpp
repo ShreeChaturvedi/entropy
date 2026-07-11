@@ -605,6 +605,54 @@ TEST_F(DatabaseTest, IllTypedExpressionReturnsErrorNotCrash) {
   EXPECT_EQ(ok.rows()[1]["name"].as_string(), "Bob");
 }
 
+// Robustness (companion to the SELECT case above): the same
+// std::bad_variant_access crash class is reachable through DML. execute_update
+// and execute_insert drain their executors outside collect_result's SELECT
+// guard, so before the dispatch-level guard an ill-typed UPDATE/INSERT threw
+// straight out of the public execute() and aborted the host. Each must now come
+// back as a clean error Status, and the database must stay usable afterward.
+TEST_F(DatabaseTest, IllTypedDmlReturnsErrorNotCrash) {
+  Database db(temp_file_->string());
+  ASSERT_TRUE(
+      db.execute("CREATE TABLE emp (id INTEGER, name VARCHAR(50), sal INTEGER)")
+          .ok());
+  ASSERT_TRUE(
+      db.execute("INSERT INTO emp VALUES (1,'Alice',100),(2,'Bob',200)").ok());
+
+  // An ill-typed UPDATE SET value or INSERT literal throws when the mistyped
+  // result is materialized into the target column. None may abort the process;
+  // every one must come back as an error Status.
+  const std::vector<std::string> ill_typed_dml = {
+      "UPDATE emp SET sal = name + 1 WHERE id = 1",
+      "UPDATE emp SET sal = name * sal WHERE id = 2",
+      "INSERT INTO emp VALUES (3, 'Carol', 'not-an-int')",
+  };
+  for (const auto &sql : ill_typed_dml) {
+    auto result = db.execute(sql);
+    EXPECT_FALSE(result.ok()) << "expected error for: " << sql;
+  }
+
+  // An ill-typed DELETE can't reach that throw: its only expression is the
+  // WHERE predicate, which evaluates to a fresh boolean, never a materialized
+  // mistyped column, so it matches nothing. It must still not crash.
+  auto del = db.execute("DELETE FROM emp WHERE name * 2 = 4");
+  EXPECT_TRUE(del.ok()) << del.status().to_string();
+  EXPECT_EQ(del.affected_rows(), 0u);
+
+  // The database is still usable after the ill-typed DML: the two original rows
+  // are intact (the aborted statements applied nothing) and a well-typed UPDATE
+  // commits. sal is INTEGER, so it reads back as int32.
+  auto after = db.execute("SELECT id, sal FROM emp ORDER BY id");
+  ASSERT_TRUE(after.ok()) << after.status().to_string();
+  ASSERT_EQ(after.row_count(), 2u);
+  EXPECT_EQ(after.rows()[0]["sal"].as_int32(), 100);
+  EXPECT_EQ(after.rows()[1]["sal"].as_int32(), 200);
+
+  auto upd = db.execute("UPDATE emp SET sal = sal + 1 WHERE id = 1");
+  ASSERT_TRUE(upd.ok()) << upd.status().to_string();
+  EXPECT_EQ(upd.affected_rows(), 1u);
+}
+
 // #10: on a large indexed table the optimizer picks an index scan for a
 // selective point lookup and a sequential scan when there is no predicate,
 // observable through EXPLAIN's rendered plan.
