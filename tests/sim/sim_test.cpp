@@ -3,14 +3,17 @@
  * @brief Tests for the deterministic crash-simulation harness.
  *
  * Coverage: device-level fault mechanics (torn/lost/durable) and their
- * determinism, exact WAL durable-prefix semantics, schedule replay determinism,
- * a set of fixed-seed schedules that must survive recovery, and a negative test
- * proving the invariant checker actually detects a violation.
+ * determinism, exact WAL durable-prefix semantics, schedule replay determinism
+ * (including byte-identical JSONL), a sweep of fixed-seed schedules that must
+ * survive recovery with a per-schedule anti-vacuity guard (every advertised
+ * fault kind fired; undo genuinely exercised where promised), and negative
+ * tests proving the invariant checker actually detects violations.
  */
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -180,20 +183,23 @@ TEST(ScheduleTest, SameSeedProducesIdenticalFaultSequenceAndOutcome) {
         << "seed " << seed << " must inject a byte-identical fault sequence";
     EXPECT_EQ(r1.faults_injected, r2.faults_injected);
     EXPECT_EQ(r1.ops, r2.ops);
+    EXPECT_EQ(r1.redo_ops, r2.redo_ops);
+    EXPECT_EQ(r1.undo_ops, r2.undo_ops);
     EXPECT_EQ(r1.outcome(), r2.outcome());
     EXPECT_EQ(r1.invariants_failed, r2.invariants_failed);
+    // The default JSONL line (no wall-clock timing) is byte-identical across
+    // replays — the report itself is reproducible, not just the outcome.
+    EXPECT_EQ(r1.to_jsonl(), r2.to_jsonl());
   }
 }
 
-TEST(ScheduleTest, MixedScheduleActuallyInjectsFaults) {
-  auto sched = make_schedule("mixed");
-  ASSERT_TRUE(sched.has_value());
-  RunResult r = run_schedule(/*seed=*/3, *sched);
-  EXPECT_GT(r.faults_injected, 0u)
-      << "the mixed schedule must exercise real fault injection";
-}
-
 // ── Fixed-seed schedules that must survive recovery ─────────────────────────
+//
+// Beyond per-seed invariants, each sweep enforces the schedule's anti-vacuity
+// contract: every fault kind the schedule advertises (must_fire) fired at
+// least once across the sweep, undo-exercising schedules really drove
+// recovery's undo phase, and the no-fault control really injected nothing. A
+// schedule whose advertised fault cannot fire fails its own test.
 
 class SchedulePassSweep
     : public ::testing::TestWithParam<std::string> {};
@@ -202,6 +208,7 @@ TEST_P(SchedulePassSweep, RecoversToACorrectStateAcrossSeeds) {
   auto sched = make_schedule(GetParam());
   ASSERT_TRUE(sched.has_value());
 
+  std::set<FaultKind> fired;
   for (uint64_t seed = 1; seed <= 40; ++seed) {
     RunResult r = run_schedule(seed, *sched);
     EXPECT_TRUE(r.passed())
@@ -213,6 +220,27 @@ TEST_P(SchedulePassSweep, RecoversToACorrectStateAcrossSeeds) {
              return s;
            }()
         << "]";
+
+    for (const FaultEvent &event : r.faults) {
+      fired.insert(event.kind);
+    }
+    if (sched->expect_undo) {
+      EXPECT_GT(r.undo_ops, 0u)
+          << "schedule=" << GetParam() << " seed=" << seed
+          << ": recovery's undo phase must be genuinely exercised";
+    }
+    if (sched->expect_zero_faults) {
+      EXPECT_EQ(r.faults_injected, 0u)
+          << "schedule=" << GetParam() << " seed=" << seed
+          << ": the clean-baseline control must inject nothing";
+    }
+  }
+
+  for (FaultKind kind : sched->must_fire) {
+    EXPECT_TRUE(fired.contains(kind))
+        << "schedule=" << GetParam() << " advertises "
+        << fault_kind_name(kind)
+        << " but it never fired across the sweep (vacuous coverage)";
   }
 }
 
@@ -244,6 +272,38 @@ TEST(DetectionTest, SkippingRecoveryIsCaughtByTheInvariantChecker) {
   EXPECT_GT(skip_failures, 0u)
       << "a checker that never fails is worthless: skipping recovery over lost "
          "committed pages must trip the invariant checker for at least one seed";
+}
+
+// Torn data pages are a real engine gap (issue #86): pages carry no checksum,
+// so recovery cannot detect a half-persisted write, and a tear that keeps the
+// header + slot directory blocks redo's repair — recover() reports success
+// while committed bytes are gone. The schedule is excluded from the passing
+// set; this test pins the characterization: the tear always fires, the harness
+// detects the silent data loss on a substantial share of seeds (0.5 expected;
+// which side of the page survives decides each seed), and every failure is the
+// committed_present invariant, never a recovery error.
+TEST(DetectionTest, TornPageWritesAreCaughtUntilPagesCarryChecksums) {
+  auto sched = make_schedule("torn_page_write");
+  ASSERT_TRUE(sched.has_value());
+
+  size_t caught = 0;
+  for (uint64_t seed = 1; seed <= 40; ++seed) {
+    RunResult r = run_schedule(seed, *sched);
+    EXPECT_GT(r.faults_injected, 0u) << "seed " << seed;
+    EXPECT_TRUE(r.recovery_ok)
+        << "seed " << seed
+        << ": the engine does not even surface an error on a torn page";
+    if (!r.passed()) {
+      ++caught;
+      EXPECT_EQ(r.invariants_failed,
+                std::vector<std::string>{"committed_present"})
+          << "seed " << seed;
+    }
+  }
+  EXPECT_GT(caught, 10u)
+      << "torn pages must trip the checker on a substantial share of seeds; "
+         "if this starts passing everywhere, the engine grew torn-page "
+         "protection — promote the schedule to the passing set (issue #86)";
 }
 
 }  // namespace
