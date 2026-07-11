@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -18,6 +19,7 @@
 
 #include "common/config.hpp"
 #include "entropy/entropy.hpp"
+#include "storage/disk_manager.hpp"
 #include "test_utils.hpp"
 
 namespace entropy {
@@ -514,6 +516,76 @@ TEST_F(TransactionApiTest, RolledBackInsertsNeverVisibleToConcurrentReaders) {
   EXPECT_EQ(count_rows(db, "t"), 0u);
 }
 
+// Rolling back a DELETE must restore its row even when a concurrent INSERT
+// raced for the freed slot (crash-safety F1). The reviewer's interleaving: A
+// deletes id=1, physically freeing slot (P,0) while still holding its X-lock;
+// B inserts into the same page; A rolls back. If B were allowed to reuse the
+// slot the deleter's rollback would find it occupied and skip the restore,
+// silently losing A's committed row. The insert's free-slot search must skip a
+// slot carrying an uncommitted delete, so B lands elsewhere and BOTH rows
+// survive.
+TEST_F(TransactionApiTest, RolledBackDeleteSurvivesConcurrentSlotReuse) {
+  Database db(path_);
+  ASSERT_TRUE(db.execute("CREATE TABLE t (id INTEGER, v INTEGER)").ok());
+  // id=1 is the committed row that lands at slot (P,0).
+  ASSERT_TRUE(db.execute("INSERT INTO t VALUES (1, 10)").ok());
+
+  std::atomic<bool> deleted{false};
+  std::atomic<bool> resume{false};
+  std::thread deleter([&] {
+    ASSERT_TRUE(db.begin_transaction().ok());
+    auto del = db.execute("DELETE FROM t WHERE id = 1");
+    ASSERT_TRUE(del.ok()) << del.status().to_string();
+    ASSERT_EQ(del.affected_rows(), 1u);
+    deleted.store(true);
+    // Hold the X-lock on the freed slot open across the concurrent insert.
+    while (!resume.load()) {
+      std::this_thread::yield();
+    }
+    ASSERT_TRUE(db.rollback().ok());
+  });
+
+  while (!deleted.load()) {
+    std::this_thread::yield();
+  }
+
+  // Concurrent INSERT into the same page while A's delete is uncommitted. With
+  // the fix it lands on a fresh slot (never (P,0)); without it, it reuses (P,0),
+  // places its bytes, and blocks on A's row lock until the rollback below.
+  std::atomic<bool> insert_started{false};
+  std::thread inserter([&] {
+    insert_started.store(true);
+    auto ins = db.execute("INSERT INTO t VALUES (2, 20)"); // autocommit
+    ASSERT_TRUE(ins.ok()) << ins.status().to_string();
+  });
+
+  // Let the insert place its bytes (and, on the buggy path, block on the lock)
+  // before the deleter rolls back — that ordering is what triggered the loss.
+  while (!insert_started.load()) {
+    std::this_thread::yield();
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+  resume.store(true);
+  deleter.join();
+  inserter.join();
+
+  // Both rows must be present: id=1 restored by the rollback, id=2 from the
+  // concurrent insert. Under the bug, id=1 is gone (its slot was reused).
+  auto result = db.execute("SELECT id FROM t ORDER BY id");
+  ASSERT_TRUE(result.ok()) << result.status().to_string();
+  ASSERT_EQ(result.row_count(), 2u)
+      << "rollback lost a committed row to a concurrent slot reuse";
+  EXPECT_EQ(result.rows()[0][0].as_int32(), 1);
+  EXPECT_EQ(result.rows()[1][0].as_int32(), 2);
+
+  // And it survives a clean reopen (the restore reached the heap).
+  (void)db.close();
+  Database reopened(path_);
+  ASSERT_TRUE(reopened.is_open());
+  EXPECT_EQ(count_rows(reopened, "t"), 2u);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Failed-transaction semantics
 // ─────────────────────────────────────────────────────────────────────────────
@@ -590,6 +662,70 @@ TEST_F(TransactionApiTest, DroppedTablePageReuseSurvivesCrashRecovery) {
     ASSERT_TRUE(result.ok()) << result.status().to_string();
     ASSERT_EQ(result.row_count(), 1u)
         << "recovery resurrected dropped rows into the reused page";
+    EXPECT_EQ(result.rows()[0][0].as_int32(), 10);
+    EXPECT_EQ(result.rows()[0][1].as_string(), "b-row");
+    (void)db2.close();
+  }
+
+  db1.reset();
+}
+
+// A file-backed disk manager that can be armed to fail every page write, used
+// to force the post-drop checkpoint's page flush to fail.
+class FaultyDiskManager : public FileDiskManager {
+public:
+  using FileDiskManager::FileDiskManager;
+  Status write_page(page_id_t page_id, const char *page_data) override {
+    if (fail_writes.load()) {
+      return Status::IOError("injected write fault");
+    }
+    return FileDiskManager::write_page(page_id, page_data);
+  }
+  std::atomic<bool> fail_writes{false};
+};
+
+// A DROP whose post-drop checkpoint FAILS must not degrade to the original
+// page-reuse corruption (crash-safety F2). The freed pages' ids are held back
+// (leaked) rather than returned to the free list, so a later CREATE cannot
+// reuse them and a crash cannot replay the dropped table's inserts into the new
+// table's page. Without the fix the pages are freed before the checkpoint and
+// reused behind the I/O fault, reproducing F1's corruption.
+TEST_F(TransactionApiTest, PostDropCheckpointFailureDoesNotCorruptPageReuse) {
+  auto disk = std::make_shared<FaultyDiskManager>(path_, /*create_if_missing=*/true,
+                                                  /*error_if_exists=*/false);
+
+  auto db1 = std::make_unique<Database>(path_, disk);
+  ASSERT_TRUE(db1->is_open());
+  ASSERT_TRUE(db1->execute("CREATE TABLE a (id INTEGER, v VARCHAR(32))").ok());
+  ASSERT_TRUE(
+      db1->execute("INSERT INTO a VALUES (1, 'a-one'), (2, 'a-two')").ok());
+
+  // A second table with an unflushed dirty page, so the checkpoint's page flush
+  // actually attempts a write the fault can reject (a's own pages are discarded
+  // from the pool before the flush and would not be written).
+  ASSERT_TRUE(db1->execute("CREATE TABLE keep (id INTEGER)").ok());
+  ASSERT_TRUE(db1->execute("INSERT INTO keep VALUES (7)").ok());
+
+  // Arm the fault and drop: the checkpoint fails, so the drop reports the
+  // failure loudly and leaks a's pages instead of freeing them.
+  disk->fail_writes.store(true);
+  auto dropped = db1->execute("DROP TABLE a");
+  EXPECT_FALSE(dropped.ok())
+      << "a failing post-drop checkpoint must surface, not silently degrade";
+  disk->fail_writes.store(false);
+
+  // A new table must NOT reuse a's leaked pages.
+  ASSERT_TRUE(db1->execute("CREATE TABLE b (id INTEGER, v VARCHAR(32))").ok());
+  ASSERT_TRUE(db1->execute("INSERT INTO b VALUES (10, 'b-row')").ok());
+
+  // Crash: reopen over the same file through a fresh (non-faulty) manager.
+  {
+    Database db2(path_);
+    ASSERT_TRUE(db2.is_open());
+    auto result = db2.execute("SELECT * FROM b");
+    ASSERT_TRUE(result.ok()) << result.status().to_string();
+    ASSERT_EQ(result.row_count(), 1u)
+        << "recovery resurrected dropped rows into a reused page";
     EXPECT_EQ(result.rows()[0][0].as_int32(), 10);
     EXPECT_EQ(result.rows()[0][1].as_string(), "b-row");
     (void)db2.close();

@@ -31,11 +31,13 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "catalog/schema.hpp"
@@ -379,6 +381,79 @@ TEST_F(RecoveryCrashTest, CommittedUpdateRedoneWithAfterImage) {
   ASSERT_TRUE(got.has_value());
   EXPECT_EQ(*got, v2_bytes) << "redo must reinstate the committed after-image";
   crash_keeping_alive(rec);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// F3: the checkpoint barrier must span a writer's WHOLE mutate + append + stamp
+// critical section, not just the log append. A checkpoint's flush_all_pages
+// ignores pins, so if the barrier does not cover the heap mutation a checkpoint
+// can flush the mutated page before its WAL record is appended and its page LSN
+// stamped — and a crash then leaves a durable change with no durable record.
+//
+// The guarantee is mutual exclusion: while a writer holds the barrier across
+// its mutation + logging, a concurrent checkpoint cannot complete its flush.
+// This asserts it directly and deterministically (forcing the flush INTO the
+// window would just deadlock against the fix). Reverting the barrier lets the
+// checkpoint finish mid-section and the test fails.
+TEST_F(RecoveryCrashTest, CheckpointExcludedFromWriteCriticalSection) {
+  using clock = std::chrono::steady_clock;
+  auto writer = make_writer();
+
+  // A committed baseline row to delete.
+  RID rid;
+  std::vector<char> base_bytes;
+  {
+    Transaction *t = writer->tm->begin();
+    Tuple base = make_tuple(1, "base");
+    base_bytes = tuple_bytes(base);
+    rid = insert_logged(*writer, t, base);
+    writer->tm->commit(t);
+  }
+
+  std::atomic<bool> in_section{false};
+  std::atomic<bool> ckpt_started{false};
+  std::atomic<long long> exit_ns{0};
+  std::atomic<long long> ckpt_done_ns{0};
+
+  Transaction *w = writer->tm->begin();
+  std::thread writer_thread([&] {
+    // on_logged runs UNDER the checkpoint barrier (the fix). Append the real
+    // DELETE record, then hold the section open long enough for a concurrent
+    // checkpoint to try (and, if the barrier is honored, be forced) to wait.
+    auto on_logged = [&] {
+      (void)writer->tm->log_delete(w, kTableOid, rid, base_bytes);
+      in_section.store(true);
+      while (!ckpt_started.load()) {
+        std::this_thread::yield();
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(150));
+      exit_ns.store(clock::now().time_since_epoch().count());
+      in_section.store(false);
+    };
+    (void)writer->heap->delete_tuple(rid, on_logged,
+                                     &writer->tm->checkpoint_barrier());
+  });
+
+  // Race a checkpoint against the open write section.
+  while (!in_section.load()) {
+    std::this_thread::yield();
+  }
+  ckpt_started.store(true);
+  RecoveryManager ckpt(writer->pool, writer->wal, writer->disk);
+  ASSERT_TRUE(
+      ckpt.create_checkpoint({}, &writer->tm->checkpoint_barrier()).ok());
+  ckpt_done_ns.store(clock::now().time_since_epoch().count());
+
+  writer_thread.join();
+
+  // The checkpoint's flush must complete only AFTER the writer left its
+  // mutate+log section — proof the barrier excluded them. Without the fix the
+  // checkpoint finishes during the section (ckpt_done < exit).
+  EXPECT_GE(ckpt_done_ns.load(), exit_ns.load())
+      << "checkpoint flushed during a write's mutate+log critical section (F3)";
+
+  writer->tm->abort(w); // undo the uncommitted delete
+  crash_keeping_alive(writer);
 }
 
 } // namespace
