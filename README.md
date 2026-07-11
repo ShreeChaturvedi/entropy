@@ -18,11 +18,11 @@
   <em>The Entropy terminal UI at boot.</em>
 </p>
 
-Entropy is a high-performance relational database engine built from scratch in
-modern C++20. It showcases core database internals: slotted-page storage, a
-latch-crabbing B+ tree, MVCC snapshot isolation, ACID transactions, write-ahead
-logging with ARIES-style crash recovery, and a cost-based query optimizer, all
-exercised by a deterministic, FoundationDB-style crash simulator.
+Entropy is a relational database engine written from scratch in C++20. It
+implements slotted-page storage, a latch-crabbing B+ tree, MVCC snapshot
+isolation, ACID transactions, write-ahead logging with ARIES-style crash
+recovery, and a cost-based query optimizer. A deterministic, FoundationDB-style
+crash simulator exercises the whole stack.
 
 ## Highlights
 
@@ -64,8 +64,8 @@ The engine drives a live terminal UI, rendered amber on charcoal.
 
 ## Architecture Details
 
-Entropy is organized as focused C++ libraries that mirror the logical
-database pipeline. The system is split into layers with explicit boundaries.
+Each layer of the pipeline is its own C++ library, from the SQL parser down to
+the storage engine.
 
 ### SQL Frontend
 
@@ -107,9 +107,8 @@ database pipeline. The system is split into layers with explicit boundaries.
 
 Entropy ships with a deterministic, FoundationDB-style crash simulator that
 drives the engine through fault-injected storage and replays failures from a
-seed. Every run is reproducible: one 64-bit seed fans out into independent PRNG
-streams for the workload, the page device, and the log store, so a failing
-schedule replays byte for byte.
+seed. One 64-bit seed drives independent PRNG streams for the workload, the page
+device, and the log store, so a failing schedule replays byte for byte.
 
 - `SimDiskManager` and `SimLogStore` stand in for the file backend and model a
   durability boundary at `fsync`. On a simulated crash, unsynced page and log
@@ -252,9 +251,9 @@ ctest --preset dev
 
 ## Roadmap
 
-The primary-key and heap path is the source of truth and always reflects
-writes, so sequential scans and the transactional engine are always correct.
-Secondary indexes are scoped roadmap work:
+The heap is the authoritative copy and always reflects writes. Sequential scans
+and the transactional engine do not use secondary indexes, so the gaps below do
+not affect them. Secondary indexes are scoped roadmap work:
 
 - Equality on a non-unique indexed column returns a single row, and index build
   drops duplicate keys ([#8](https://github.com/ShreeChaturvedi/entropy/issues/8)).
