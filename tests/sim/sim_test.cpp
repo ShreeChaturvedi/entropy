@@ -21,6 +21,7 @@
 #include "sim/schedule.hpp"
 #include "sim/sim_disk_manager.hpp"
 #include "sim/sim_log_store.hpp"
+#include "storage/page.hpp"
 
 namespace entropy::sim {
 namespace {
@@ -29,6 +30,15 @@ constexpr size_t kPageBytes = DiskManager::page_size();
 
 std::vector<char> filled_page(char value) {
   return std::vector<char>(kPageBytes, value);
+}
+
+// The device stamps a header checksum onto every non-empty page it stores, so
+// the durable image of a written page is the filled bytes with that stamp. This
+// mirrors what read-back / crash-survival returns.
+std::vector<char> checksummed_page(char value) {
+  std::vector<char> p(kPageBytes, value);
+  stamp_page_checksum(p.data());
+  return p;
 }
 
 // ── Device-level: SimDiskManager ────────────────────────────────────────────
@@ -47,7 +57,7 @@ TEST(SimDiskManagerTest, LostUnfsyncedWriteRevertsToDurable) {
 
   auto image = dm.crash();
   ASSERT_TRUE(image.pages.count(0));
-  EXPECT_EQ(image.pages[0], filled_page('\xAA'))
+  EXPECT_EQ(image.pages[0], checksummed_page('\xAA'))
       << "an unfsynced write must be lost, reverting to the durable content";
   ASSERT_EQ(log.size(), 1u);
   EXPECT_EQ(log[0].kind, FaultKind::kLostPageWrite);
@@ -96,7 +106,7 @@ TEST(SimDiskManagerTest, SyncedWriteSurvivesCrashIntact) {
 
   auto image = dm.crash();
   ASSERT_TRUE(image.pages.count(3));
-  EXPECT_EQ(image.pages[3], filled_page('\xCD'));
+  EXPECT_EQ(image.pages[3], checksummed_page('\xCD'));
   EXPECT_TRUE(log.empty()) << "a fsynced write is not subject to any fault";
   EXPECT_EQ(dm.fsync_count(), 1u);
 }
@@ -280,36 +290,33 @@ TEST(DetectionTest, SkippingRecoveryIsCaughtByTheInvariantChecker) {
          "committed pages must trip the invariant checker for at least one seed";
 }
 
-// Torn data pages are a real engine gap (issue #86): pages carry no checksum,
-// so recovery cannot detect a half-persisted write, and a tear that keeps the
-// header + slot directory blocks redo's repair — recover() reports success
-// while committed bytes are gone. The schedule is excluded from the passing
-// set; this test pins the characterization: the tear always fires, the harness
-// detects the silent data loss on a substantial share of seeds (0.5 expected;
-// which side of the page survives decides each seed), and every failure is the
-// committed_present invariant, never a recovery error.
-TEST(DetectionTest, TornPageWritesAreCaughtUntilPagesCarryChecksums) {
+// Page checksums now let recovery survive a torn data-page write (issue #86):
+// the reopened disk detects the tear and recovery rebuilds the page from the
+// WAL. The behavior is guarded permanently by the torn_page_write entry in the
+// passing schedule sweep above (40/40 recover, with the tear required to fire).
+// This focused test additionally pins that recovery never errors and always
+// restores the committed rows across seeds.
+TEST(DetectionTest, TornPageWritesAreDetectedAndRecovered) {
   auto sched = make_schedule("torn_page_write");
   ASSERT_TRUE(sched.has_value());
 
-  size_t caught = 0;
+  bool torn_fired = false;
   for (uint64_t seed = 1; seed <= 40; ++seed) {
     RunResult r = run_schedule(seed, *sched);
     EXPECT_GT(r.faults_injected, 0u) << "seed " << seed;
     EXPECT_TRUE(r.recovery_ok)
+        << "seed " << seed << ": recovery must not error on a torn page";
+    EXPECT_TRUE(r.passed())
         << "seed " << seed
-        << ": the engine does not even surface an error on a torn page";
-    if (!r.passed()) {
-      ++caught;
-      EXPECT_EQ(r.invariants_failed,
-                std::vector<std::string>{"committed_present"})
-          << "seed " << seed;
+        << ": recovery must restore the committed rows despite the tear";
+    for (const FaultEvent &event : r.faults) {
+      if (event.kind == FaultKind::kTornPageWrite) {
+        torn_fired = true;
+      }
     }
   }
-  EXPECT_GT(caught, 10u)
-      << "torn pages must trip the checker on a substantial share of seeds; "
-         "if this starts passing everywhere, the engine grew torn-page "
-         "protection — promote the schedule to the passing set (issue #86)";
+  EXPECT_TRUE(torn_fired)
+      << "the torn-page fault must actually fire, or the coverage is vacuous";
 }
 
 }  // namespace

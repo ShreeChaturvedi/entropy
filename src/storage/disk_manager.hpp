@@ -109,6 +109,13 @@ public:
      * @param db_file Path to the database file
      * @param create_if_missing Create the file when it does not exist
      * @param error_if_exists Fail to open when the file already exists
+     * @param enable_checksums When true, every written page is stamped with a
+     *        header checksum and every full read is verified against it, so a
+     *        torn/partial page write is reported as a Corruption Status instead
+     *        of silently returning corrupt bytes. Defaults to false: the
+     *        checksum lives at the PageHeader offset that B+ tree pages reuse
+     *        for parent_page_id, so it may only be enabled for a file that
+     *        holds exclusively PageHeader-style pages. (See page.hpp.)
      *
      * On failure (file missing with create_if_missing=false, or file present
      * with error_if_exists=true) the manager is left closed; is_open() reports
@@ -116,7 +123,8 @@ public:
      */
     explicit FileDiskManager(const std::string& db_file,
                              bool create_if_missing = true,
-                             bool error_if_exists = false);
+                             bool error_if_exists = false,
+                             bool enable_checksums = false);
 
     ~FileDiskManager() override;
 
@@ -139,6 +147,7 @@ public:
 private:
     std::string db_file_;
     std::fstream db_io_;
+    bool enable_checksums_ = false;
     page_id_t num_pages_ = 0;
     /// Freed page ids awaiting reuse. In-memory only — lost on restart, so
     /// pages freed before a crash/shutdown are leaked rather than reclaimed.
