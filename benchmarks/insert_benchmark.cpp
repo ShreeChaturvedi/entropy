@@ -28,6 +28,11 @@ void SkipWithResult(benchmark::State &state, const entropy::Result &result) {
 static void BM_Entropy_InsertBatch(benchmark::State &state) {
     const int64_t rows = state.range(0);
 
+    // The measured commit path is non-durable: begin_transaction()/commit() are
+    // in-memory flips that never fsync or flush the WAL. Surface that in the
+    // output so the number is not read as a durable-write throughput.
+    state.SetLabel("non-durable: no fsync/WAL flush on commit");
+
     for (auto _ : state) {
         state.PauseTiming();
         {
@@ -79,6 +84,11 @@ BENCHMARK(BM_Entropy_InsertBatch)->Arg(1000)->Arg(10000);
 #ifdef ENTROPY_BENCH_HAS_SQLITE
 static void BM_Sqlite_InsertBatch(benchmark::State &state) {
     const int64_t rows = state.range(0);
+
+    // SqliteDb sets synchronous=OFF + journal_mode=MEMORY to match Entropy's
+    // non-durable commit path (see sqlite_utils.hpp); label it so the durability
+    // configuration is visible alongside the number.
+    state.SetLabel("non-durable: synchronous=OFF, journal_mode=MEMORY");
 
     for (auto _ : state) {
         state.PauseTiming();
