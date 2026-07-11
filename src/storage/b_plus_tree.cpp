@@ -10,6 +10,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "common/macros.hpp"
+
 namespace entropy {
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -188,7 +190,15 @@ private:
         return p;
     }
 
-    static void relatch_entry(Entry& e) {
+    // The single helper through which every structural writer takes a Page
+    // write latch. Force it non-inline: the tsan suppression for the benign
+    // buffer-pool frame-reuse lock-order-inversions matches on this exact frame
+    // (.config/tsan-suppressions.txt), and at -O2 the optimizer would otherwise
+    // inline it per call site, dropping the frame from some cycles' stacks and
+    // letting those benign reports slip past the suppression (an intermittent
+    // tsan-CI failure). Keeping it a real frame makes the match reliable; the
+    // cost is negligible (writers are serialized by write_mutex_).
+    static ENTROPY_NOINLINE void relatch_entry(Entry& e) {
         if (!e.latched) {
             e.page->wlatch();
             e.latched = true;
