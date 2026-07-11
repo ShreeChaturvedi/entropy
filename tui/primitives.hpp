@@ -31,16 +31,22 @@ using ftxui::Elements;
 
 /**
  * The hero mark: a braille dot-matrix spiral galaxy whose cells are filled with
- * a per-point 24-bit ramp from a silver-white core out to charcoal edges, with
- * a STATIC diagonal luster band baked in for a metallic sheen.
+ * a per-point 24-bit ramp keyed on radial distance, so a dense silver-white
+ * core falls off smoothly to charcoal edges. A STATIC diagonal luster band is
+ * baked in for a metallic sheen that survives a still capture.
  *
- * @param cell_cols  width in terminal character cells (each is 2 braille dots)
- * @param cell_rows  height in terminal character cells (each is 4 braille dots)
+ * @param cell_cols    width in terminal character cells (each is 2 braille dots)
+ * @param cell_rows    height in terminal character cells (each is 4 braille dots)
+ * @param sweep_phase  when >= 0, a brighter highlight band sweeps diagonally
+ *                     across the disc at this phase in [0,1] (a full 0->1 cycle
+ *                     loops seamlessly); the default -1 renders the static mark
+ *                     with only the baked luster (used for stills).
  *
- * Deterministic: the same size always renders byte-identical output, so it is
- * safe for still capture.
+ * Deterministic: the same size and phase always render byte-identical output,
+ * so both the still and each animation frame are reproducible.
  */
-[[nodiscard]] Element GalaxyMark(int cell_cols, int cell_rows);
+[[nodiscard]] Element GalaxyMark(int cell_cols, int cell_rows,
+                                 double sweep_phase = -1.0);
 
 // ── (b) Rounded focus panel ──────────────────────────────────────────────────
 
