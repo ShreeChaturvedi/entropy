@@ -10,9 +10,9 @@
 [![license](https://img.shields.io/github/license/ShreeChaturvedi/entropy)](LICENSE)
 [![c++](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
 
-Entropy is a high-performance relational database engine built from scratch in
-modern C++20. It showcases core database internals: B+ tree storage, MVCC,
-ACID transactions, write-ahead logging, and a cost-based query optimizer.
+Entropy is a relational database engine built from scratch in modern C++20. It
+implements the core database internals: B+ tree storage, MVCC, ACID
+transactions, write-ahead logging, and a cost-based query optimizer.
 
 ## Highlights
 
