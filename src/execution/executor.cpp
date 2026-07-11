@@ -48,8 +48,12 @@ std::optional<Tuple> mvcc_visible(const ExecutorContext *ctx,
                                   const Tuple &heap_tuple) {
   // No transaction context: yield the latest (heap) version unchanged. This is
   // the path executor unit tests take when constructing executors with a null
-  // context, and the path any read takes when MVCC is not wired.
+  // context, and the path any read takes when MVCC is not wired. An empty
+  // tuple (a probed ghost slot) is never a row outside MVCC.
   if (!transactional(ctx) || ctx->version_store == nullptr) {
+    if (heap_tuple.is_empty()) {
+      return std::nullopt;
+    }
     return heap_tuple;
   }
 
@@ -83,29 +87,38 @@ Status txn_acquire_write(const ExecutorContext *ctx, oid_t table_oid, RID rid,
   return Status::Ok();
 }
 
-Status txn_register_insert(const ExecutorContext *ctx, oid_t table_oid,
-                           RID rid, const Tuple &tuple) {
+std::function<Status(RID)> txn_insert_hook(const ExecutorContext *ctx,
+                                           oid_t table_oid,
+                                           const Tuple &tuple) {
+  if (!transactional(ctx)) {
+    return nullptr;
+  }
+  // Runs inside the heap's exclusive-lock critical section: version first
+  // (the instant a reader could see the bytes, the chain already marks them
+  // uncommitted), then the WAL record + write-set entry. Logging also stamps
+  // the page LSN while the page is still pinned, so the WAL-before-page rule
+  // covers the insert from its first flushable moment. No lock waits here —
+  // txn_lock_row runs after the heap lock is released.
+  return [ctx, table_oid, &tuple](RID rid) -> Status {
+    if (ctx->version_store != nullptr) {
+      Status versioned = ctx->version_store->on_insert(ctx->txn, rid);
+      if (!versioned.ok()) {
+        return versioned;
+      }
+    }
+    if (ctx->txn_mgr != nullptr) {
+      (void)ctx->txn_mgr->log_insert(ctx->txn, table_oid, rid,
+                                     tuple_bytes(tuple));
+    }
+    return Status::Ok();
+  };
+}
+
+Status txn_lock_row(const ExecutorContext *ctx, oid_t table_oid, RID rid) {
   if (!transactional(ctx)) {
     return Status::Ok();
   }
-
-  Status locked = lock_row_exclusive(ctx, table_oid, rid);
-  if (!locked.ok()) {
-    return locked;
-  }
-
-  if (ctx->version_store != nullptr) {
-    Status versioned = ctx->version_store->on_insert(ctx->txn, rid);
-    if (!versioned.ok()) {
-      return versioned;
-    }
-  }
-
-  if (ctx->txn_mgr != nullptr) {
-    (void)ctx->txn_mgr->log_insert(ctx->txn, table_oid, rid,
-                                   tuple_bytes(tuple));
-  }
-  return Status::Ok();
+  return lock_row_exclusive(ctx, table_oid, rid);
 }
 
 void txn_log_update(const ExecutorContext *ctx, oid_t table_oid, RID rid,

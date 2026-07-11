@@ -11,7 +11,11 @@ namespace entropy {
 
 void SeqScanExecutor::init() {
   if (table_heap_) {
-    iterator_ = table_heap_->begin();
+    // Transactional scans also visit empty slots ("ghost mode"): a slot freed
+    // by an in-flight or later-committed DELETE may still carry a version
+    // chain whose retained before-image this snapshot is entitled to see.
+    const bool ghosts = ctx_ != nullptr && ctx_->txn != nullptr;
+    iterator_ = table_heap_->begin(ghosts);
     end_ = table_heap_->end();
   }
 }

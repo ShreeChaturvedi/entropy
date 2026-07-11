@@ -23,16 +23,21 @@ std::optional<Tuple> InsertExecutor::next() {
   while (current_idx_ < tuples_.size()) {
     const Tuple &tuple = tuples_[current_idx_];
     RID rid;
-    Status status = table_heap_->insert_tuple(tuple, &rid);
+    // The publication hook registers the uncommitted version and logs the
+    // insert inside the heap's critical section, so no concurrent reader can
+    // observe the bytes before their version metadata exists. A no-op hook
+    // without a transaction context (executor unit tests).
+    Status status = table_heap_->insert_tuple(
+        tuple, &rid, txn_insert_hook(ctx_, table_oid_, tuple));
     if (!status.ok()) {
       status_ = status;
       break;
     }
 
-    // Inside a transaction: lock the freshly placed row, register the new
-    // (uncommitted) version, and log the insert for WAL redo and abort undo.
-    // A no-op without a transaction context (executor unit tests).
-    status = txn_register_insert(ctx_, table_oid_, rid, tuple);
+    // Row lock last: lock waits must not happen inside the heap lock. The
+    // row is already invisible to other snapshots, and on failure the abort
+    // undoes the published insert via the write set.
+    status = txn_lock_row(ctx_, table_oid_, rid);
     if (!status.ok()) {
       status_ = status;
       break;

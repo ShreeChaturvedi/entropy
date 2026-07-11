@@ -97,36 +97,53 @@ std::optional<Tuple> UpdateExecutor::next() {
       break;
     }
 
-    RID new_rid = rid;
-    status = table_heap_->update_tuple(new_tuple, rid, &new_rid);
+    status = table_heap_->update_tuple_in_place(new_tuple, rid);
+    if (status.ok()) {
+      // In-place update: one UPDATE record at the original RID.
+      rows_updated_++;
+      txn_log_update(ctx_, table_oid_, rid, tuple, new_tuple);
+      continue;
+    }
+    if (status.code() != StatusCode::kOutOfMemory) {
+      status_ = status; // row vanished or page error: surface it
+      break;
+    }
+
+    // The new bytes do not fit in place: relocate as an explicit, logged
+    // delete+insert. A single UPDATE record at the old RID could not be
+    // redone (the old slot is empty after replaying the delete), and the new
+    // RID needs its own version metadata or its uncommitted bytes would be
+    // exposed to every snapshot. Order: convert the pending update on the
+    // old chain into a delete, free the old slot (older snapshots keep
+    // reading the retained before-image through the chain), log the delete
+    // AFTER the slot is freed (so the stamped page LSN never claims an
+    // unapplied delete), then insert+publish the new location and lock it.
+    status = txn_acquire_write(ctx_, table_oid_, rid, tuple,
+                               TxnWriteKind::kDelete);
+    if (!status.ok()) {
+      status_ = status;
+      break;
+    }
+    status = table_heap_->delete_tuple(rid);
+    if (!status.ok()) {
+      status_ = status;
+      break;
+    }
+    txn_log_delete(ctx_, table_oid_, rid, tuple);
+
+    RID new_rid;
+    status = table_heap_->insert_tuple(
+        new_tuple, &new_rid, txn_insert_hook(ctx_, table_oid_, new_tuple));
+    if (!status.ok()) {
+      status_ = status;
+      break;
+    }
+    status = txn_lock_row(ctx_, table_oid_, new_rid);
     if (!status.ok()) {
       status_ = status;
       break;
     }
     rows_updated_++;
-
-    if (new_rid == rid) {
-      // In-place update: one UPDATE record at the original RID.
-      txn_log_update(ctx_, table_oid_, rid, tuple, new_tuple);
-    } else {
-      // Grow-update relocated the row (the heap did delete@old + insert@new).
-      // Record it as such: a single UPDATE record at the old RID could not be
-      // redone (the old slot is empty after replaying the delete), and the
-      // new RID would otherwise carry no version metadata and expose the
-      // uncommitted bytes to every snapshot. Convert the pending update on
-      // the old chain into a delete, log it, then register the new location
-      // as an insert (lock + version + log).
-      status = txn_acquire_write(ctx_, table_oid_, rid, tuple,
-                                 TxnWriteKind::kDelete);
-      if (status.ok()) {
-        txn_log_delete(ctx_, table_oid_, rid, tuple);
-        status = txn_register_insert(ctx_, table_oid_, new_rid, new_tuple);
-      }
-      if (!status.ok()) {
-        status_ = status;
-        break;
-      }
-    }
   }
 
   done_ = true;
