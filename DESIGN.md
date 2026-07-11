@@ -43,7 +43,6 @@
 | Testing | Google Test | Well-supported, familiar to reviewers |
 | Benchmarking | Google Benchmark | Pairs with GTest, micro-benchmark support |
 | SQL Parser | **Custom** | Hand-written recursive descent parser; no external dependencies |
-| Compression | LZ4 (optional) | Fast compression for pages |
 | Logging | spdlog | Header-only, fast, modern |
 
 ---
@@ -440,7 +439,6 @@ Leaf Node:
 | Google Benchmark | 1.8+ | Performance benchmarks | FetchContent |
 | spdlog | 1.12+ | Logging | FetchContent |
 | hsql | latest | SQL parsing | FetchContent or submodule |
-| LZ4 | 1.9+ | Page compression (optional) | System or FetchContent |
 
 ---
 
