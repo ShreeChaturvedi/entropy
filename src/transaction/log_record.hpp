@@ -373,7 +373,9 @@ private:
         std::memcpy(ptr, &tuple_size, sizeof(tuple_size));
         ptr += sizeof(tuple_size);
 
-        std::memcpy(ptr, new_tuple_data_.data(), tuple_size);
+        if (tuple_size > 0) {
+            std::memcpy(ptr, new_tuple_data_.data(), tuple_size);
+        }
     }
 
     [[nodiscard]] bool deserialize_insert(const char* ptr, uint32_t remaining) {
@@ -412,7 +414,9 @@ private:
         std::memcpy(ptr, &tuple_size, sizeof(tuple_size));
         ptr += sizeof(tuple_size);
 
-        std::memcpy(ptr, old_tuple_data_.data(), tuple_size);
+        if (tuple_size > 0) {
+            std::memcpy(ptr, old_tuple_data_.data(), tuple_size);
+        }
     }
 
     [[nodiscard]] bool deserialize_delete(const char* ptr, uint32_t remaining) {
@@ -451,14 +455,18 @@ private:
         std::memcpy(ptr, &old_size, sizeof(old_size));
         ptr += sizeof(old_size);
 
-        std::memcpy(ptr, old_tuple_data_.data(), old_size);
+        if (old_size > 0) {
+            std::memcpy(ptr, old_tuple_data_.data(), old_size);
+        }
         ptr += old_size;
 
         uint32_t new_size = static_cast<uint32_t>(new_tuple_data_.size());
         std::memcpy(ptr, &new_size, sizeof(new_size));
         ptr += sizeof(new_size);
 
-        std::memcpy(ptr, new_tuple_data_.data(), new_size);
+        if (new_size > 0) {
+            std::memcpy(ptr, new_tuple_data_.data(), new_size);
+        }
     }
 
     [[nodiscard]] bool deserialize_update(const char* ptr, uint32_t remaining) {
