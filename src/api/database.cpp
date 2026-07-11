@@ -156,8 +156,22 @@ Status resolve_expr(Expression *expr, const Schema &schema,
     if (!s.ok()) {
       return s;
     }
-    return resolve_expr(const_cast<Expression *>(b->right()), schema,
-                        col_tables);
+    s = resolve_expr(const_cast<Expression *>(b->right()), schema, col_tables);
+    if (!s.ok()) {
+      return s;
+    }
+    // Arithmetic is defined only on numeric operands. A VARCHAR or BOOLEAN
+    // operand is a type error, not something to silently coerce to 0. INVALID
+    // (a NULL or not-yet-typed sub-expression) is left alone so `NULL + 1`
+    // still yields NULL.
+    auto bad = [](TypeId t) {
+      return t == TypeId::VARCHAR || t == TypeId::BOOLEAN;
+    };
+    if (bad(b->left()->result_type()) || bad(b->right()->result_type())) {
+      return Status::InvalidArgument(
+          "arithmetic operator requires numeric operands");
+    }
+    return Status::Ok();
   }
   case ExpressionType::COMPARISON: {
     auto *c = dynamic_cast<ComparisonExpression *>(expr);
@@ -929,6 +943,15 @@ public:
           Status s = resolve_expr(ref, *input_schema, input_tables);
           if (!s.ok()) {
             return Result(s);
+          }
+          // SUM/AVG have no meaning over a non-numeric column (COUNT/MIN/MAX
+          // work over any type). Reject at plan time rather than coercing a
+          // string operand to 0 during aggregation.
+          if ((col.agg_func == AggregateFunc::SUM ||
+               col.agg_func == AggregateFunc::AVG) &&
+              !is_numeric_type(ref->result_type())) {
+            return Result(Status::InvalidArgument(
+                "SUM/AVG requires a numeric argument"));
           }
           arg_index = ref->column_index();
         }
