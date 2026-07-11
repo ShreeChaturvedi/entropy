@@ -15,6 +15,8 @@
  * - Tree is always balanced (all leaves at same depth)
  */
 
+#include <atomic>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -99,6 +101,37 @@ public:
   [[nodiscard]] std::vector<std::pair<KeyType, ValueType>>
   range_scan(KeyType start_key, KeyType end_key);
 
+  /**
+   * @brief Deallocate every page owned by the tree
+   *
+   * Traverses the tree and frees each page through the buffer pool (which
+   * forwards to DiskManager::deallocate_page). Used when the owning index is
+   * dropped. Deliberately does NOT fire the root-change callback: the caller
+   * is destroying the tree and records the removal itself.
+   */
+  [[nodiscard]] Status reclaim_all_pages();
+
+  /**
+   * @brief Write every page owned by the tree to disk
+   *
+   * flush_page works on pinned pages, so this is safe to call from the
+   * root-change callback while the mutation that moved the root still holds
+   * pins. Fails on the first page the buffer pool cannot write.
+   */
+  [[nodiscard]] Status flush_all_pages();
+
+  /**
+   * @brief Register a callback invoked whenever the root page id changes
+   *
+   * The root moves on first insert, root split, and root collapse. The
+   * catalog uses this to keep the durable manifest's root_page_id current.
+   * Register before the tree is shared across threads; the callback runs on
+   * the thread performing the mutation.
+   */
+  void set_root_change_callback(std::function<void(page_id_t)> callback) {
+    root_change_callback_ = std::move(callback);
+  }
+
   // ─────────────────────────────────────────────────────────────────────────
   // Iteration
   // ─────────────────────────────────────────────────────────────────────────
@@ -131,7 +164,7 @@ public:
    * @brief Get the root page ID
    */
   [[nodiscard]] page_id_t root_page_id() const noexcept {
-    return root_page_id_;
+    return root_page_id_.load(std::memory_order_relaxed);
   }
 
   /**
@@ -216,8 +249,23 @@ private:
   handle_internal_underflow(Page *internal_page,
                             page_id_t *page_to_delete_out);
 
+  /**
+   * @brief Assign a new root page id and notify the root-change callback
+   */
+  void change_root(page_id_t new_root_id);
+
+  /**
+   * @brief Collect the ids of every intact page reachable from the root
+   *
+   * Cycle- and corruption-tolerant: uses a visited set and skips pages that
+   * are not valid index nodes.
+   */
+  [[nodiscard]] std::vector<page_id_t> collect_tree_pages();
+
   std::shared_ptr<BufferPoolManager> buffer_pool_;
-  page_id_t root_page_id_;
+  /// Atomic so the catalog can snapshot the root while a writer moves it.
+  std::atomic<page_id_t> root_page_id_;
+  std::function<void(page_id_t)> root_change_callback_;
 
   // Maximum sizes for nodes (computed once)
   uint32_t leaf_max_size_;
