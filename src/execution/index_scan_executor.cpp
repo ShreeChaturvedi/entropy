@@ -85,11 +85,19 @@ void IndexScanExecutor::init() {
 std::optional<Tuple> IndexScanExecutor::fetch_visible(RID rid) {
   Tuple tuple;
   Status status = table_heap_->get_tuple(rid, &tuple);
-  // On a hit, the index still points at a RID whose heap version may be
-  // invisible to this snapshot; on a miss, the slot may be a ghost whose
-  // retained before-image is still visible (uncommitted or later-committed
-  // DELETE). Either way, the version store makes the call.
-  return mvcc_visible(ctx_, status.ok() ? tuple : Tuple({}, rid));
+  if (!status.ok()) {
+    // Ghost probe, matching the seq scan's policy: only a transactional scan
+    // asks the version store whether a freed slot still has a before-image
+    // visible to its snapshot. Outside a transaction a missing tuple is
+    // simply gone.
+    if (ctx_ == nullptr || ctx_->txn == nullptr) {
+      return std::nullopt;
+    }
+    return mvcc_visible(ctx_, Tuple({}, rid));
+  }
+  // The index still points at a RID whose heap version may be invisible to
+  // this snapshot; the version store makes the call.
+  return mvcc_visible(ctx_, tuple);
 }
 
 std::optional<Tuple> IndexScanExecutor::next() {

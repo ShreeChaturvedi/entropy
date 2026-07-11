@@ -117,16 +117,22 @@ void TransactionManager::commit(Transaction* txn) {
 
     // Garbage-collect version chains no remaining snapshot can observe. The
     // bound is the oldest active snapshot, or the current clock value when
-    // idle (every retired version is then unreachable). Runs under mutex_;
-    // the store takes its own latch, and nothing the store calls ever takes
-    // mutex_, so the order is acyclic.
+    // idle (every retired version is then unreachable). Versions retired by
+    // THIS commit carry timestamps newer than any currently active snapshot,
+    // so while the bound is pinned by an old transaction a re-run collects
+    // nothing — skip the store-wide walk until the bound actually advances.
+    // Runs under mutex_; the store takes its own latch, and nothing the
+    // store calls ever takes mutex_, so the order is acyclic.
     if (version_store_ && mvcc_) {
         uint64_t min_active_start_ts = mvcc_->current_timestamp();
         for (const auto& [id, active] : txn_map_) {
             min_active_start_ts =
                 std::min(min_active_start_ts, active->start_ts());
         }
-        version_store_->gc(min_active_start_ts);
+        if (min_active_start_ts > last_gc_bound_) {
+            last_gc_bound_ = min_active_start_ts;
+            version_store_->gc(min_active_start_ts);
+        }
     }
 }
 

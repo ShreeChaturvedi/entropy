@@ -502,9 +502,9 @@ public:
   Result execute_drop_table(DropTableStatement *stmt) {
     oid_t table_oid = catalog_->get_table_oid(stmt->table_name);
 
-    // Snapshot the heap's page ids before the drop reclaims them: both the
-    // version-store purge and nothing else can recover them afterwards.
-    std::vector<page_id_t> dropped_pages;
+    // Snapshot the heap's page ids before the drop reclaims them: nothing
+    // can recover them afterwards.
+    std::unordered_set<page_id_t> dropped_pages;
     if (auto info = catalog_->get_table_shared(stmt->table_name);
         info && info->table_heap) {
       dropped_pages = info->table_heap->page_ids();
@@ -521,8 +521,7 @@ public:
     //
     // 1. Version chains keyed by RIDs on those pages — a later table reusing
     //    a page would inherit visibility decisions from dropped rows.
-    version_store_->purge_pages(std::unordered_set<page_id_t>(
-        dropped_pages.begin(), dropped_pages.end()));
+    version_store_->purge_pages(dropped_pages);
 
     // 2. The dropped table's WAL records. Redo replays records in LSN order
     //    onto pages by id; without a boundary, a reused page's fresh content
@@ -716,7 +715,7 @@ public:
     if (txn == nullptr) {
       return Status::Internal("Failed to begin transaction");
     }
-    thread_txns_[tid] = ThreadTxn{txn};
+    thread_txns_[tid] = txn;
     return Status::Ok();
   }
 
@@ -790,7 +789,7 @@ private:
     if (it == thread_txns_.end()) {
       return {};
     }
-    return {true, it->second.txn};
+    return {true, it->second};
   }
 
   /// Mark the calling thread's binding failed (its transaction was aborted);
@@ -799,7 +798,7 @@ private:
     std::lock_guard<std::mutex> lock(session_mutex_);
     auto it = thread_txns_.find(std::this_thread::get_id());
     if (it != thread_txns_.end()) {
-      it->second.txn = nullptr;
+      it->second = nullptr;
     }
   }
 
@@ -810,7 +809,7 @@ private:
     if (it == thread_txns_.end()) {
       return {};
     }
-    SessionState state{true, it->second.txn};
+    SessionState state{true, it->second};
     thread_txns_.erase(it);
     return state;
   }
@@ -840,16 +839,13 @@ private:
   std::shared_ptr<CostModel> cost_model_;
   std::unique_ptr<IndexSelector> index_selector_;
 
-  // Per-thread explicit transactions ("a connection is a thread"). A binding
-  // whose transaction failed (aborted by a statement error or write-write
-  // conflict) stays bound with txn == nullptr until the caller issues
-  // rollback (or commit, which errors and clears): statements meanwhile are
-  // rejected instead of silently autocommitting.
-  struct ThreadTxn {
-    Transaction *txn = nullptr; ///< null once the transaction was aborted
-  };
+  // Per-thread explicit transactions ("a connection is a thread"). A mapped
+  // null value is a FAILED binding: the transaction was aborted by a
+  // statement error or write-write conflict, and the entry stays until the
+  // caller issues rollback (or commit, which errors and clears) — statements
+  // meanwhile are rejected instead of silently autocommitting.
   mutable std::mutex session_mutex_;
-  std::unordered_map<std::thread::id, ThreadTxn> thread_txns_;
+  std::unordered_map<std::thread::id, Transaction *> thread_txns_;
 };
 
 Database::Database(const std::string &path, const DatabaseOptions &options)

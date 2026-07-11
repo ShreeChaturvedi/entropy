@@ -385,15 +385,13 @@ Status TableHeap::get_tuple(const RID &rid, Tuple *tuple) {
   return Status::Ok();
 }
 
-std::vector<page_id_t> TableHeap::page_ids() const {
+std::unordered_set<page_id_t> TableHeap::page_ids() const {
   std::shared_lock lock(mutex_);
 
-  std::vector<page_id_t> ids;
-  std::unordered_set<page_id_t> visited;
+  std::unordered_set<page_id_t> ids;
   page_id_t current_id = first_page_id_;
-  while (current_id != INVALID_PAGE_ID && !visited.contains(current_id)) {
-    visited.insert(current_id);
-    ids.push_back(current_id);
+  while (current_id != INVALID_PAGE_ID && !ids.contains(current_id)) {
+    ids.insert(current_id);
 
     Page *page = buffer_pool_->fetch_page(current_id);
     if (page == nullptr) {
