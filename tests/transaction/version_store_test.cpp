@@ -6,10 +6,13 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <span>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "common/types.hpp"
 #include "transaction/mvcc.hpp"
@@ -246,6 +249,258 @@ TEST_F(VersionStoreTest, RollbackRevertsUncommittedUpdate) {
 
   store_.gc(100);
   EXPECT_EQ(store_.chain_length(rid_), 1u) << "tombstone not pruned";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Read-your-own-writes
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A transaction sees its own uncommitted insert; a concurrent one does not.
+TEST_F(VersionStoreTest, ReadYourOwnUncommittedInsert) {
+  Transaction txn(5);
+  ASSERT_TRUE(store_.on_insert(&txn, rid_).ok());
+
+  const std::string heap = "MINE";
+  auto own = store_.read_visible(rid_, span_of(heap), &txn);
+  ASSERT_TRUE(own.has_value());
+  EXPECT_EQ(bytes_of(*own), "MINE");
+
+  Transaction other(6);
+  EXPECT_FALSE(store_.read_visible(rid_, span_of(heap), &other).has_value())
+      << "another transaction must not see an uncommitted insert";
+}
+
+// A transaction reads its own uncommitted update (the heap's new bytes), while a
+// concurrent reader still sees the committed before-image.
+TEST_F(VersionStoreTest, ReadYourOwnUncommittedUpdate) {
+  Transaction creator(1);
+  ASSERT_TRUE(store_.on_insert(&creator, rid_).ok());
+  store_.finalize(&creator, 10);
+
+  const std::string v1 = "V1";
+  Transaction writer(2);
+  ASSERT_TRUE(store_.on_update(&writer, rid_, span_of(v1)).ok());
+
+  const std::string v2 = "V2"; // heap now holds the writer's new bytes
+  auto own = store_.read_visible(rid_, span_of(v2), &writer);
+  ASSERT_TRUE(own.has_value());
+  EXPECT_EQ(bytes_of(*own), "V2") << "writer reads its own uncommitted update";
+
+  Transaction reader(3);
+  reader.set_start_ts(15); // snapshot after the base commit, before writer's
+  auto seen = store_.read_visible(rid_, span_of(v2), &reader);
+  ASSERT_TRUE(seen.has_value());
+  EXPECT_EQ(bytes_of(*seen), "V1")
+      << "a concurrent reader still sees the committed before-image";
+}
+
+// First-updater-wins holds regardless of arrival order: whichever transaction
+// stages its write first wins, the other conflicts.
+TEST_F(VersionStoreTest, FirstUpdaterWinsBothOrders) {
+  auto seed_committed = [&](RID rid) {
+    Transaction creator(1);
+    ASSERT_TRUE(store_.on_insert(&creator, rid).ok());
+    store_.finalize(&creator, 10);
+  };
+  const std::string heap = "V1";
+
+  // Order 1: A updates first, then B.
+  {
+    RID rid{2, 0};
+    seed_committed(rid);
+    Transaction a(2), b(3);
+    EXPECT_TRUE(store_.on_update(&a, rid, span_of(heap)).ok());
+    EXPECT_EQ(store_.on_update(&b, rid, span_of(heap)).code(),
+              StatusCode::kAborted);
+  }
+  // Order 2: B updates first, then A — the winner is simply whoever was first.
+  {
+    RID rid{3, 0};
+    seed_committed(rid);
+    Transaction a(2), b(3);
+    EXPECT_TRUE(store_.on_update(&b, rid, span_of(heap)).ok());
+    EXPECT_EQ(store_.on_update(&a, rid, span_of(heap)).code(),
+              StatusCode::kAborted);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Concurrency: read_visible returns an OWNED copy, so it is safe against a
+// concurrent rollback/gc that frees the underlying before-image. These stress
+// tests must be race-free under ThreadSanitizer and must never return a torn or
+// garbage buffer.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Reads the readers must collectively perform before a stress test's mutator is
+// allowed to stop. Guarantees the reader/mutator overlap the tests exist to
+// exercise, independent of when the OS schedules the reader threads.
+constexpr uint64_t kMinStressReads = 1000;
+
+// Run `mutate(i)` at least `min_iters` times, then keep mutating until the
+// readers have performed kMinStressReads reads, then set `stop`. Without the
+// reads gate the mutator can finish and stop the readers before they were ever
+// scheduled, making the "readers actually ran" guard racy on a loaded machine.
+// A generous wall-clock deadline bounds the wait so a genuinely broken (never
+// reading) reader fails the guard instead of hanging the test.
+template <typename Mutate>
+void churn_until_reads(std::atomic<bool> &stop,
+                       const std::atomic<uint64_t> &reads, int min_iters,
+                       Mutate mutate) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  for (int i = 0;; ++i) {
+    if (i >= min_iters &&
+        (reads.load(std::memory_order_relaxed) >= kMinStressReads ||
+         std::chrono::steady_clock::now() >= deadline)) {
+      break;
+    }
+    mutate(i);
+  }
+  stop.store(true, std::memory_order_relaxed);
+}
+
+// Readers hammer a RID while a single writer repeatedly stages and rolls back
+// an update. Every read must return the committed base value, never a partial
+// or freed buffer.
+TEST_F(VersionStoreTest, ConcurrentReadVisibleAndRollbackStayConsistent) {
+  Transaction creator(1);
+  ASSERT_TRUE(store_.on_insert(&creator, rid_).ok());
+  store_.finalize(&creator, 10); // base committed at ts 10
+  const std::string base = "BASE-VALUE";
+
+  std::atomic<bool> stop{false};
+  std::atomic<int> bad{0};
+  std::atomic<uint64_t> reads{0};
+
+  std::vector<std::thread> readers;
+  for (int i = 0; i < 3; ++i) {
+    readers.emplace_back([&, i] {
+      // Default start_ts is the steady-clock stamp, far past 10, so the base is
+      // always visible.
+      Transaction reader(static_cast<txn_id_t>(100 + i));
+      while (!stop.load(std::memory_order_relaxed)) {
+        auto v = store_.read_visible(rid_, span_of(base), &reader);
+        if (!v.has_value() || bytes_of(*v) != base) {
+          bad.fetch_add(1, std::memory_order_relaxed);
+        }
+        reads.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+
+  std::thread writer([&] {
+    Transaction w(2);
+    churn_until_reads(stop, reads, 3000, [&](int) {
+      if (store_.on_update(&w, rid_, span_of(base)).ok()) {
+        store_.rollback(&w); // frees the head + before-image the readers walk
+      }
+    });
+  });
+
+  writer.join();
+  for (auto &t : readers) {
+    t.join();
+  }
+
+  EXPECT_EQ(bad.load(), 0) << "a reader observed a non-base / torn value";
+  EXPECT_GE(reads.load(), kMinStressReads);
+}
+
+// Readers pinned to a snapshot that can only see a superseded before-image read
+// it while gc concurrently prunes that version. Each read must return either the
+// owned before-image bytes or nullopt — never garbage from a freed buffer.
+TEST_F(VersionStoreTest, ConcurrentReadVisibleAndGcStayConsistent) {
+  Transaction creator(1);
+  ASSERT_TRUE(store_.on_insert(&creator, rid_).ok());
+  store_.finalize(&creator, 10);
+
+  const std::string v1 = "V1-before-image";
+  Transaction updater(2);
+  ASSERT_TRUE(store_.on_update(&updater, rid_, span_of(v1)).ok());
+  store_.finalize(&updater, 20); // chain: base(before=V1) -> V2 head
+  const std::string v2 = "V2-heap-value";
+
+  std::atomic<bool> stop{false};
+  std::atomic<int> bad{0};
+  std::atomic<uint64_t> reads{0};
+
+  std::vector<std::thread> readers;
+  for (int i = 0; i < 4; ++i) {
+    readers.emplace_back([&] {
+      Transaction reader(50);
+      reader.set_start_ts(15); // sees the before-image, not the ts-20 head
+      while (!stop.load(std::memory_order_relaxed)) {
+        auto v = store_.read_visible(rid_, span_of(v2), &reader);
+        // The pruning race can legitimately turn the answer into nullopt, but a
+        // returned value must be the intact before-image, never torn bytes.
+        if (v.has_value() && bytes_of(*v) != v1) {
+          bad.fetch_add(1, std::memory_order_relaxed);
+        }
+        reads.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+
+  // Churn gc across the boundary that prunes the superseded before-image.
+  std::thread collector([&] {
+    churn_until_reads(stop, reads, 5000,
+                      [&](int i) { store_.gc(i % 2 == 0 ? 15 : 25); });
+  });
+
+  collector.join();
+  for (auto &t : readers) {
+    t.join();
+  }
+
+  EXPECT_EQ(bad.load(), 0) << "a reader observed a torn before-image";
+  EXPECT_GE(reads.load(), kMinStressReads);
+}
+
+// A stream of committing transactions finalizes versions (unique-lock mutation
+// of the chain map) while readers concurrently read a stable committed row. The
+// readers must always observe that row's committed value — never a torn read or
+// a corrupted map traversal.
+TEST_F(VersionStoreTest, ConcurrentFinalizeAndReadStayConsistent) {
+  Transaction base_creator(1);
+  ASSERT_TRUE(store_.on_insert(&base_creator, rid_).ok());
+  store_.finalize(&base_creator, 2); // rid_ committed and stable
+  const std::string base = "BASE";
+
+  std::atomic<bool> stop{false};
+  std::atomic<int> bad{0};
+  std::atomic<uint64_t> reads{0};
+
+  std::vector<std::thread> readers;
+  for (int i = 0; i < 3; ++i) {
+    readers.emplace_back([&] {
+      Transaction reader(500);
+      while (!stop.load(std::memory_order_relaxed)) {
+        auto v = store_.read_visible(rid_, span_of(base), &reader);
+        if (!v.has_value() || bytes_of(*v) != base) {
+          bad.fetch_add(1, std::memory_order_relaxed);
+        }
+        reads.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+
+  std::thread writer([&] {
+    churn_until_reads(stop, reads, 4000, [&](int i) {
+      RID other{10, static_cast<slot_id_t>(i % 200)};
+      Transaction w(static_cast<txn_id_t>(1000 + i));
+      if (store_.on_insert(&w, other).ok()) {
+        store_.finalize(&w, static_cast<uint64_t>(3 + i));
+      }
+    });
+  });
+
+  writer.join();
+  for (auto &t : readers) {
+    t.join();
+  }
+
+  EXPECT_EQ(bad.load(), 0) << "a reader observed a torn / corrupted value";
+  EXPECT_GE(reads.load(), kMinStressReads);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

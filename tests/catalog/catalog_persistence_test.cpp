@@ -12,6 +12,7 @@
 
 #include <gtest/gtest.h>
 
+#include <fstream>
 #include <set>
 #include <string>
 #include <thread>
@@ -459,6 +460,102 @@ TEST(CatalogPersistence, ConcurrentCreateGetDrop) {
   // Every table each thread created was also dropped, so the catalog is empty
   // and internally consistent.
   EXPECT_TRUE(catalog.get_table_names().empty());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A corrupt manifest opens as an empty catalog rather than crashing, and the
+// catalog stays fully usable (new DDL overwrites the bad file durably).
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(CatalogPersistence, CorruptManifestOpensEmptyAndStaysUsable) {
+  test::TempDir dir("cat_corrupt_");
+  const std::string db_path = (dir.path() / "c.db").string();
+  const std::string manifest_path = (dir.path() / "c.catalog").string();
+
+  // Hand-write a manifest with a bad magic header.
+  {
+    std::ofstream out(manifest_path, std::ios::binary);
+    const std::string junk = "GARBAGE-not-a-catalog-manifest-header";
+    out.write(junk.data(), static_cast<std::streamsize>(junk.size()));
+  }
+
+  {
+    auto disk = std::make_shared<FileDiskManager>(db_path);
+    auto buffer_pool = std::make_shared<BufferPoolManager>(64, disk);
+    Catalog catalog(buffer_pool, manifest_path); // must not crash
+
+    // Corrupt metadata is treated as "none": the catalog opens empty.
+    EXPECT_TRUE(catalog.get_table_names().empty());
+
+    // And it is fully usable: DDL succeeds and rewrites a valid manifest.
+    ASSERT_TRUE(catalog.create_table("fresh", make_users_schema()).ok());
+    EXPECT_TRUE(catalog.table_exists("fresh"));
+  }
+
+  // The rewritten manifest is valid and reloads cleanly.
+  {
+    auto disk = std::make_shared<FileDiskManager>(db_path);
+    auto buffer_pool = std::make_shared<BufferPoolManager>(64, disk);
+    Catalog catalog(buffer_pool, manifest_path);
+    EXPECT_TRUE(catalog.table_exists("fresh"));
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DDL performed AFTER a reopen is itself durable: an index created against a
+// reopened table survives a further reopen and stays queryable.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(CatalogPersistence, IndexCreatedAfterReopenSurvives) {
+  test::TempDir dir("cat_idx_reopen_");
+  const std::string db_path = (dir.path() / "ir.db").string();
+  const std::string manifest_path = (dir.path() / "ir.catalog").string();
+  const Schema schema = make_users_schema();
+
+  // Phase 1: create the table and populate it, then close cleanly.
+  {
+    auto disk = std::make_shared<FileDiskManager>(db_path);
+    auto buffer_pool = std::make_shared<BufferPoolManager>(64, disk);
+    Catalog catalog(buffer_pool, manifest_path);
+    ASSERT_TRUE(catalog.create_table("users", schema).ok());
+    auto info = catalog.get_table_shared("users");
+    ASSERT_NE(info, nullptr);
+    for (int i = 1; i <= 5; ++i) {
+      std::vector<TupleValue> values = {
+          TupleValue(i), TupleValue(std::string("u") + std::to_string(i))};
+      Tuple tuple(values, schema);
+      RID rid;
+      ASSERT_TRUE(info->table_heap->insert_tuple(tuple, &rid).ok());
+    }
+    buffer_pool->flush_all_pages();
+  }
+
+  // Phase 2: reopen, then create the index — DDL against a rebuilt table.
+  {
+    auto disk = std::make_shared<FileDiskManager>(db_path);
+    auto buffer_pool = std::make_shared<BufferPoolManager>(64, disk);
+    Catalog catalog(buffer_pool, manifest_path);
+    ASSERT_TRUE(catalog.create_index("idx_id", "users", "id").ok());
+    auto idx = catalog.get_index_shared("idx_id");
+    ASSERT_NE(idx, nullptr);
+    for (int key = 1; key <= 5; ++key) {
+      EXPECT_TRUE(idx->index->find(key).has_value()) << "missing key " << key;
+    }
+    buffer_pool->flush_all_pages();
+  }
+
+  // Phase 3: reopen again — the post-reopen index survived and is queryable.
+  {
+    auto disk = std::make_shared<FileDiskManager>(db_path);
+    auto buffer_pool = std::make_shared<BufferPoolManager>(64, disk);
+    Catalog catalog(buffer_pool, manifest_path);
+    auto idx = catalog.get_index_shared("idx_id");
+    ASSERT_NE(idx, nullptr);
+    EXPECT_EQ(idx->table_oid, catalog.get_table_oid("users"));
+    for (int key = 1; key <= 5; ++key) {
+      EXPECT_TRUE(idx->index->find(key).has_value()) << "missing key " << key;
+    }
+  }
 }
 
 } // namespace
