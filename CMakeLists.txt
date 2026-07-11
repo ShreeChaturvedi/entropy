@@ -34,6 +34,7 @@ option(ENTROPY_BENCH_COMPARE_SQLITE "Build SQLite comparison benchmarks" OFF)
 option(ENTROPY_BUILD_EXAMPLES "Build example programs" ON)
 option(ENTROPY_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(ENTROPY_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
+option(ENTROPY_BUILD_TUI "Build the terminal UI (fetches FTXUI)" OFF)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CMake Modules
@@ -122,6 +123,14 @@ endif()
 add_subdirectory(tools)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Terminal UI (optional; pulls FTXUI via FetchContent only when enabled)
+# ─────────────────────────────────────────────────────────────────────────────
+
+if(ENTROPY_BUILD_TUI)
+    add_subdirectory(tui)
+endif()
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Installation & Package Config
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -191,6 +200,7 @@ message(STATUS "  Tests:           ${ENTROPY_BUILD_TESTS}")
 message(STATUS "  Benchmarks:      ${ENTROPY_BUILD_BENCHMARKS}")
 message(STATUS "  Bench SQLite:    ${ENTROPY_BENCH_COMPARE_SQLITE}")
 message(STATUS "  Examples:        ${ENTROPY_BUILD_EXAMPLES}")
+message(STATUS "  Terminal UI:     ${ENTROPY_BUILD_TUI}")
 message(STATUS "  AddressSanitizer:${ENTROPY_ENABLE_ASAN}")
 message(STATUS "  ThreadSanitizer: ${ENTROPY_ENABLE_TSAN}")
 message(STATUS "")
