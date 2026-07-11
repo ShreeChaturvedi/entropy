@@ -144,6 +144,26 @@ constexpr bool is_variable_length(TypeId type) noexcept {
     return type == TypeId::VARCHAR;
 }
 
+/**
+ * @brief Check if a type is numeric (integer or floating/fixed point)
+ *
+ * BOOLEAN, VARCHAR, TIMESTAMP and INVALID are not numeric.
+ */
+constexpr bool is_numeric_type(TypeId type) noexcept {
+    switch (type) {
+        case TypeId::TINYINT:
+        case TypeId::SMALLINT:
+        case TypeId::INTEGER:
+        case TypeId::BIGINT:
+        case TypeId::DECIMAL:
+        case TypeId::FLOAT:
+        case TypeId::DOUBLE:
+            return true;
+        default:
+            return false;
+    }
+}
+
 }  // namespace entropy
 
 // Hash support for RID
