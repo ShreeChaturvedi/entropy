@@ -83,16 +83,25 @@ size_t RandomWorkload::run(const WorkloadContext &ctx, std::mt19937_64 &rng,
 
   for (size_t t = 0; t < num_txns; ++t) {
     const bool in_flight = leave_in_flight && (t + 1 == num_txns);
+    if (in_flight && ctx.on_inflight_begin) {
+      ctx.on_inflight_begin();
+    }
 
     Transaction *txn = ctx.tm->begin();
     if (txn == nullptr) {
       continue;
     }
 
-    const size_t op_count = 1 + (rng() % 4);
+    // The in-flight transaction can be forced insert-heavy (inflight_ops_) so
+    // its WAL volume overflows the WAL manager's buffer mid-transaction; see
+    // the constructor comment.
+    const bool big_inflight = in_flight && inflight_ops_ > 0;
+    const size_t op_count = big_inflight ? inflight_ops_ : 1 + (rng() % 4);
     // Per-transaction staging, kept in EXECUTION order: a DELETE and a
     // slot-reusing INSERT can hit the same RID, so the oracle must replay the
-    // effects in the order they ran, not grouped by kind.
+    // effects in the order they ran, not grouped by kind. The in-flight
+    // transaction never commits, so its (potentially 1000+) effects are not
+    // staged at all — the oracle tracks its RIDs via note_loser instead.
     enum class Kind { kInsert, kUpdate, kDelete };
     struct Effect {
       Kind kind;
@@ -102,7 +111,8 @@ size_t RandomWorkload::run(const WorkloadContext &ctx, std::mt19937_64 &rng,
     std::vector<Effect> staged;
 
     for (size_t o = 0; o < op_count; ++o) {
-      const uint32_t choice = static_cast<uint32_t>(rng() % 100);
+      const uint32_t choice =
+          big_inflight ? 0 : static_cast<uint32_t>(rng() % 100);
       const bool can_modify = !live.empty();
 
       if (choice < 55 || !can_modify) {
@@ -117,9 +127,10 @@ size_t RandomWorkload::run(const WorkloadContext &ctx, std::mt19937_64 &rng,
         if (ctx.version_store != nullptr) {
           (void)ctx.version_store->on_insert(txn, rid);
         }
-        staged.push_back({Kind::kInsert, rid, std::move(bytes)});
         if (in_flight) {
           oracle.note_loser(rid);
+        } else {
+          staged.push_back({Kind::kInsert, rid, std::move(bytes)});
         }
         ++ops;
       } else if (choice < 80) {
@@ -140,7 +151,9 @@ size_t RandomWorkload::run(const WorkloadContext &ctx, std::mt19937_64 &rng,
           (void)ctx.version_store->on_update(txn, rid,
                                              std::span<const char>(old_bytes));
         }
-        staged.push_back({Kind::kUpdate, rid, std::move(new_bytes)});
+        if (!in_flight) {
+          staged.push_back({Kind::kUpdate, rid, std::move(new_bytes)});
+        }
         ++ops;
       } else {
         // DELETE a committed row.
@@ -158,7 +171,9 @@ size_t RandomWorkload::run(const WorkloadContext &ctx, std::mt19937_64 &rng,
           (void)ctx.version_store->on_delete(txn, rid,
                                              std::span<const char>(old_bytes));
         }
-        staged.push_back({Kind::kDelete, rid, {}});
+        if (!in_flight) {
+          staged.push_back({Kind::kDelete, rid, {}});
+        }
         ++ops;
       }
     }

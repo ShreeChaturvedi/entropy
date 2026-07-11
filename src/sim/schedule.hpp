@@ -31,6 +31,26 @@ struct Schedule {
   bool sync_pages_after_workload = false;  ///< fsync the data image before crash
   bool skip_recovery = false;          ///< negative test: skip recover()
   uint32_t abort_ppk = 0;              ///< workload abort rate (see RandomWorkload)
+  /// In-flight transaction insert count (see RandomWorkload). Sized past
+  /// WAL_BUFFER_SIZE it forces mid-transaction overflow flushes so the loser's
+  /// bytes genuinely reach the log device before the crash.
+  size_t inflight_ops = 0;
+  /// Arm SimLogStore sync failures at the start of the in-flight transaction:
+  /// its overflow flushes then append without becoming durable, producing a
+  /// real unsynced WAL tail for the crash to lose/tear.
+  bool arm_wal_sync_failures = false;
+
+  // ── Anti-vacuity contract, asserted by the schedule sweep test ────────────
+  /// Every fault kind listed here must fire at least once across the sweep's
+  /// seeds. A schedule whose advertised fault cannot fire fails its own test.
+  std::vector<FaultKind> must_fire;
+  /// The sweep asserts undo_ops > 0 for every seed (recovery's undo phase is
+  /// genuinely exercised, not vacuously green).
+  bool expect_undo = false;
+  /// The sweep asserts faults_injected == 0 for every seed (clean-baseline
+  /// control schedules).
+  bool expect_zero_faults = false;
+
   FaultConfig faults{};
 };
 
@@ -41,7 +61,9 @@ struct RunResult {
   std::string crash_point;
   size_t faults_injected = 0;
   size_t ops = 0;
-  double recovery_ms = 0.0;
+  size_t redo_ops = 0;  ///< recovery redo operations actually applied
+  size_t undo_ops = 0;  ///< recovery undo operations actually applied
+  double recovery_ms = 0.0;  ///< wall time; excluded from JSONL by default
   bool recovery_ok = true;
   std::vector<std::string> invariants_failed;
   FaultLog faults;  ///< combined, ordered (disk then log) for determinism checks
@@ -57,8 +79,11 @@ struct RunResult {
     }
     return invariants_failed.empty() ? "pass" : "fail";
   }
-  /// One stable JSONL line. The schema is fixed; a dashboard consumes it.
-  [[nodiscard]] std::string to_jsonl() const;
+  /// One stable JSONL line (schema documented in schedule.cpp). By default the
+  /// line is fully deterministic: two runs of the same seed produce identical
+  /// bytes. @p include_timing appends the wall-clock recovery_ms field, which
+  /// is inherently non-reproducible and therefore opt-in.
+  [[nodiscard]] std::string to_jsonl(bool include_timing = false) const;
 };
 
 /// Assemble the stack for @p seed under @p schedule, crash, recover, and check.

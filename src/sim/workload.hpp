@@ -16,6 +16,7 @@
  */
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <random>
 #include <string>
@@ -80,6 +81,11 @@ struct WorkloadContext {
   VersionStore *version_store = nullptr;
   const Schema *schema = nullptr;
   oid_t table_oid = 1;
+  /// Invoked once, right before the final in-flight transaction begins (only
+  /// when the run leaves one). Schedules use it to arm device faults whose
+  /// window is "during the transaction the crash interrupts" (e.g. WAL sync
+  /// failures that leave a real appended-but-unsynced tail).
+  std::function<void()> on_inflight_begin;
 };
 
 /// Abstract seeded workload. Slot a public-API driver in here later.
@@ -103,8 +109,15 @@ public:
   ///        of committing. Kept 0 for schedules that must survive recovery:
   ///        recovery has no CLRs and never gates redo by page LSN, so it
   ///        resurrects rows from transactions aborted during normal operation
-  ///        (tracked engine limitation; see the live-abort repro schedule).
-  explicit RandomWorkload(uint32_t abort_ppk = 0) : abort_ppk_(abort_ppk) {}
+  ///        (issues #75/#81; see the live-abort repro schedule).
+  /// @param inflight_ops when > 0, the final in-flight transaction performs
+  ///        exactly this many inserts instead of the usual 1-4 random ops.
+  ///        Sized past WAL_BUFFER_SIZE, this forces mid-transaction overflow
+  ///        flushes, so the loser's record bytes genuinely reach the LogStore
+  ///        before the crash (small in-flight transactions die inside the WAL
+  ///        manager's user-space buffer and never produce a device tail).
+  explicit RandomWorkload(uint32_t abort_ppk = 0, size_t inflight_ops = 0)
+      : abort_ppk_(abort_ppk), inflight_ops_(inflight_ops) {}
 
   [[nodiscard]] const char *name() const override { return "random"; }
   size_t run(const WorkloadContext &ctx, std::mt19937_64 &rng, Oracle &oracle,
@@ -112,6 +125,7 @@ public:
 
 private:
   uint32_t abort_ppk_;
+  size_t inflight_ops_;
   uint64_t next_row_id_ = 1;  // monotonic, guarantees distinct row payloads
 };
 
