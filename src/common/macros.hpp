@@ -102,6 +102,23 @@ namespace entropy {
     ClassName& operator=(ClassName&&) = default
 
 /**
+ * @brief Prevent the compiler from inlining a function.
+ *
+ * Used where a function must remain a distinct stack frame regardless of the
+ * optimizer's inlining decisions — e.g. so a ThreadSanitizer suppression that
+ * matches on that frame's symbol keeps matching under -O2 (see
+ * .config/tsan-suppressions.txt). Expands to nothing on unknown compilers, so
+ * it never changes semantics, only frame layout.
+ */
+#if defined(_MSC_VER)
+#define ENTROPY_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define ENTROPY_NOINLINE __attribute__((noinline))
+#else
+#define ENTROPY_NOINLINE
+#endif
+
+/**
  * @brief Concatenate tokens
  */
 #define ENTROPY_CONCAT_IMPL(a, b) a##b
