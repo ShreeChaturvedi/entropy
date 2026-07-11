@@ -5,7 +5,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "catalog/catalog.hpp"
 #include "entropy/entropy.hpp"
@@ -458,6 +461,159 @@ TEST_F(DatabaseTest, IndexScanResolvesIndexByOidEndToEnd) {
   EXPECT_EQ(row[0].as_int32(), kV)
       << "wrong index resolved: OID was cast to a column_id";
   EXPECT_EQ(row[2].as_int32(), kN + 1 - kV);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Query reachability (#16): joins, aggregation, GROUP BY, and computed/aliased
+// projections must run end-to-end through Database::execute().
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A two-table inner equi-join returns exactly the matching (left, right) rows.
+TEST_F(DatabaseTest, TwoTableInnerJoinReturnsCorrectRows) {
+  Database db(temp_file_->string());
+  ASSERT_TRUE(db.execute("CREATE TABLE emp (id INTEGER, dept INTEGER)").ok());
+  ASSERT_TRUE(
+      db.execute("CREATE TABLE dept (did INTEGER, name VARCHAR)").ok());
+  ASSERT_TRUE(
+      db.execute("INSERT INTO emp VALUES (1,10),(2,10),(3,20),(4,30)").ok());
+  ASSERT_TRUE(
+      db.execute("INSERT INTO dept VALUES (10,'Eng'),(20,'Sales')").ok());
+
+  // emp row 4 (dept 30) has no matching department and must be dropped by the
+  // inner join.
+  auto result = db.execute(
+      "SELECT emp.id AS id, dept.name AS name "
+      "FROM emp JOIN dept ON emp.dept = dept.did");
+  ASSERT_TRUE(result.ok()) << result.status().to_string();
+
+  std::vector<std::pair<int, std::string>> got;
+  for (const auto &row : result.rows()) {
+    got.emplace_back(row["id"].as_int32(), row["name"].as_string());
+  }
+  std::sort(got.begin(), got.end());
+
+  const std::vector<std::pair<int, std::string>> want = {
+      {1, "Eng"}, {2, "Eng"}, {3, "Sales"}};
+  EXPECT_EQ(got, want);
+}
+
+// GROUP BY with every supported aggregate produces the correct per-group value.
+TEST_F(DatabaseTest, GroupByAggregatesAreCorrect) {
+  Database db(temp_file_->string());
+  ASSERT_TRUE(db.execute("CREATE TABLE emp (dept INTEGER, sal INTEGER)").ok());
+  ASSERT_TRUE(
+      db.execute("INSERT INTO emp VALUES (10,100),(10,200),(20,300),(20,50),"
+                 "(20,120)")
+          .ok());
+
+  auto result = db.execute(
+      "SELECT dept, COUNT(*) AS c, SUM(sal) AS s, MIN(sal) AS mn, "
+      "MAX(sal) AS mx, AVG(sal) AS av FROM emp GROUP BY dept ORDER BY dept");
+  ASSERT_TRUE(result.ok()) << result.status().to_string();
+  ASSERT_EQ(result.row_count(), 2u);
+
+  // ORDER BY dept: group 10 first, then 20.
+  const auto &g10 = result.rows()[0];
+  EXPECT_EQ(g10["dept"].as_int32(), 10);
+  EXPECT_EQ(g10["c"].as_int64(), 2);
+  EXPECT_EQ(g10["s"].as_int64(), 300);
+  EXPECT_EQ(g10["mn"].as_int32(), 100);
+  EXPECT_EQ(g10["mx"].as_int32(), 200);
+  EXPECT_DOUBLE_EQ(g10["av"].as_double(), 150.0);
+
+  const auto &g20 = result.rows()[1];
+  EXPECT_EQ(g20["dept"].as_int32(), 20);
+  EXPECT_EQ(g20["c"].as_int64(), 3);
+  EXPECT_EQ(g20["s"].as_int64(), 470);
+  EXPECT_EQ(g20["mn"].as_int32(), 50);
+  EXPECT_EQ(g20["mx"].as_int32(), 300);
+  EXPECT_NEAR(g20["av"].as_double(), 470.0 / 3.0, 1e-9);
+}
+
+// COUNT(*) with no GROUP BY aggregates the whole table into a single row.
+TEST_F(DatabaseTest, CountStarWholeTable) {
+  Database db(temp_file_->string());
+  ASSERT_TRUE(db.execute("CREATE TABLE t (id INTEGER)").ok());
+  ASSERT_TRUE(db.execute("INSERT INTO t VALUES (1),(2),(3),(4)").ok());
+
+  auto result = db.execute("SELECT COUNT(*) AS n FROM t");
+  ASSERT_TRUE(result.ok()) << result.status().to_string();
+  ASSERT_EQ(result.row_count(), 1u);
+  EXPECT_EQ(result.rows()[0]["n"].as_int64(), 4);
+}
+
+// Computed arithmetic expressions and aliases produce correctly named, typed
+// output columns.
+TEST_F(DatabaseTest, ComputedAndAliasedProjection) {
+  Database db(temp_file_->string());
+  ASSERT_TRUE(db.execute("CREATE TABLE t (id INTEGER, sal INTEGER)").ok());
+  ASSERT_TRUE(db.execute("INSERT INTO t VALUES (1,100),(2,250)").ok());
+
+  auto result = db.execute(
+      "SELECT id AS emp_id, sal + 10 AS bonus, sal * 2 AS doubled FROM t "
+      "ORDER BY emp_id");
+  ASSERT_TRUE(result.ok()) << result.status().to_string();
+  ASSERT_EQ(result.row_count(), 2u);
+
+  const std::vector<std::string> expected_cols = {"emp_id", "bonus", "doubled"};
+  EXPECT_EQ(result.column_names(), expected_cols);
+
+  // Arithmetic over integers widens to BIGINT (int64) in this engine.
+  const auto &r0 = result.rows()[0];
+  EXPECT_EQ(r0["emp_id"].as_int32(), 1);
+  EXPECT_EQ(r0["bonus"].as_int64(), 110);
+  EXPECT_EQ(r0["doubled"].as_int64(), 200);
+
+  const auto &r1 = result.rows()[1];
+  EXPECT_EQ(r1["emp_id"].as_int32(), 2);
+  EXPECT_EQ(r1["bonus"].as_int64(), 260);
+  EXPECT_EQ(r1["doubled"].as_int64(), 500);
+}
+
+// #10: on a large indexed table the optimizer picks an index scan for a
+// selective point lookup and a sequential scan when there is no predicate,
+// observable through EXPLAIN's rendered plan.
+TEST_F(DatabaseTest, OptimizerChoosesIndexVsSeqScan) {
+  Database db(temp_file_->string());
+  ASSERT_TRUE(db.execute("CREATE TABLE t (id INTEGER, v INTEGER)").ok());
+
+  // Enough rows that a point lookup via the index beats a full scan.
+  constexpr int kN = 3000;
+  for (int base = 0; base < kN; base += 500) {
+    std::string sql = "INSERT INTO t VALUES ";
+    for (int i = base; i < base + 500 && i < kN; ++i) {
+      if (i != base) {
+        sql += ", ";
+      }
+      sql += "(" + std::to_string(i) + ", " + std::to_string(i % 5) + ")";
+    }
+    ASSERT_TRUE(db.execute(sql).ok()) << "insert batch at " << base;
+  }
+  ASSERT_TRUE(db.catalog_for_testing()->create_index("idx_t_id", "t", "id").ok());
+
+  auto explain_contains = [&](const std::string &sql, const std::string &needle) {
+    auto r = db.execute(sql);
+    EXPECT_TRUE(r.ok()) << r.status().to_string();
+    for (const auto &row : r.rows()) {
+      if (row[0].as_string().find(needle) != std::string::npos) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // Selective equality -> index scan.
+  EXPECT_TRUE(explain_contains("EXPLAIN SELECT * FROM t WHERE id = 5",
+                               "Index Scan"));
+  // No predicate -> sequential scan.
+  EXPECT_TRUE(
+      explain_contains("EXPLAIN SELECT * FROM t", "Sequential Scan"));
+
+  // The index-backed query still returns the correct row.
+  auto row = db.execute("SELECT id FROM t WHERE id = 5");
+  ASSERT_TRUE(row.ok()) << row.status().to_string();
+  ASSERT_EQ(row.row_count(), 1u);
+  EXPECT_EQ(row.rows()[0]["id"].as_int32(), 5);
 }
 
 } // namespace
