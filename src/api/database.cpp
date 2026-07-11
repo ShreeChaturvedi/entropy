@@ -967,6 +967,29 @@ public:
   // Test-only seam: hands out the internal Catalog pointer (see header).
   Catalog *catalog_for_testing() noexcept { return catalog_.get(); }
 
+  // Test-only seam (see header). Re-stamp the calling thread's explicit-
+  // transaction binding with a fresh session epoch this thread does not own,
+  // and drop this thread's guard ownership of it. The binding stays present
+  // under this thread's id but is now attributed to a different session —
+  // exactly the state a recycled OS thread id inherits from a prior, abandoned
+  // session. This drives the recycled-thread-id identity-validation path
+  // (begin_transaction / session_state reject a binding whose epoch this
+  // session does not hold) deterministically, with no dependence on the OS
+  // actually recycling a std::thread::id. It touches only the session-binding
+  // bookkeeping; no production code path calls it, so production behavior is
+  // unchanged.
+  void orphan_current_session_for_testing() {
+    std::lock_guard<std::mutex> lock(sessions_->mutex);
+    auto it = sessions_->bindings.find(std::this_thread::get_id());
+    if (it == sessions_->bindings.end()) {
+      return;
+    }
+    // A freshly minted, never-owned session identity: precisely what a recycled
+    // thread id carries relative to the prior session that left the binding.
+    it->second.epoch = g_next_session_epoch.fetch_add(1);
+    t_session_guard.forget(sessions_);
+  }
+
 private:
   /// Result of looking up the calling thread's explicit-transaction binding.
   struct SessionState {
@@ -1099,6 +1122,12 @@ std::string_view Database::path() const noexcept {
 
 Catalog *Database::catalog_for_testing() noexcept {
   return impl_ ? impl_->catalog_for_testing() : nullptr;
+}
+
+void Database::orphan_current_session_for_testing() {
+  if (impl_) {
+    impl_->orphan_current_session_for_testing();
+  }
 }
 
 } // namespace entropy

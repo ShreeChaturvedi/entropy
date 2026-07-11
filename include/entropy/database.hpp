@@ -165,6 +165,18 @@ public:
     /// (CREATE INDEX is not yet parseable). Not part of the stable public API.
     [[nodiscard]] Catalog* catalog_for_testing() noexcept;
 
+    /// Test-only seam: leave the calling thread's OPEN explicit transaction
+    /// bound under this thread's id but stamped with a session identity this
+    /// thread no longer owns — byte-for-byte the state a recycled OS thread id
+    /// inherits from a prior, abandoned session. Lets a test drive the
+    /// recycled-thread-id identity-validation guarantee (#87) deterministically
+    /// on every platform, without relying on the OS to actually recycle a
+    /// std::thread::id (which some platforms will not do within a bounded number
+    /// of sequential spawns). No-op if no explicit transaction is open on the
+    /// calling thread. Does not change production behavior; nothing outside
+    /// tests calls this. Not part of the stable public API.
+    void orphan_current_session_for_testing();
+
 private:
     std::unique_ptr<DatabaseImpl> impl_;
 };
