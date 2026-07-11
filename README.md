@@ -10,6 +10,14 @@
 [![license](https://img.shields.io/github/license/ShreeChaturvedi/entropy)](LICENSE)
 [![c++](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
 
+<p align="center">
+  <img src="docs/assets/tui/boot.gif" width="820" alt="Entropy terminal UI booting into an animated braille galaxy, amber on charcoal">
+</p>
+
+<p align="center">
+  <em>The Entropy terminal UI: a deterministic crash-simulator front end, amber on charcoal, opening on an animated braille galaxy boot screen.</em>
+</p>
+
 Entropy is a high-performance relational database engine built from scratch in
 modern C++20. It showcases core database internals: slotted-page storage, a
 latch-crabbing B+ tree, MVCC snapshot isolation, ACID transactions, write-ahead
@@ -31,6 +39,26 @@ exercised by a deterministic, FoundationDB-style crash simulator.
 - Benchmarks with optional SQLite comparison and reproducible scripts.
 - Cross-platform CMake build with Linux/macOS/Windows CI, AddressSanitizer,
   UBSan, ThreadSanitizer, and a `find_package` consumer smoke test.
+
+## Terminal UI
+
+The engine drives a live terminal UI, rendered amber on charcoal.
+
+<p align="center">
+  <img src="docs/assets/tui/dashboard.png" width="820" alt="Crash-simulator dashboard with a seed run table and a live fault feed using btop-style row lighting">
+</p>
+
+<p align="center">
+  <em>Live crash-simulator dashboard: seed runs and pass/fail beside a streaming fault feed with btop-style row lighting.</em>
+</p>
+
+<p align="center">
+  <img src="docs/assets/tui/console.png" width="820" alt="Interactive SQL console showing a query and its result grid">
+</p>
+
+<p align="center">
+  <em>Interactive SQL console: type a query, read the result grid.</em>
+</p>
 
 ## Architecture
 
