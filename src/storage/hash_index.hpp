@@ -8,7 +8,8 @@
  * 1. O(1) average case lookups/inserts
  * 2. Dynamic growth via bucket splitting
  * 3. Space-efficient directory structure
- * 4. Concurrent-safe with latch crabbing
+ * 4. Concurrent-safe via a single reader/writer lock over the whole index
+ *    (a coarse std::shared_mutex, not latch crabbing)
  *
  * Structure:
  * - Directory: Array of pointers to buckets, indexed by hash prefix
