@@ -32,3 +32,107 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure -C Release
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # AddressSanitizer+UBSan and ThreadSanitizer (Linux). Same pipeline
+  # parameterized by the instrumentation flags; RelWithDebInfo so reports carry
+  # symbols. The full suite runs serially (parallel ctest collides on shared
+  # fixture temp dirs).
+  # ───────────────────────────────────────────────────────────────────────────
+  sanitizers:
+    name: ${{ matrix.name }} (ubuntu)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: asan+ubsan
+            build_dir: build-asan
+            flags: "-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all"
+          - name: tsan
+            build_dir: build-tsan
+            flags: "-fsanitize=thread -fno-omit-frame-pointer"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Sanitizer shadow memory fails to map on runners with high ASLR entropy
+      # (kernel default vm.mmap_rnd_bits=32). Lower it so the runtime can start.
+      - name: Lower ASLR entropy for sanitizer runtime
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: >-
+          cmake -S . -B ${{ matrix.build_dir }}
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DENTROPY_BUILD_TESTS=ON
+          -DENTROPY_BUILD_EXAMPLES=OFF
+          -DCMAKE_CXX_FLAGS="${{ matrix.flags }}"
+          -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.flags }}"
+          -DCMAKE_SHARED_LINKER_FLAGS="${{ matrix.flags }}"
+
+      - name: Build
+        run: cmake --build ${{ matrix.build_dir }} --parallel
+
+      - name: Test (serial)
+        env:
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        run: ctest --test-dir ${{ matrix.build_dir }} --output-on-failure
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Benchmarks: compile-check (with the SQLite comparison path) so benchmark
+  # code cannot bit-rot, then a sub-second smoke run to prove the binary runs.
+  # This is never a real performance measurement.
+  # ───────────────────────────────────────────────────────────────────────────
+  benchmarks:
+    name: benchmarks (build + smoke)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install SQLite dev headers
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Configure
+        run: cmake --preset bench
+
+      - name: Build
+        run: cmake --build --preset bench --parallel
+
+      - name: Smoke run (sub-second, not a measurement)
+        run: ./build/bench/benchmarks/entropy_bench --benchmark_min_time=0.01s
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Downstream packaging: install to a prefix, then find_package(entropy) from a
+  # standalone consumer and link entropy::entropy. Proves the exported package
+  # config is actually usable.
+  # ───────────────────────────────────────────────────────────────────────────
+  consumer-smoke:
+    name: consumer find_package smoke (ubuntu)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and install Entropy to a prefix
+        run: |
+          cmake -S . -B build-install \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENTROPY_BUILD_TESTS=OFF \
+            -DENTROPY_BUILD_EXAMPLES=OFF
+          cmake --build build-install --config Release --parallel
+          cmake --install build-install --prefix "$PWD/dist" --config Release
+
+      - name: Configure, build and run the consumer against the install prefix
+        run: |
+          cmake -S packaging/consumer-smoke -B build-consumer \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$PWD/dist"
+          cmake --build build-consumer --config Release
+          ./build-consumer/consumer_smoke

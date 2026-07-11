@@ -49,7 +49,11 @@ double CostModel::estimate_cost(const PlanNode *plan) const {
     cost = cost_aggregation(static_cast<const AggregationPlanNode *>(plan));
     break;
   default:
-    cost = children_cost(plan);
+    // INSERT/UPDATE/DELETE and any other unmodeled node carry no intrinsic
+    // cost here. Children are added exactly once below; previously this set
+    // cost = children_cost and then returned cost + children_cost, counting the
+    // child subtree twice and inflating every DML estimate.
+    cost = 0.0;
     break;
   }
 
@@ -94,8 +98,13 @@ size_t CostModel::estimate_cardinality(const PlanNode *plan) const {
   }
 
   case PlanNodeType::FILTER: {
-    // Estimate based on predicate selectivity
-    double sel = Statistics::DEFAULT_SELECTIVITY;
+    // Selectivity depends on the actual predicate, not a fixed 0.1. A filter
+    // node has no table context (INVALID_OID), so equality falls back to
+    // predicate-type defaults; a scan-level predicate (handled above) can still
+    // use 1/NDV.
+    auto *filter = static_cast<const FilterPlanNode *>(plan);
+    double sel =
+        statistics_->estimate_selectivity(INVALID_OID, filter->predicate());
     return static_cast<size_t>(static_cast<double>(child_card) * sel);
   }
 
@@ -163,8 +172,13 @@ double CostModel::cost_index_scan(const IndexScanPlanNode *node) const {
     break;
   }
 
-  // Fetch cost: random I/O for each RID
-  double fetch_cost = static_cast<double>(matching_rows) * INDEX_TUPLE_COST;
+  // Fetch cost: each matching tuple is a random heap access (unclustered-index
+  // assumption), so it costs a random page read plus per-tuple index CPU.
+  // Charging only INDEX_TUPLE_COST (0.005) made an index tuple cheaper than a
+  // sequential one (TUPLE_CPU_COST 0.01) and omitted random I/O entirely,
+  // systematically under-costing index scans.
+  double fetch_cost = static_cast<double>(matching_rows) *
+                      (RANDOM_PAGE_COST + INDEX_TUPLE_COST);
 
   return seek_cost + fetch_cost;
 }
