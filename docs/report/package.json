@@ -1,0 +1,30 @@
+{
+  "name": "entropy-report",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Typeset PDF technical report for the Entropy database engine",
+  "scripts": {
+    "dev": "vite --port 5190",
+    "build": "tsc --noEmit && vite build",
+    "pdf": "npm run build && node scripts/export-pdf.mjs"
+  },
+  "dependencies": {
+    "@fontsource/ibm-plex-mono": "^5.2.5",
+    "@fontsource/instrument-serif": "^5.2.5",
+    "@fontsource/schibsted-grotesk": "^5.2.5",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "puppeteer-core": "^24.0.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true
+  }
+}

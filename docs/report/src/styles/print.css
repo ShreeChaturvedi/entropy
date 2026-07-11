@@ -1,0 +1,62 @@
+@page {
+  size: 8.5in 11in;
+  margin: 0;
+}
+
+* {
+  box-sizing: border-box;
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: #131316;
+}
+
+.page {
+  position: relative;
+  width: 8.5in;
+  height: 11in;
+  background: #0a0a0c;
+  overflow: hidden;
+  break-after: page;
+  page-break-after: always;
+  contain: layout size;
+}
+
+.page:last-child {
+  break-after: auto;
+  page-break-after: auto;
+}
+
+/* Screen preview: stack pages with a gap so overflow and seams are visible. */
+@media screen {
+  body {
+    padding: 32px 0;
+  }
+  .report-root {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 28px;
+  }
+  .page {
+    box-shadow: 0 2px 24px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(233, 230, 222, 0.08);
+  }
+}
+
+@media print {
+  body {
+    padding: 0;
+    background: none;
+  }
+  .report-root {
+    display: block;
+  }
+  .page {
+    box-shadow: none;
+  }
+}
