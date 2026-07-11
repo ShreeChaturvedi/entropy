@@ -106,10 +106,11 @@ public:
 class RandomWorkload : public Workload {
 public:
   /// @param abort_ppk chance (parts per thousand) a transaction aborts instead
-  ///        of committing. Kept 0 for schedules that must survive recovery:
-  ///        recovery has no CLRs and never gates redo by page LSN, so it
-  ///        resurrects rows from transactions aborted during normal operation
-  ///        (issues #75/#81; see the live-abort repro schedule).
+  ///        of committing. The forward abort path logs a redoable compensation
+  ///        record per undone write, so recovery's repeat-history redo leaves no
+  ///        aborted effect behind even when the compensated pages were lost at
+  ///        the crash (issues #75/#81; exercised by the live_abort_repro
+  ///        schedule).
   /// @param inflight_ops when > 0, the final in-flight transaction performs
   ///        exactly this many inserts instead of the usual 1-4 random ops.
   ///        Sized past WAL_BUFFER_SIZE, this forces mid-transaction overflow
@@ -123,10 +124,16 @@ public:
   size_t run(const WorkloadContext &ctx, std::mt19937_64 &rng, Oracle &oracle,
              size_t num_txns, bool leave_in_flight) override;
 
+  /// Transactions that aborted during normal operation in the last run(). The
+  /// schedule sweep asserts this is > 0 on abort schedules so their recovery
+  /// coverage can never regress into vacuity (aborts silently stop firing).
+  [[nodiscard]] size_t aborts() const noexcept { return aborts_; }
+
 private:
   uint32_t abort_ppk_;
   size_t inflight_ops_;
   uint64_t next_row_id_ = 1;  // monotonic, guarantees distinct row payloads
+  size_t aborts_ = 0;         // committed-path aborts in the last run()
 };
 
 /// A schema shared across simulator runs: (id INTEGER, name VARCHAR(64)). The

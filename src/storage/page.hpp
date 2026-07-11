@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <shared_mutex>
 
 #include "common/config.hpp"
 #include "common/types.hpp"
@@ -96,6 +97,31 @@ public:
     /// Reset the page to initial state
     void reset();
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Page latch (reader/writer)
+    //
+    // A per-page reader/writer latch used by the B+ tree's latch-crabbing
+    // protocol. It guards this frame's contents (data_) against concurrent
+    // access. Crucially it is a SEPARATE member from data_: reset() (called by
+    // the buffer pool on frame reuse) clears only data_/is_dirty_/pin_count_ and
+    // never touches the latch, so the latch object survives frame reuse. A
+    // latched page is always kept pinned by its holder, and the buffer pool
+    // refuses to evict or delete a pinned frame, so the frame a latch protects
+    // cannot be reused out from under the latch holder.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Acquire the latch in shared (read) mode.
+    void rlatch() { latch_.lock_shared(); }
+
+    /// Release a shared (read) latch.
+    void runlatch() { latch_.unlock_shared(); }
+
+    /// Acquire the latch in exclusive (write) mode.
+    void wlatch() { latch_.lock(); }
+
+    /// Release an exclusive (write) latch.
+    void wunlatch() { latch_.unlock(); }
+
     /// Get the header
     [[nodiscard]] PageHeader* header() noexcept {
         return reinterpret_cast<PageHeader*>(data_.data());
@@ -112,6 +138,9 @@ private:
     std::array<char, config::kDefaultPageSize> data_{};
     bool is_dirty_ = false;
     int pin_count_ = 0;
+    // Not part of the on-disk page image and intentionally excluded from
+    // reset(); see the latch documentation above.
+    std::shared_mutex latch_;
 };
 
 }  // namespace entropy

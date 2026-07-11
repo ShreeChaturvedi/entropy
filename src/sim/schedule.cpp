@@ -157,6 +157,7 @@ RunResult run_schedule(uint64_t seed, const Schedule &schedule) {
     RandomWorkload workload(schedule.abort_ppk, schedule.inflight_ops);
     result.ops = workload.run(ctx, wl_rng, oracle, schedule.num_txns,
                               schedule.leave_in_flight);
+    result.aborts = workload.aborts();
 
     // Steal: push dirty (committed and/or loser) pages to disk, unsynced.
     if (schedule.flush_pages_before_crash) {
@@ -324,20 +325,24 @@ std::optional<Schedule> make_schedule(const std::string &name) {
     return s;
   }
   if (name == "live_abort_repro") {
-    // EXCLUDED from the passing set (schedule_names()) on purpose. Transactions
-    // abort during normal operation; recovery then resurrects their rows,
-    // because it writes no CLRs and never gates redo by page LSN (the write
-    // path never stamps one, #75), so repeat-history re-applies an aborted
-    // INSERT and the undo phase, which only rolls back in-flight losers, never
-    // removes it. Reproduce: `entropy-sim --schedule live_abort_repro --seeds
-    // 40` — seeds 1-40 all fail; at larger scale ~97% of seeds fail (a seed
-    // whose random mix happens to abort no transaction passes). Tracked in
-    // issues #75/#81; do not add to the passing sweep until fixed.
+    // Transactions abort during normal operation, then committed pages are
+    // stolen to disk (unsynced) and lost at the crash, so recovery rebuilds the
+    // table purely from the WAL. The forward abort path now emits a redoable
+    // compensation record (CLR) per undone write and stamps its page LSN, so
+    // repeat-history redo replays each aborted mutation AND its inverse: an
+    // aborted INSERT is re-deleted and an aborted DELETE/UPDATE of a committed
+    // row is restored, leaving none of the aborted transaction's effects behind
+    // even though its compensated pages never reached disk (#75/#81). The sweep
+    // asserts at least one abort fired per seed (expect_aborts) so this coverage
+    // can never regress into vacuity. Reproduce the fixed behavior with
+    // `entropy-sim --schedule live_abort_repro --seeds 40` (40/40 pass).
     s.crash_point = "live_abort_then_recover";
     s.num_txns = 14;
     s.leave_in_flight = false;
     s.flush_pages_before_crash = true;
     s.abort_ppk = 400;
+    s.must_fire = {FaultKind::kLostPageWrite};
+    s.expect_aborts = true;
     return s;
   }
   if (name == "torn_page_write") {
@@ -384,6 +389,7 @@ std::vector<std::string> schedule_names() {
       "durable_survives_intact",
       "transient_write_errors",
       "mixed",
+      "live_abort_repro",
   };
 }
 
