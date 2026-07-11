@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -16,6 +17,14 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+// Process id, for building per-process-unique temp directories. Guarded so no
+// POSIX header leaks into the Windows CI build.
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "catalog/schema.hpp"
 #include "storage/buffer_pool.hpp"
@@ -33,6 +42,50 @@
 
 namespace entropy {
 namespace {
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-test unique temp directory
+//
+// ctest -j runs each discovered test in its own process, but several fixtures
+// historically used a FIXED temp-dir name (e.g. "entropy_wal_test"). Two
+// concurrent processes then created, wrote, and remove_all'd the same directory,
+// producing non-deterministic failures. make_unique_test_dir composes a path
+// from the running test's suite + name, the process id, and a per-process
+// counter, so no two fixtures — in the same process or across parallel
+// processes — can ever collide.
+// ─────────────────────────────────────────────────────────────────────────────
+
+[[nodiscard]] long long current_process_id() {
+#ifdef _WIN32
+  return static_cast<long long>(::_getpid());
+#else
+  return static_cast<long long>(::getpid());
+#endif
+}
+
+[[nodiscard]] std::filesystem::path
+make_unique_test_dir(const std::string &tag) {
+  static std::atomic<uint64_t> counter{0};
+  const ::testing::TestInfo *info =
+      ::testing::UnitTest::GetInstance()->current_test_info();
+  std::string leaf = tag;
+  leaf += '_';
+  leaf += info ? info->test_suite_name() : "nosuite";
+  leaf += '_';
+  leaf += info ? info->name() : "notest";
+  // Parameterized / typed test names can contain '/' or ':'; sanitize so the
+  // leaf is always a single path component.
+  for (char &c : leaf) {
+    if (c == '/' || c == '\\' || c == ':') {
+      c = '_';
+    }
+  }
+  leaf += "_p" + std::to_string(current_process_id());
+  leaf += "_" + std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
+  std::filesystem::path dir = std::filesystem::temp_directory_path() / leaf;
+  std::filesystem::create_directories(dir);
+  return dir;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Transaction Tests
@@ -294,8 +347,7 @@ TEST(LogRecordTest, TypeToString) {
 class WALTest : public ::testing::Test {
 protected:
   void SetUp() override {
-    test_dir_ = std::filesystem::temp_directory_path() / "entropy_wal_test";
-    std::filesystem::create_directories(test_dir_);
+    test_dir_ = make_unique_test_dir("entropy_wal");
     wal_file_ = test_dir_ / "test.wal";
     std::filesystem::remove(wal_file_);
   }
@@ -707,8 +759,7 @@ TEST(LogRecordTest, DeserializeCheckpointRejectsOversizedCount) {
 class TransactionManagerTest : public ::testing::Test {
 protected:
   void SetUp() override {
-    test_dir_ = std::filesystem::temp_directory_path() / "entropy_txn_test";
-    std::filesystem::create_directories(test_dir_);
+    test_dir_ = make_unique_test_dir("entropy_txn");
     wal_file_ = test_dir_ / "test.wal";
     std::filesystem::remove(wal_file_);
   }
@@ -925,9 +976,7 @@ TEST_F(TransactionManagerTest, FullTransactionWorkflow) {
 class AbortUndoTest : public ::testing::Test {
 protected:
   void SetUp() override {
-    test_dir_ = std::filesystem::temp_directory_path() /
-                ("entropy_abort_undo_" + std::to_string(rand()));
-    std::filesystem::create_directories(test_dir_);
+    test_dir_ = make_unique_test_dir("entropy_abort_undo");
     db_file_ = test_dir_ / "data.db";
     wal_file_ = test_dir_ / "test.wal";
 
@@ -1677,9 +1726,7 @@ TEST_F(LockManagerTest, MultipleLockReleaseGrantsWaiting) {
 class RecoveryTest : public ::testing::Test {
 protected:
   void SetUp() override {
-    test_dir_ =
-        std::filesystem::temp_directory_path() / "entropy_recovery_test";
-    std::filesystem::create_directories(test_dir_);
+    test_dir_ = make_unique_test_dir("entropy_recovery");
     wal_file_ = test_dir_ / "test.wal";
     db_file_ = test_dir_ / "test.db";
     std::filesystem::remove(wal_file_);
@@ -2622,9 +2669,7 @@ TEST_F(MVCCTest, CreatorCannotSeeAfterSelfDelete) {
 class MVCCTxnIntegrationTest : public ::testing::Test {
 protected:
   void SetUp() override {
-    test_dir_ = std::filesystem::temp_directory_path() /
-                ("entropy_wp5_" + std::to_string(rand()));
-    std::filesystem::create_directories(test_dir_);
+    test_dir_ = make_unique_test_dir("entropy_wp5");
     db_file_ = test_dir_ / "data.db";
     wal_file_ = test_dir_ / "test.wal";
 
