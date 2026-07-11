@@ -2,7 +2,7 @@
 
 /**
  * @file projection.hpp
- * @brief Projection executor - selects specific columns from tuples
+ * @brief Projection executor - selects columns or evaluates expressions
  */
 
 #include <memory>
@@ -10,23 +10,23 @@
 
 #include "catalog/schema.hpp"
 #include "execution/executor.hpp"
+#include "parser/expression.hpp"
 
 namespace entropy {
 
 /**
- * @brief Projection executor - selects specific columns
+ * @brief Projection executor
  *
- * Takes a child executor and produces tuples with only the
- * specified columns.
+ * Two modes:
+ * - Column mode: forwards a subset of input columns (by index). Output columns
+ *   inherit the input column metadata.
+ * - Expression mode: evaluates one expression per output column against each
+ *   input tuple. Used for computed/aliased SELECT items (e.g. `a + b AS c`).
  */
 class ProjectionExecutor : public Executor {
 public:
   /**
-   * @brief Construct a projection executor
-   * @param ctx Executor context
-   * @param child Child executor providing tuples
-   * @param input_schema Schema of input tuples
-   * @param column_indices Indices of columns to include in output
+   * @brief Column-projection constructor (subset of input columns by index).
    */
   ProjectionExecutor(ExecutorContext *ctx, std::unique_ptr<Executor> child,
                      const Schema *input_schema,
@@ -37,19 +37,21 @@ public:
   }
 
   /**
-   * @brief Initialize the executor
+   * @brief Expression-projection constructor.
+   * @param expressions One expression per output column (bound to input_schema).
+   * @param output_columns Output column metadata (name + type) per expression.
    */
-  void init() override;
+  ProjectionExecutor(ExecutorContext *ctx, std::unique_ptr<Executor> child,
+                     const Schema *input_schema,
+                     std::vector<std::unique_ptr<Expression>> expressions,
+                     std::vector<Column> output_columns)
+      : Executor(ctx), child_(std::move(child)), input_schema_(input_schema),
+        expressions_(std::move(expressions)),
+        output_schema_(std::move(output_columns)) {}
 
-  /**
-   * @brief Get the next projected tuple
-   * @return Tuple with only projected columns, or nullopt if done
-   */
+  void init() override;
   [[nodiscard]] std::optional<Tuple> next() override;
 
-  /**
-   * @brief Get the output schema
-   */
   [[nodiscard]] const Schema &output_schema() const { return output_schema_; }
 
 private:
@@ -57,7 +59,8 @@ private:
 
   std::unique_ptr<Executor> child_;
   const Schema *input_schema_;
-  std::vector<size_t> column_indices_;
+  std::vector<size_t> column_indices_;                  // column mode
+  std::vector<std::unique_ptr<Expression>> expressions_; // expression mode
   Schema output_schema_;
 };
 
