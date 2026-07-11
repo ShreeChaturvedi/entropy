@@ -7,6 +7,9 @@
 
 #include <cmath>
 #include <limits>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 #include "catalog/schema.hpp"
 #include "storage/tuple.hpp"
@@ -231,6 +234,31 @@ TEST(TupleValueSerializeTest, VarcharRoundTrip) {
     // from_bytes takes the data WITHOUT the length prefix
     TupleValue restored = TupleValue::from_bytes(TypeId::VARCHAR, bytes.data() + 2, 16);
     EXPECT_EQ(restored.as_string(), "Hello, Database!");
+}
+
+// Regression test for issue #7: the on-disk VARCHAR format records length in a
+// 2-byte prefix. A string longer than 65535 bytes cannot be represented, so
+// serialization must throw loudly instead of truncating the recorded length
+// (which would desync it from the bytes written and corrupt the tuple).
+TEST(TupleValueSerializeTest, VarcharExceedingUint16Throws) {
+    std::string too_long(
+        static_cast<size_t>(std::numeric_limits<uint16_t>::max()) + 1, 'x');
+    TupleValue val(too_long);
+    EXPECT_THROW({ [[maybe_unused]] auto bytes = val.to_bytes(TypeId::VARCHAR); },
+                 std::length_error);
+}
+
+TEST(TupleValueSerializeTest, VarcharAtUint16MaxRoundTrip) {
+    std::string max_len(std::numeric_limits<uint16_t>::max(), 'y');
+    TupleValue val(max_len);
+
+    std::vector<char> bytes;
+    ASSERT_NO_THROW(bytes = val.to_bytes(TypeId::VARCHAR));
+    ASSERT_EQ(bytes.size(), 2u + max_len.size());
+
+    TupleValue restored = TupleValue::from_bytes(
+        TypeId::VARCHAR, bytes.data() + 2, max_len.size());
+    EXPECT_EQ(restored.as_string(), max_len);
 }
 
 TEST(TupleValueSerializeTest, NullBytesEmpty) {
