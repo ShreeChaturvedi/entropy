@@ -7,6 +7,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <functional>
+#include <optional>
+#include <type_traits>
 #include <unordered_set>
 #include <vector>
 
@@ -14,6 +18,63 @@
 #include "storage/table_heap.hpp"
 
 namespace entropy {
+
+namespace {
+
+// Hash for TupleValue so exact distinct values can be counted with a set.
+// NULLs are never inserted, so the monostate branch is unreachable in practice.
+struct TupleValueHash {
+  size_t operator()(const TupleValue &v) const {
+    return std::visit(
+        [](const auto &x) -> size_t {
+          using T = std::decay_t<decltype(x)>;
+          if constexpr (std::is_same_v<T, std::monostate>) {
+            return 0;
+          } else {
+            return std::hash<T>{}(x);
+          }
+        },
+        v.value());
+  }
+};
+
+// Extract a numeric value for ordering (min/max). Returns false for
+// non-numeric types (e.g. VARCHAR), which are ordered separately.
+bool numeric_value(const TupleValue &v, double *out) {
+  if (v.is_bool()) {
+    *out = v.as_bool() ? 1.0 : 0.0;
+  } else if (v.is_tinyint()) {
+    *out = static_cast<double>(v.as_tinyint());
+  } else if (v.is_smallint()) {
+    *out = static_cast<double>(v.as_smallint());
+  } else if (v.is_integer()) {
+    *out = static_cast<double>(v.as_integer());
+  } else if (v.is_bigint()) {
+    *out = static_cast<double>(v.as_bigint());
+  } else if (v.is_float()) {
+    *out = static_cast<double>(v.as_float());
+  } else if (v.is_double()) {
+    *out = v.as_double();
+  } else {
+    return false;
+  }
+  return true;
+}
+
+// Order two non-null values (numeric by magnitude, strings lexicographically).
+bool value_less(const TupleValue &a, const TupleValue &b) {
+  double da = 0.0;
+  double db = 0.0;
+  if (numeric_value(a, &da) && numeric_value(b, &db)) {
+    return da < db;
+  }
+  if (a.is_string() && b.is_string()) {
+    return a.as_string() < b.as_string();
+  }
+  return false; // Incomparable: leave the current extremum in place.
+}
+
+} // namespace
 
 Statistics::Statistics(std::shared_ptr<Catalog> catalog)
     : catalog_(std::move(catalog)) {}
@@ -116,39 +177,47 @@ void Statistics::collect_statistics(oid_t table_oid) {
     stats.columns[static_cast<column_id_t>(i)] = ColumnStatistics{};
   }
 
-  // Single pass: count rows and estimate distinct values.
-  // Sized to the actual column count so tables with any number of columns are
-  // handled (previously fixed 32-element stack arrays overflowed for >32).
-  std::vector<size_t> null_counts(schema.column_count(), 0);
-  std::vector<size_t> distinct_estimates(schema.column_count(), 0);
+  // Single pass: count rows, count true distinct non-null values, and track
+  // per-column min/max. Sized to the actual column count so tables with any
+  // number of columns are handled (previously fixed 32-element stack arrays
+  // overflowed for >32).
+  const size_t col_count = schema.column_count();
+  std::vector<size_t> null_counts(col_count, 0);
+  std::vector<std::unordered_set<TupleValue, TupleValueHash>> distinct_sets(
+      col_count);
+  std::vector<std::optional<TupleValue>> col_min(col_count);
+  std::vector<std::optional<TupleValue>> col_max(col_count);
 
   for (auto it = table_info->table_heap->begin();
        it != table_info->table_heap->end(); ++it) {
     Tuple tuple = *it;
     ++stats.row_count;
 
-    for (size_t i = 0; i < schema.column_count(); ++i) {
+    for (size_t i = 0; i < col_count; ++i) {
       TupleValue val = tuple.get_value(schema, static_cast<uint32_t>(i));
 
       if (val.is_null()) {
         ++null_counts[i];
-      } else {
-        // For simplicity, assume each value is distinct initially
-        // A proper implementation would use HyperLogLog or similar
-        ++distinct_estimates[i];
+        continue;
+      }
+      // Count exact distinct values instead of assuming ~90% are unique.
+      distinct_sets[i].insert(val);
+      if (!col_min[i] || value_less(val, *col_min[i])) {
+        col_min[i] = val;
+      }
+      if (!col_max[i] || value_less(*col_max[i], val)) {
+        col_max[i] = val;
       }
     }
   }
 
   // Finalize column statistics
-  for (size_t i = 0; i < schema.column_count(); ++i) {
+  for (size_t i = 0; i < col_count; ++i) {
     auto &col_stats = stats.columns[static_cast<column_id_t>(i)];
-    // Estimate distinct values (simplified: assume 10% are duplicates)
-    col_stats.distinct_values =
-        static_cast<double>(distinct_estimates[i]) * 0.9;
-    if (col_stats.distinct_values < 1.0 && distinct_estimates[i] > 0) {
-      col_stats.distinct_values = 1.0;
-    }
+    // NDV = number of distinct non-null values actually observed.
+    col_stats.distinct_values = static_cast<double>(distinct_sets[i].size());
+    col_stats.min_value = col_min[i];
+    col_stats.max_value = col_max[i];
     if (stats.row_count > 0) {
       col_stats.null_fraction =
           static_cast<double>(null_counts[i]) /
