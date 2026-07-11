@@ -192,3 +192,21 @@ target_link_libraries(optimizer_tests
 )
 
 gtest_discover_tests(optimizer_tests)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Simulation Tests (crash-simulation harness)
+# ─────────────────────────────────────────────────────────────────────────────
+
+add_executable(sim_tests
+    sim/sim_test.cpp
+)
+
+target_link_libraries(sim_tests
+    PRIVATE
+        entropy_sim
+        test_utils
+        GTest::gtest
+        GTest::gtest_main
+)
+
+gtest_discover_tests(sim_tests)
