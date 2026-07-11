@@ -18,6 +18,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -28,8 +29,10 @@
 
 namespace entropy {
 
-// Forward declaration
+// Forward declarations
 class BPlusTreeIterator;
+/// Per-operation set of write-latched + pinned pages; defined in b_plus_tree.cpp.
+class WriteSet;
 
 /**
  * @brief B+ Tree index for efficient key-value lookups
@@ -162,9 +165,14 @@ public:
 
   /**
    * @brief Get the root page ID
+   *
+   * Acquire load, paired with change_root's release store: a reader that
+   * observes a new root id also observes every write the publishing thread
+   * made to that root page before publishing it (the grown root is installed
+   * without holding its page latch, so this pairing is what orders its bytes).
    */
   [[nodiscard]] page_id_t root_page_id() const noexcept {
-    return root_page_id_.load(std::memory_order_relaxed);
+    return root_page_id_.load(std::memory_order_acquire);
   }
 
   /**
@@ -180,11 +188,25 @@ private:
   // ─────────────────────────────────────────────────────────────────────────
 
   /**
-   * @brief Find the leaf page that should contain the key
-   * @param key The key to search for
-   * @return Page ID of the leaf, or INVALID_PAGE_ID if tree is empty
+   * @brief Pin and read-latch the current root page.
+   *
+   * A writer can only move the root while holding the old root's write latch,
+   * so after latching we re-check root_page_id_ and retry if it moved between
+   * the snapshot and the latch. Returns the root pinned and read-latched (the
+   * caller must runlatch() then unpin_page()), or nullptr on an empty tree or
+   * fetch failure.
    */
-  [[nodiscard]] page_id_t find_leaf(KeyType key);
+  [[nodiscard]] Page *latch_root_read() const;
+
+  /**
+   * @brief Descend to the leaf that should contain @p key, read-latch-crabbing.
+   *
+   * Starts from latch_root_read(), then hand-over-hand takes each child's read
+   * latch and releases the parent. Returns the leaf pinned and holding its READ
+   * latch; the caller must runlatch() then unpin_page(). Returns nullptr on an
+   * empty tree or fetch failure.
+   */
+  [[nodiscard]] Page *descend_to_leaf_read(KeyType key);
 
   /**
    * @brief Create a new leaf page
@@ -198,56 +220,57 @@ private:
    */
   [[nodiscard]] Page *create_internal_page(page_id_t *page_id);
 
-  /**
-   * @brief Insert into a leaf, splitting if necessary
-   * @param leaf_page The leaf page
-   * @param key Key to insert
-   * @param value Value to insert
-   * @return Status and optional (split_key, new_page_id) if split occurred
-   */
-  struct InsertResult {
-    Status status;
-    bool did_split = false;
-    KeyType split_key = 0;
-    page_id_t new_page_id = INVALID_PAGE_ID;
-  };
-  [[nodiscard]] InsertResult insert_into_leaf(Page *leaf_page, KeyType key,
-                                              const ValueType &value);
+  // ─────────────────────────────────────────────────────────────────────────
+  // Structural-write helpers (latch-crabbing)
+  //
+  // These run while write_mutex_ is held and operate on the retained ancestor
+  // chain `path` (root-first, leaf-last) whose pages are write-latched in `ws`.
+  // Siblings and new pages are latched through `ws` on demand.
+  // ─────────────────────────────────────────────────────────────────────────
 
-  /**
-   * @brief Insert a new key into parent after a child split
-   */
-  [[nodiscard]] Status insert_into_parent(Page *old_page, KeyType key,
-                                          page_id_t new_page_id);
+  /// Propagate a split (@p up_key separating the node at path.back() from its
+  /// new right sibling @p up_child) up the retained @p path, splitting internal
+  /// nodes and growing a new root as needed.
+  [[nodiscard]] Status insert_into_parents(WriteSet &ws,
+                                           std::vector<page_id_t> &path,
+                                           KeyType up_key, page_id_t up_child);
 
-  /**
-   * @brief Update parent pointers for all children of an internal node
-   */
-  void update_children_parent(page_id_t parent_id,
-                              BPTreeInternalPage *internal);
+  /// Point every child of @p internal at @p parent_id (fixes parent pointers
+  /// after a split/merge moves children between nodes).
+  void reparent_children(page_id_t parent_id, BPTreeInternalPage &internal);
 
-  /**
-   * @brief Handle underflow in a leaf node after deletion
-   *
-   * Tries to borrow from siblings first, then merges if necessary.
-   * @param leaf_page The underfull leaf (still pinned by caller)
-   * @param page_to_delete_out If non-null, set to a page the caller must
-   *        delete_page after unpinning (the merged-away leaf on left-merge)
-   */
-  [[nodiscard]] Status handle_leaf_underflow(Page *leaf_page,
-                                             page_id_t *page_to_delete_out);
+  /// Set @p child_id's parent pointer to @p parent_id (no-op for INVALID).
+  ///
+  /// Deliberately latch-free (pin, write the field, unpin): parent_page_id is
+  /// written and read ONLY by structural writers, which write_mutex_
+  /// serializes, and readers never access the field. Latching here would have
+  /// to write-latch children LEFT of leaf latches the operation already holds
+  /// (e.g. a merged node's child 0), inverting the global left-to-right order
+  /// against leaf-chain scans -- the deadlock found in review.
+  void set_parent(page_id_t child_id, page_id_t parent_id);
 
-  /**
-   * @brief Handle underflow in an internal node after a child merge
-   *
-   * Tries to borrow from siblings first, then merges if necessary.
-   * @param internal_page The underfull internal node (still pinned by caller)
-   * @param page_to_delete_out If non-null, set to a page the caller must
-   *        delete_page after unpinning (the merged-away node on left-merge)
-   */
-  [[nodiscard]] Status
-  handle_internal_underflow(Page *internal_page,
-                            page_id_t *page_to_delete_out);
+  /// Rebalance an underfull leaf (path.back()) by borrowing from or merging with
+  /// a sibling, then propagate any resulting parent underflow.
+  [[nodiscard]] Status handle_leaf_underflow(WriteSet &ws,
+                                             std::vector<page_id_t> &path);
+
+  /// After a child merge removed a key from the node at path.back(), collapse
+  /// the root if it emptied, or rebalance the node if it underflowed.
+  [[nodiscard]] Status handle_parent_after_merge(WriteSet &ws,
+                                                 std::vector<page_id_t> &path);
+
+  /// Rebalance an underfull internal node (path.back()) by borrowing from or
+  /// merging with a sibling, then recurse upward.
+  [[nodiscard]] Status handle_internal_underflow(WriteSet &ws,
+                                                 std::vector<page_id_t> &path);
+
+  /// Release @p id from @p ws and delete it from the pool; if the pool refuses
+  /// (a reader in its unlatch-then-unpin window still holds a pin), queue the
+  /// id so a later structural write retries instead of leaking it on disk.
+  void free_page_or_defer(WriteSet &ws, page_id_t id);
+
+  /// Retry deallocation of pages refused earlier. Caller holds write_mutex_.
+  void drain_deferred_free();
 
   /**
    * @brief Assign a new root page id and notify the root-change callback
@@ -263,9 +286,21 @@ private:
   [[nodiscard]] std::vector<page_id_t> collect_tree_pages();
 
   std::shared_ptr<BufferPoolManager> buffer_pool_;
-  /// Atomic so the catalog can snapshot the root while a writer moves it.
+  /// Atomic so a reader can snapshot the root while a writer moves it.
   std::atomic<page_id_t> root_page_id_;
   std::function<void(page_id_t)> root_change_callback_;
+
+  /// Serializes structural writers (insert / remove / reclaim). Readers do NOT
+  /// take this; they synchronize with writers through per-page latches acquired
+  /// via crabbing. Serialization removes writer-vs-writer latch interactions;
+  /// reader-vs-writer deadlock freedom comes from the single global latch order
+  /// (ancestors before descendants, left before right) that every code path
+  /// honors. See the design notes in b_plus_tree.cpp.
+  std::mutex write_mutex_;
+
+  /// Page ids whose delete_page was refused by a transient reader pin.
+  /// Guarded by write_mutex_ (only structural writers touch it).
+  std::vector<page_id_t> deferred_free_;
 
   // Maximum sizes for nodes (computed once)
   uint32_t leaf_max_size_;
