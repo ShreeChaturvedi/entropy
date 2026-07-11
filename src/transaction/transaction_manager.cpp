@@ -5,6 +5,7 @@
 
 #include "transaction/transaction_manager.hpp"
 
+#include <algorithm>
 #include <shared_mutex>
 #include <unordered_set>
 
@@ -113,6 +114,20 @@ void TransactionManager::commit(Transaction* txn) {
 
     // Remove from active transactions
     txn_map_.erase(txn->txn_id());
+
+    // Garbage-collect version chains no remaining snapshot can observe. The
+    // bound is the oldest active snapshot, or the current clock value when
+    // idle (every retired version is then unreachable). Runs under mutex_;
+    // the store takes its own latch, and nothing the store calls ever takes
+    // mutex_, so the order is acyclic.
+    if (version_store_ && mvcc_) {
+        uint64_t min_active_start_ts = mvcc_->current_timestamp();
+        for (const auto& [id, active] : txn_map_) {
+            min_active_start_ts =
+                std::min(min_active_start_ts, active->start_ts());
+        }
+        version_store_->gc(min_active_start_ts);
+    }
 }
 
 void TransactionManager::abort(Transaction* txn) {
@@ -249,6 +264,13 @@ void TransactionManager::undo_write_record(const WriteRecord& record) {
             if (record.old_data.empty()) {
                 LOG_WARN("Abort undo DELETE missing old_data for ({},{})",
                          record.rid.page_id, record.rid.slot_id);
+                break;
+            }
+            // State-checked: a still-occupied slot means the physical delete
+            // never ran (e.g. a relocation that failed between its version
+            // conversion and the slot free) — nothing to restore.
+            Tuple existing;
+            if (heap->get_tuple(record.rid, &existing).ok()) {
                 break;
             }
             Tuple restored(record.old_data, record.rid);
