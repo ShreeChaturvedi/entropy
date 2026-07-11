@@ -13,6 +13,8 @@
 
 #include "execution/index_scan_executor.hpp"
 
+#include "execution/executor_context.hpp"
+
 namespace entropy {
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -93,7 +95,9 @@ std::optional<Tuple> IndexScanExecutor::next() {
     Tuple tuple;
     Status status = table_heap_->get_tuple(*point_lookup_rid_, &tuple);
     if (status.ok()) {
-      return tuple;
+      // Filter through the snapshot: the index still points at a RID whose
+      // heap version may be invisible to this transaction.
+      return mvcc_visible(ctx_, tuple);
     }
     return std::nullopt;
   }
@@ -113,9 +117,12 @@ std::optional<Tuple> IndexScanExecutor::next() {
       Tuple tuple;
       Status status = table_heap_->get_tuple(rid, &tuple);
       if (status.ok()) {
-        return tuple;
+        std::optional<Tuple> visible = mvcc_visible(ctx_, tuple);
+        if (visible.has_value()) {
+          return visible;
+        }
       }
-      // RID might be invalid (deleted), continue to next
+      // RID might be invalid (deleted) or invisible to this snapshot; continue.
     }
     return std::nullopt;
   }
@@ -130,9 +137,12 @@ std::optional<Tuple> IndexScanExecutor::next() {
       Tuple tuple;
       Status status = table_heap_->get_tuple(rid, &tuple);
       if (status.ok()) {
-        return tuple;
+        std::optional<Tuple> visible = mvcc_visible(ctx_, tuple);
+        if (visible.has_value()) {
+          return visible;
+        }
       }
-      // Continue to next if current RID invalid
+      // Continue to next if current RID invalid or invisible to this snapshot.
     }
     return std::nullopt;
   }
