@@ -19,7 +19,13 @@ class DiskManagerTest : public ::testing::Test {
 protected:
     void SetUp() override {
         temp_file_ = std::make_unique<test::TempFile>("dm_test_");
-        disk_manager_ = std::make_unique<FileDiskManager>(temp_file_->string());
+        // These cases exercise raw block-I/O plumbing (allocation, persistence,
+        // EOF zero-fill, dealloc/reuse) and compare full pages byte-for-byte, so
+        // they open in raw-store mode: checksums off, bytes round-trip untouched.
+        // The integrity layer has its own FileDiskManagerChecksumTest cases.
+        disk_manager_ = std::make_unique<FileDiskManager>(
+            temp_file_->string(), /*create_if_missing=*/true,
+            /*error_if_exists=*/false, /*enable_checksums=*/false);
     }
 
     void TearDown() override {
@@ -98,9 +104,11 @@ TEST_F(DiskManagerTest, Persistence) {
     auto status = disk_manager_->write_page(page_id, write_data);
     EXPECT_TRUE(status.ok());
 
-    // Close and reopen
+    // Close and reopen (raw-store mode, matching the fixture).
     disk_manager_.reset();
-    disk_manager_ = std::make_unique<FileDiskManager>(temp_file_->string());
+    disk_manager_ = std::make_unique<FileDiskManager>(
+        temp_file_->string(), /*create_if_missing=*/true,
+        /*error_if_exists=*/false, /*enable_checksums=*/false);
 
     char read_data[config::kDefaultPageSize];
     status = disk_manager_->read_page(page_id, read_data);
@@ -213,11 +221,12 @@ TEST(FileDiskManagerChecksumTest, RoundTripsAndDetectsTornPage) {
 }
 
 // The checksum stamp lives in the page header, so a manager with checksums
-// DISABLED (the default) round-trips arbitrary bytes untouched and never
-// rejects them — the opt-in must not change behavior for existing callers.
+// explicitly DISABLED round-trips arbitrary bytes untouched and never rejects
+// them — the raw-store mode must preserve every byte for callers that opt out.
 TEST(FileDiskManagerChecksumTest, DisabledLeavesBytesUntouched) {
     test::TempFile temp("dm_nocksum_");
-    FileDiskManager dm(temp.string());  // checksums off by default
+    FileDiskManager dm(temp.string(), /*create_if_missing=*/true,
+                       /*error_if_exists=*/false, /*enable_checksums=*/false);
     ASSERT_TRUE(dm.is_open());
     page_id_t page_id = dm.allocate_page();
 
@@ -231,6 +240,45 @@ TEST(FileDiskManagerChecksumTest, DisabledLeavesBytesUntouched) {
     ASSERT_TRUE(dm.read_page(page_id, read_back).ok());
     EXPECT_EQ(std::memcmp(page, read_back, sizeof(page)), 0)
         << "checksums-off must preserve every byte, header included";
+}
+
+// Checksums are ON by default: a manager constructed with no explicit flag
+// still stamps every write and catches a torn page at read time. This guards
+// the real engine's default path (Database/BufferPool construct FileDiskManager
+// without passing the flag).
+TEST(FileDiskManagerChecksumTest, EnabledByDefaultDetectsTornPage) {
+    test::TempFile temp("dm_default_cksum_");
+    page_id_t page_id = 0;
+    {
+        FileDiskManager dm(temp.string());  // default ctor: checksums on
+        ASSERT_TRUE(dm.is_open());
+        page_id = dm.allocate_page();
+
+        char page[config::kDefaultPageSize];
+        std::memset(page, 'A', sizeof(page));
+        ASSERT_TRUE(dm.write_page(page_id, page).ok());
+
+        char read_back[config::kDefaultPageSize];
+        EXPECT_TRUE(dm.read_page(page_id, read_back).ok())
+            << "a clean page must verify under the default configuration";
+    }
+
+    // Tear the durable image: flip one payload byte, leaving the stamp stale.
+    {
+        std::fstream f(temp.string(),
+                       std::ios::binary | std::ios::in | std::ios::out);
+        ASSERT_TRUE(f.is_open());
+        f.seekp(64, std::ios::beg);
+        const char corrupt = 'B';
+        f.write(&corrupt, 1);
+        ASSERT_TRUE(f.good());
+    }
+
+    FileDiskManager dm(temp.string());  // default ctor: checksums on
+    ASSERT_TRUE(dm.is_open());
+    char read_back[config::kDefaultPageSize];
+    Status s = dm.read_page(page_id, read_back);
+    EXPECT_EQ(s.code(), StatusCode::kCorruption) << s.to_string();
 }
 
 // A deallocated page id is handed back by the next allocate_page before the
