@@ -19,6 +19,14 @@ Status Parser::parse(std::unique_ptr<Statement> *result) {
   }
 
   has_error_ = false;
+
+  // The first token is fetched in the constructor, bypassing advance()'s lex
+  // error check, so validate it here before parsing begins.
+  if (current_.type == TokenType::INVALID) {
+    set_error("Lex error: " + current_.value);
+    return Status::InvalidArgument(error_.to_string());
+  }
+
   auto stmt = parse_statement();
 
   if (has_error_) {
@@ -45,7 +53,15 @@ Token Parser::current_token() { return current_; }
 
 Token Parser::peek_token() { return lexer_.peek_token(); }
 
-void Parser::advance() { current_ = lexer_.next_token(); }
+void Parser::advance() {
+  current_ = lexer_.next_token();
+  // An INVALID token is a lex error (unterminated string/comment, stray
+  // character). Surface it immediately with the lexer's message so it wins over
+  // any later, less specific parser error. set_error keeps the first error.
+  if (current_.type == TokenType::INVALID) {
+    set_error("Lex error: " + current_.value);
+  }
+}
 
 bool Parser::check(TokenType type) { return current_.type == type; }
 

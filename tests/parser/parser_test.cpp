@@ -947,5 +947,54 @@ TEST_F(BinderTest, BindIsNullUnknownColumn) {
   EXPECT_EQ(status.code(), StatusCode::kNotFound);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SQL surface gaps and lax lexing (issue #35)
+//
+// - DECIMAL/TIMESTAMP/DATE/CHAR must be declarable in CREATE TABLE.
+// - CREATE INDEX / DROP INDEX must parse into their own statement nodes.
+// - Unterminated string literals and block comments must be lex errors.
+// - Duplicate column names in CREATE TABLE / INSERT must be rejected.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// -- Lexer: malformed input must error, not be silently accepted -------------
+
+TEST_F(LexerTest, UnterminatedStringIsInvalidToken) {
+  Lexer lexer("'unterminated");
+  EXPECT_EQ(lexer.next_token().type, TokenType::INVALID);
+}
+
+TEST_F(LexerTest, UnterminatedStringWithEscapeIsInvalidToken) {
+  // A trailing backslash must not let the scanner consume the closing state and
+  // fall off the end silently.
+  Lexer lexer("'abc\\");
+  EXPECT_EQ(lexer.next_token().type, TokenType::INVALID);
+}
+
+TEST_F(LexerTest, UnterminatedBlockCommentIsInvalidToken) {
+  Lexer lexer("SELECT /* oops");
+  EXPECT_EQ(lexer.next_token().type, TokenType::SELECT);
+  EXPECT_EQ(lexer.next_token().type, TokenType::INVALID);
+}
+
+// Guard: a properly-closed block comment must still be skipped cleanly.
+TEST_F(LexerTest, SkipClosedBlockComment) {
+  Lexer lexer("SELECT /* comment */ *");
+  EXPECT_EQ(lexer.next_token().type, TokenType::SELECT);
+  EXPECT_EQ(lexer.next_token().type, TokenType::STAR);
+  EXPECT_EQ(lexer.next_token().type, TokenType::END_OF_FILE);
+}
+
+TEST_F(ParserTest, UnterminatedStringIsParseError) {
+  Parser parser("SELECT * FROM users WHERE name = 'unterminated");
+  std::unique_ptr<Statement> stmt;
+  EXPECT_FALSE(parser.parse(&stmt).ok());
+}
+
+TEST_F(ParserTest, UnterminatedBlockCommentIsParseError) {
+  Parser parser("SELECT * FROM users /* oops");
+  std::unique_ptr<Statement> stmt;
+  EXPECT_FALSE(parser.parse(&stmt).ok());
+}
+
 } // namespace
 } // namespace entropy
