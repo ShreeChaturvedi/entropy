@@ -73,14 +73,40 @@ struct ColumnDef {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * @brief Represents a SELECT column (can be * or specific columns)
+ * @brief Aggregate function applied to a SELECT column
+ *
+ * NONE marks an ordinary (non-aggregated) select item. The remaining values
+ * mirror the SQL aggregate set the execution engine supports.
+ */
+enum class AggregateFunc {
+  NONE,
+  COUNT_STAR, // COUNT(*)
+  COUNT,      // COUNT(expr)
+  SUM,
+  AVG,
+  MIN,
+  MAX,
+};
+
+/**
+ * @brief Represents a SELECT item
+ *
+ * A select item is one of:
+ * - a star (`*`)                       -> is_star = true
+ * - a plain column (`age`)             -> column_name set, expression null
+ * - a computed expression (`a + b`)    -> expression set
+ * - an aggregate (`SUM(age)`)          -> agg_func != NONE, expression = arg
+ *
+ * `alias` carries an explicit `AS name` (or a bare trailing alias) and becomes
+ * the output column's name when present.
  */
 struct SelectColumn {
   bool is_star = false;                   // SELECT *
-  std::string column_name;                // Column name
-  std::string table_alias;                // Optional table alias
-  std::string alias;                      // AS alias
-  std::unique_ptr<Expression> expression; // Computed column
+  std::string column_name;                // Column name (plain column ref)
+  std::string table_alias;                // Optional table qualifier (t.col)
+  std::string alias;                      // AS alias / output name
+  std::unique_ptr<Expression> expression; // Computed column or aggregate arg
+  AggregateFunc agg_func = AggregateFunc::NONE; // Aggregate wrapping, if any
 
   SelectColumn() = default;
 

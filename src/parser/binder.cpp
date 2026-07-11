@@ -35,12 +35,6 @@ enum class TypeFamily { kNumeric, kString, kBoolean, kUnknown };
   }
 }
 
-/// True if the SQL type belongs to the numeric family (ints and floats are
-/// mutually assignable with widening/narrowing conversions).
-[[nodiscard]] bool is_numeric_type(TypeId type) {
-  return type_family(type) == TypeFamily::kNumeric;
-}
-
 /// Human-readable family name for type-error messages.
 [[nodiscard]] const char *family_name(TypeFamily family) {
   switch (family) {
