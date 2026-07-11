@@ -121,9 +121,14 @@ private:
  * Uses dynamic directory doubling for growth.
  * Each bucket has a local depth ≤ global depth.
  *
- * Hash function: std::hash for key type
+ * Hash function: the Hash template parameter, defaulting to std::hash for the
+ * key type. It is exposed as a parameter (as std::unordered_map does) so tests
+ * can inject a deterministic, known-bit-pattern hash and construct precise
+ * split scenarios independent of any standard-library std::hash implementation.
  */
-template <typename KeyType, typename ValueType> class HashIndex {
+template <typename KeyType, typename ValueType,
+          typename Hash = std::hash<KeyType>>
+class HashIndex {
 public:
   /**
    * @brief Construct with initial global depth
@@ -184,7 +189,7 @@ private:
    * @brief Get directory index for a key
    */
   size_t get_index(const KeyType &key) const {
-    size_t hash = std::hash<KeyType>{}(key);
+    size_t hash = hasher_(key);
     return hash & ((1ULL << global_depth_) - 1);
   }
 
@@ -208,14 +213,15 @@ private:
   uint32_t global_depth_;
   std::vector<BucketPtr> directory_;
   mutable std::shared_mutex mutex_;
+  [[no_unique_address]] Hash hasher_{};
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Template Implementation
 // ─────────────────────────────────────────────────────────────────────────────
 
-template <typename KeyType, typename ValueType>
-HashIndex<KeyType, ValueType>::HashIndex(uint32_t initial_depth)
+template <typename KeyType, typename ValueType, typename Hash>
+HashIndex<KeyType, ValueType, Hash>::HashIndex(uint32_t initial_depth)
     : global_depth_(initial_depth) {
   size_t num_buckets = 1ULL << global_depth_;
   directory_.reserve(num_buckets);
@@ -225,9 +231,9 @@ HashIndex<KeyType, ValueType>::HashIndex(uint32_t initial_depth)
   }
 }
 
-template <typename KeyType, typename ValueType>
-Status HashIndex<KeyType, ValueType>::insert(const KeyType &key,
-                                             const ValueType &value) {
+template <typename KeyType, typename ValueType, typename Hash>
+Status HashIndex<KeyType, ValueType, Hash>::insert(const KeyType &key,
+                                                   const ValueType &value) {
   std::unique_lock lock(mutex_);
 
   size_t idx = get_index(key);
@@ -249,7 +255,7 @@ Status HashIndex<KeyType, ValueType>::insert(const KeyType &key,
   // must keep splitting at successively higher bits (growing the directory as
   // needed) until the keys finally separate. This is proper extendible-hashing
   // directory growth rather than giving up after one attempt.
-  const size_t key_hash = std::hash<KeyType>{}(key);
+  const size_t key_hash = hasher_(key);
   idx = get_index(key);
   while (directory_[idx]->is_full()) {
     // Guard against genuinely unsplittable keys: if every entry in the full
@@ -257,7 +263,7 @@ Status HashIndex<KeyType, ValueType>::insert(const KeyType &key,
     // them, so stop instead of growing the directory forever.
     bool separable = false;
     for (const auto &entry : directory_[idx]->entries()) {
-      if (std::hash<KeyType>{}(entry.first) != key_hash) {
+      if (hasher_(entry.first) != key_hash) {
         separable = true;
         break;
       }
@@ -277,8 +283,8 @@ Status HashIndex<KeyType, ValueType>::insert(const KeyType &key,
   return Status::InvalidArgument("Failed to insert after split");
 }
 
-template <typename KeyType, typename ValueType>
-Status HashIndex<KeyType, ValueType>::remove(const KeyType &key) {
+template <typename KeyType, typename ValueType, typename Hash>
+Status HashIndex<KeyType, ValueType, Hash>::remove(const KeyType &key) {
   std::unique_lock lock(mutex_);
 
   auto bucket = get_bucket(key);
@@ -288,15 +294,15 @@ Status HashIndex<KeyType, ValueType>::remove(const KeyType &key) {
   return Status::NotFound("Key not found");
 }
 
-template <typename KeyType, typename ValueType>
+template <typename KeyType, typename ValueType, typename Hash>
 std::optional<ValueType>
-HashIndex<KeyType, ValueType>::find(const KeyType &key) const {
+HashIndex<KeyType, ValueType, Hash>::find(const KeyType &key) const {
   std::shared_lock lock(mutex_);
   return get_bucket(key)->find(key);
 }
 
-template <typename KeyType, typename ValueType>
-size_t HashIndex<KeyType, ValueType>::size() const {
+template <typename KeyType, typename ValueType, typename Hash>
+size_t HashIndex<KeyType, ValueType, Hash>::size() const {
   std::shared_lock lock(mutex_);
   size_t total = 0;
   // Count unique buckets
@@ -317,8 +323,8 @@ size_t HashIndex<KeyType, ValueType>::size() const {
   return total;
 }
 
-template <typename KeyType, typename ValueType>
-void HashIndex<KeyType, ValueType>::split_bucket(size_t bucket_idx) {
+template <typename KeyType, typename ValueType, typename Hash>
+void HashIndex<KeyType, ValueType, Hash>::split_bucket(size_t bucket_idx) {
   auto old_bucket = directory_[bucket_idx];
   uint32_t local_depth = old_bucket->local_depth();
 
@@ -352,7 +358,7 @@ void HashIndex<KeyType, ValueType>::split_bucket(size_t bucket_idx) {
   std::vector<std::pair<KeyType, ValueType>> to_move;
 
   for (const auto &entry : entries) {
-    size_t hash = std::hash<KeyType>{}(entry.first);
+    size_t hash = hasher_(entry.first);
     if ((hash & split_bit) != 0) {
       to_move.push_back(entry);
     } else {
@@ -366,8 +372,8 @@ void HashIndex<KeyType, ValueType>::split_bucket(size_t bucket_idx) {
   }
 }
 
-template <typename KeyType, typename ValueType>
-void HashIndex<KeyType, ValueType>::grow_directory() {
+template <typename KeyType, typename ValueType, typename Hash>
+void HashIndex<KeyType, ValueType, Hash>::grow_directory() {
   size_t old_size = directory_.size();
   directory_.resize(old_size * 2);
 

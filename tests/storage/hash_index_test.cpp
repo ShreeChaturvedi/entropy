@@ -75,36 +75,60 @@ TEST_F(HashIndexTest, DirectoryGrowth) {
   EXPECT_GE(hash_index_->global_depth(), initial_depth);
 }
 
-// Regression: a bucket whose keys collide on many low hash bits needs more
-// than one split to relieve the overflow. std::hash<int32_t> is the identity
-// on libstdc++, so keys that are multiples of 1024 share their low 10 bits and
-// all land in the same bucket; the 257th such key can only be admitted after
-// the directory grows enough for the keys to separate at bit 10. The old code
-// split exactly once, moved nothing (every key shared the first split bit), and
-// then returned InvalidArgument. A correct implementation keeps splitting until
-// the key fits.
+// A hash that returns the key's own bit pattern. std::hash is
+// implementation-defined (libstdc++ and libc++ hash integers to themselves,
+// MSVC does not), so a multi-split scenario built from hand-picked std::hash
+// outputs only reproduces on some standard libraries. Injecting this identity
+// hash lets the test lay out the exact bits the split logic keys on, making the
+// scenario byte-for-byte identical on every platform. Production still defaults
+// to std::hash.
+struct IdentityHash {
+  size_t operator()(int32_t key) const {
+    return static_cast<size_t>(static_cast<uint32_t>(key));
+  }
+};
+
+// Regression for #6: relieving an overflowing bucket can need MORE than one
+// split. When every resident key plus the incoming key shares the current split
+// bit, redistribution moves nothing and the bucket stays full, so insert must
+// keep splitting at higher bits until the keys separate. The old code split
+// exactly once and then returned InvalidArgument.
+//
+// The scenario is driven by the injected identity hash, so it is independent of
+// the platform's std::hash. Starting at global depth 2 the directory is indexed
+// by the low 2 bits. Every key is a multiple of 16, so:
+//   - low 2 bits are 0        -> all keys start in the same bucket;
+//   - bits 2 and 3 are 0       -> the first two splits (at bit 2, then bit 3)
+//                                 move no entries and leave the bucket full,
+//                                 forcing yet another split;
+//   - bit 4 = (key / 16) & 1   -> differs across keys, so the third split
+//                                 finally separates them and admits the 257th
+//                                 (overflowing) key.
+// This provably requires three splits on any correct implementation, and is
+// unsatisfiable for a single-split one, on Linux, macOS, and Windows/MSVC alike.
 TEST_F(HashIndexTest, MultiSplitBucketOverflow) {
-  constexpr int32_t kStride = 1024;      // 2^10 — forces shared low bits
-  constexpr int kCount = 257;            // one past a full 256-entry bucket
-  const uint32_t initial_depth = hash_index_->global_depth();
+  HashIndex<int32_t, int64_t, IdentityHash> index(2);
+  constexpr int32_t kStride = 16; // 2^4: zeroes bits 0..3, varies bit 4
+  constexpr int kCount = 257;     // one past a full 256-entry bucket
+  const uint32_t initial_depth = index.global_depth();
 
   for (int i = 0; i < kCount; ++i) {
     const int32_t key = i * kStride;
-    ASSERT_TRUE(hash_index_->insert(key, key * 2).ok())
+    ASSERT_TRUE(index.insert(key, static_cast<int64_t>(key) * 2).ok())
         << "insert failed for key " << key << " (needs multiple splits)";
   }
 
   // Every key must be present and the total exact.
   for (int i = 0; i < kCount; ++i) {
     const int32_t key = i * kStride;
-    auto val = hash_index_->find(key);
+    auto val = index.find(key);
     ASSERT_TRUE(val.has_value()) << "missing key " << key;
     EXPECT_EQ(*val, static_cast<int64_t>(key) * 2);
   }
-  EXPECT_EQ(hash_index_->size(), static_cast<size_t>(kCount));
+  EXPECT_EQ(index.size(), static_cast<size_t>(kCount));
 
   // Relieving the overflow required growing well past a single split.
-  EXPECT_GT(hash_index_->global_depth(), initial_depth + 1);
+  EXPECT_GT(index.global_depth(), initial_depth + 1);
 }
 
 TEST_F(HashIndexTest, StringKeys) {
