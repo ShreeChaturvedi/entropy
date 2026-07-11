@@ -102,6 +102,7 @@ gtest_discover_tests(lock_manager_tests)
 add_executable(integration_tests
     integration/database_test.cpp
     integration/transaction_api_test.cpp
+    integration/api_safety_test.cpp
 )
 
 target_link_libraries(integration_tests
@@ -132,6 +133,23 @@ target_link_libraries(parser_tests
 )
 
 gtest_discover_tests(parser_tests)
+
+# Binder / expression type-checking tests (issue #34)
+add_executable(binder_type_check_tests
+    parser/binder_type_check_test.cpp
+)
+
+target_link_libraries(binder_type_check_tests
+    PRIVATE
+        entropy_parser
+        entropy_catalog
+        entropy_storage
+        test_utils
+        GTest::gtest
+        GTest::gtest_main
+)
+
+gtest_discover_tests(binder_type_check_tests)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shell utility tests
