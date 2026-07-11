@@ -552,19 +552,28 @@ TEST_F(TransactionApiTest, RolledBackDeleteSurvivesConcurrentSlotReuse) {
   // Concurrent INSERT into the same page while A's delete is uncommitted. With
   // the fix it lands on a fresh slot (never (P,0)); without it, it reuses (P,0),
   // places its bytes, and blocks on A's row lock until the rollback below.
-  std::atomic<bool> insert_started{false};
+  std::atomic<bool> insert_done{false};
   std::thread inserter([&] {
-    insert_started.store(true);
     auto ins = db.execute("INSERT INTO t VALUES (2, 20)"); // autocommit
     ASSERT_TRUE(ins.ok()) << ins.status().to_string();
+    insert_done.store(true);
   });
 
-  // Let the insert place its bytes (and, on the buggy path, block on the lock)
-  // before the deleter rolls back — that ordering is what triggered the loss.
-  while (!insert_started.load()) {
+  // Wait for the concurrent insert to actually complete while A's delete is
+  // still uncommitted — the ordering that triggers the slot reuse — rather than
+  // sleeping a fixed interval and hoping the insert has run. On a correct engine
+  // the insert skips the slot A's pending delete reserved, lands on a fresh
+  // slot, and commits without ever touching A's row lock, so it finishes here
+  // deterministically. The bounded deadline is only a regression guard: an
+  // insert that wrongly reused the slot would block on A's row lock and never
+  // signal, so we stop waiting and let the rollback below unblock it — the
+  // row-count assertions then fail cleanly instead of hanging. It never fires on
+  // a correct engine.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!insert_done.load() && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::yield();
   }
-  std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
   resume.store(true);
   deleter.join();

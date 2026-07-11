@@ -61,4 +61,16 @@
 # file does not mention. Reintroducing a reader-side latch inversion still trips
 # TSan (verified). Data-race reports are a different report type entirely and are
 # never matched by a `deadlock:` entry, so real races continue to fail CI.
+#
+# Frame must stay present under -O2
+# --------------------------------
+# This entry names one frame, so it only matches while relatch_entry is a real
+# stack frame. relatch_entry is a small static helper that the optimizer would
+# inline per call site at the -O2 the sanitizer build uses, dropping it from
+# some cycles' symbolized stacks and letting those benign reports slip past this
+# suppression on some runs (an intermittent tsan-CI failure). It is therefore
+# marked ENTROPY_NOINLINE in src/storage/b_plus_tree.cpp so the frame is always
+# present and every benign writer cycle matches deterministically. Do NOT remove
+# that attribute without widening this suppression to the enclosing writer-only
+# frames (WriteSet::acquire / track), or the reports come back intermittently.
 deadlock:entropy::WriteSet::relatch_entry
