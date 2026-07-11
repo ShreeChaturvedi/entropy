@@ -36,7 +36,7 @@ protected:
         std::filesystem::remove(db_file_);
 
         // Create disk manager and buffer pool
-        disk_manager_ = std::make_shared<DiskManager>(db_file_.string());
+        disk_manager_ = std::make_shared<FileDiskManager>(db_file_.string());
         buffer_pool_ = std::make_shared<BufferPoolManager>(100, disk_manager_);
     }
 

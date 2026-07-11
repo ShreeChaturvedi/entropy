@@ -61,6 +61,7 @@ add_library(entropy_catalog STATIC
     catalog/column.cpp
     catalog/schema.cpp
     catalog/catalog.cpp
+    catalog/catalog_manifest.cpp
 )
 
 target_include_directories(entropy_catalog
@@ -84,6 +85,7 @@ add_library(entropy_transaction STATIC
     transaction/transaction_manager.cpp
     transaction/lock_manager.cpp
     transaction/log_record.cpp
+    transaction/version_store.cpp
     transaction/wal.cpp
     transaction/recovery.cpp
     transaction/mvcc.cpp
