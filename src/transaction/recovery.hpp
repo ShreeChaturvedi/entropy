@@ -21,6 +21,7 @@
  */
 
 #include <memory>
+#include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -84,19 +85,25 @@ public:
    * setups) no pages can be flushed and the record carries no anchor,
    * which makes recovery fall back to a full page-LSN-gated scan.
    *
-   * IMPORTANT: the recorded anchor is only sound when no writer runs
-   * concurrently with this call. A writer that obtained an LSN before the
-   * anchor was captured but dirtied its page after flush_all_pages would be
-   * skipped by anchored redo yet not be durable on disk. Concurrency is not
-   * wired yet; when WP7 wires concurrent writers, checkpointing must either
-   * quiesce writers for the flush window or record a real dirty-page-table
-   * anchor (min recLSN) instead.
+   * Anchor soundness under concurrency: the anchor is only safe when every
+   * record older than it is durably reflected on disk pages by the time
+   * flush_all_pages returns. Pass @p write_barrier (the
+   * TransactionManager::checkpoint_barrier()) so the anchor capture + WAL flush
+   * + page flush window is taken EXCLUSIVELY against it. Logging writers hold
+   * that barrier SHARED across their WAL append + page-LSN stamp, so no writer
+   * can hold a sub-anchor LSN whose page is not yet stamped and flushed. Without
+   * a barrier this remains single-threaded-only (a concurrent writer that
+   * appended a record but not yet dirtied its page could be skipped by anchored
+   * redo without being durable).
    *
    * @param active_txn_ids List of currently active transaction IDs
+   * @param write_barrier  Optional writer-quiesce latch (see above); nullptr
+   *                       keeps the historical single-threaded contract.
    * @return Status indicating success or failure
    */
   [[nodiscard]] Status
-  create_checkpoint(const std::vector<txn_id_t> &active_txn_ids);
+  create_checkpoint(const std::vector<txn_id_t> &active_txn_ids,
+                    std::shared_mutex *write_barrier = nullptr);
 
   // ─────────────────────────────────────────────────────────────────────────
   // Accessors for testing
