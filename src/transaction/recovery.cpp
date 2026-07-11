@@ -148,8 +148,10 @@ Status RecoveryManager::create_checkpoint(
     if (!flush_status.ok()) {
       return flush_status;
     }
-    buffer_pool_->flush_all_pages();
-    return Status::Ok();
+    // The anchor is a promise that every pre-anchor effect is on disk; a page
+    // that failed to flush breaks that promise, so surface the error rather
+    // than record an unsound anchor.
+    return buffer_pool_->flush_all_pages();
   };
 
   lsn_t begin_lsn = INVALID_LSN;
