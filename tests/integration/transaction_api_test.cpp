@@ -634,6 +634,177 @@ TEST_F(TransactionApiTest, FailedStatementPoisonsExplicitTransaction) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Abandoned sessions and recycled thread ids (#87)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A thread that opens an explicit transaction, mutates a row (taking its X
+// lock), and exits without commit or rollback must not leak that lock until a
+// timeout: the transaction is rolled back deterministically when the thread
+// exits. The follow-up autocommit update below acquires the same row lock and
+// commits promptly, and the abandoned write never becomes visible.
+TEST_F(TransactionApiTest, AbandonedTransactionReleasesLocksOnThreadExit) {
+  Database db(path_);
+  ASSERT_TRUE(db.execute("CREATE TABLE t (id INTEGER, v INTEGER)").ok());
+  ASSERT_TRUE(db.execute("INSERT INTO t VALUES (1, 0)").ok());
+
+  std::thread worker([&] {
+    ASSERT_TRUE(db.begin_transaction().ok());
+    ASSERT_TRUE(db.execute("UPDATE t SET v = 111 WHERE id = 1").ok());
+    // Thread returns here with the transaction still open: no commit, no
+    // rollback. join() below guarantees its exit guard has run.
+  });
+  worker.join();
+
+  // The abandoned transaction was rolled back on thread exit.
+  auto after = db.execute("SELECT v FROM t WHERE id = 1");
+  ASSERT_TRUE(after.ok()) << after.status().to_string();
+  ASSERT_EQ(after.row_count(), 1u);
+  EXPECT_EQ(after.rows()[0][0].as_int32(), 0)
+      << "abandoned update must be rolled back on thread exit";
+
+  // Its X lock was released, not leaked: this autocommit update takes the same
+  // row lock and succeeds without waiting on a timeout.
+  auto upd = db.execute("UPDATE t SET v = 222 WHERE id = 1");
+  ASSERT_TRUE(upd.ok()) << upd.status().to_string();
+  auto final_read = db.execute("SELECT v FROM t WHERE id = 1");
+  ASSERT_TRUE(final_read.ok()) << final_read.status().to_string();
+  ASSERT_EQ(final_read.row_count(), 1u);
+  EXPECT_EQ(final_read.rows()[0][0].as_int32(), 222);
+}
+
+// An explicit transaction still open at database teardown (its owner never
+// committed or rolled back) is rolled back deterministically by close(), not
+// left to leak. After a clean reopen the abandoned write is gone.
+TEST_F(TransactionApiTest, AbandonedTransactionRolledBackAtTeardown) {
+  {
+    Database db(path_);
+    ASSERT_TRUE(db.execute("CREATE TABLE t (id INTEGER, v INTEGER)").ok());
+    ASSERT_TRUE(db.execute("INSERT INTO t VALUES (1, 0)").ok());
+    ASSERT_TRUE(db.begin_transaction().ok());
+    ASSERT_TRUE(db.execute("UPDATE t SET v = 111 WHERE id = 1").ok());
+    EXPECT_TRUE(db.in_transaction());
+    // db leaves scope here with the transaction open: teardown must roll it
+    // back.
+  }
+  Database db(path_);
+  auto result = db.execute("SELECT v FROM t WHERE id = 1");
+  ASSERT_TRUE(result.ok()) << result.status().to_string();
+  ASSERT_EQ(result.row_count(), 1u);
+  EXPECT_EQ(result.rows()[0][0].as_int32(), 0)
+      << "abandoned update must be rolled back at teardown";
+}
+
+// After a thread abandons a transaction and exits, its thread id may be
+// recycled by the OS for a later, unrelated session. That new session must get
+// a FRESH transaction: it is never told it is "already in a transaction" from
+// the stale binding, never sees the abandoned uncommitted write, and its own
+// explicit transaction commits cleanly.
+//
+// The recycled-id state is reproduced DETERMINISTICALLY via a test seam rather
+// than by hoping the OS recycles a std::thread::id: after opening an explicit
+// transaction and writing (uncommitted), orphan_current_session_for_testing()
+// leaves that binding under this thread's id but stamped with a session
+// identity this thread no longer owns — byte-for-byte the state a recycled id
+// inherits. Everything after the orphan runs as the fresh session that landed
+// on the recycled id. This exercises #87's identity validation on every
+// platform (Linux/macOS/Windows) with no reliance on OS thread-id reuse; the
+// natural end-to-end reuse path is additionally covered, where the OS actually
+// recycles ids, by RecycledThreadIdNaturalReuse below.
+TEST_F(TransactionApiTest, RecycledThreadIdGetsFreshTransaction) {
+  Database db(path_);
+  ASSERT_TRUE(db.execute("CREATE TABLE t (id INTEGER, v INTEGER)").ok());
+  ASSERT_TRUE(db.execute("INSERT INTO t VALUES (1, 0)").ok());
+
+  // A prior session opens an explicit transaction and writes, uncommitted...
+  ASSERT_TRUE(db.begin_transaction().ok());
+  ASSERT_TRUE(db.execute("UPDATE t SET v = 111 WHERE id = 1").ok());
+  // ...then its thread id is recycled: the binding stays under this id but now
+  // belongs to a session this caller does not own.
+  db.orphan_current_session_for_testing();
+
+  // Everything below runs as the FRESH session that landed on the recycled id.
+
+  // 1. Isolation: it sees the baseline, never the abandoned uncommitted write.
+  //    (Reads are lock-free MVCC snapshots, so this does not block on the still-
+  //    held row lock of the abandoned transaction.)
+  auto seen = db.execute("SELECT v FROM t WHERE id = 1");
+  ASSERT_TRUE(seen.ok()) << seen.status().to_string();
+  ASSERT_EQ(seen.row_count(), 1u);
+  EXPECT_EQ(seen.rows()[0][0].as_int32(), 0)
+      << "fresh session inherited the abandoned transaction's write";
+
+  // 2. begin_transaction() is NOT rejected as "already in a transaction" by the
+  //    stale binding; it rolls the abandoned transaction back (releasing its
+  //    locks) and rebinds this session freshly.
+  Status begun = db.begin_transaction();
+  EXPECT_TRUE(begun.ok()) << begun.to_string();
+  ASSERT_TRUE(db.execute("UPDATE t SET v = 222 WHERE id = 1").ok());
+  EXPECT_TRUE(db.commit().ok());
+
+  // 3. The abandoned write is gone and the fresh session's committed write
+  //    stands — proving the abandoned transaction's row lock was released (this
+  //    UPDATE never blocked on it) and its write was undone.
+  auto after = db.execute("SELECT v FROM t WHERE id = 1");
+  ASSERT_TRUE(after.ok()) << after.status().to_string();
+  ASSERT_EQ(after.row_count(), 1u);
+  EXPECT_EQ(after.rows()[0][0].as_int32(), 222);
+}
+
+// End-to-end companion to the deterministic seam test above: exercise the FULL
+// recycled-id lifecycle on platforms whose OS actually recycles a freshly-freed
+// std::thread::id (Linux/macOS reliably do). A thread abandons a transaction
+// and exits — its thread-exit guard rolls the transaction back and clears the
+// binding — and a sequentially-spawned thread reuses the just-freed id. That
+// reused id must behave as a fresh session. On platforms that do not recycle an
+// id within the bounded attempts (observed on Windows/MSVC), this SKIPS rather
+// than fails: the guarantee is still deterministically covered everywhere by
+// RecycledThreadIdGetsFreshTransaction.
+TEST_F(TransactionApiTest, RecycledThreadIdNaturalReuse) {
+  Database db(path_);
+  ASSERT_TRUE(db.execute("CREATE TABLE t (id INTEGER, v INTEGER)").ok());
+  ASSERT_TRUE(db.execute("INSERT INTO t VALUES (1, 0)").ok());
+
+  std::thread::id abandoned_id;
+  std::thread abandoner([&] {
+    abandoned_id = std::this_thread::get_id();
+    ASSERT_TRUE(db.begin_transaction().ok());
+    ASSERT_TRUE(db.execute("UPDATE t SET v = 111 WHERE id = 1").ok());
+    // Abandon: fall off the end with the transaction still open.
+  });
+  abandoner.join();
+
+  // Spawn fresh sessions until one lands on the recycled thread id. Every new
+  // session — matched id or not — must behave as a fresh session.
+  bool observed_reuse = false;
+  for (int attempt = 0; attempt < 64 && !observed_reuse; ++attempt) {
+    std::thread fresh([&] {
+      if (std::this_thread::get_id() == abandoned_id) {
+        observed_reuse = true;
+      }
+      // A fresh session sees the rolled-back baseline, not the abandoned write.
+      auto seen = db.execute("SELECT v FROM t WHERE id = 1");
+      ASSERT_TRUE(seen.ok()) << seen.status().to_string();
+      ASSERT_EQ(seen.row_count(), 1u);
+      EXPECT_NE(seen.rows()[0][0].as_int32(), 111)
+          << "fresh session inherited the abandoned transaction's write";
+      // begin_transaction must succeed (not rejected as "already in a
+      // transaction" by a stale binding on this recycled id) and commit
+      // cleanly.
+      Status begun = db.begin_transaction();
+      EXPECT_TRUE(begun.ok()) << begun.to_string();
+      EXPECT_TRUE(db.execute("SELECT v FROM t WHERE id = 1").ok());
+      EXPECT_TRUE(db.commit().ok());
+    });
+    fresh.join();
+  }
+  if (!observed_reuse) {
+    GTEST_SKIP() << "OS did not recycle the freed thread id within 64 attempts "
+                    "on this platform; the recycled-id guarantee is covered "
+                    "deterministically by RecycledThreadIdGetsFreshTransaction";
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // DDL page reuse vs. recovery
 // ─────────────────────────────────────────────────────────────────────────────
 

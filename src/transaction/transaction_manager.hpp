@@ -104,6 +104,21 @@ public:
     [[nodiscard]] Transaction* get_transaction(txn_id_t txn_id);
 
     /**
+     * @brief Is @p txn_id a live transaction still identified by @p txn?
+     *
+     * True only when the active set holds @p txn_id AND it still maps to the
+     * same Transaction object. A session validates a cached thread->transaction
+     * binding through this before reusing it: once its transaction has
+     * committed or aborted (erased from the active set) the check fails, so a
+     * recycled thread id that inherited a stale binding starts a fresh
+     * transaction instead of misbinding to a dead one. Compares the pointer
+     * without dereferencing it, so it is safe to call with a possibly-stale
+     * binding.
+     */
+    [[nodiscard]] bool is_active_transaction(txn_id_t txn_id,
+                                             const Transaction* txn) const;
+
+    /**
      * @brief Get all active transaction IDs
      */
     [[nodiscard]] std::vector<txn_id_t> get_active_txn_ids() const;
