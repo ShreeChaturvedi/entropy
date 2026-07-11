@@ -69,39 +69,38 @@ the storage engine.
 
 ### SQL Frontend
 
-- Hand-written recursive-descent parser builds an AST for SELECT, INSERT, UPDATE,
-  DELETE, CREATE TABLE, CREATE INDEX, DROP TABLE, DROP INDEX, and EXPLAIN.
-- Binder resolves names and types against catalog metadata and rejects type
-  errors at bind time (for example comparing a string column to a numeric literal).
+- Recursive-descent parser: SELECT/INSERT/UPDATE/DELETE, CREATE/DROP, EXPLAIN.
+- Binder resolves names and types, rejecting type errors at bind time.
 
 ### Planning and Optimization
 
 - Statistics track row counts and simple selectivity estimates.
 - Cost model compares index scans and sequential scans for predicates.
-- Index selector chooses point lookup and range scan paths when an index exists.
-- Join method is chosen by cost: hash join for equi-joins, nested loop otherwise.
+- Index selector picks point-lookup or range-scan paths when an index exists.
+- Join method chosen by cost: hash for equi-joins, nested loop otherwise.
 
 ### Execution
 
-- Iterator operators for seq scan, index scan, hash join, nested loop join, sort, aggregate, filter, and limit.
-- Projection and DML executors materialize rows and apply insert, update, and delete.
+- Scan and join operators: seq scan, index scan, hash and nested-loop join.
+- Sort, aggregate, filter, and limit operators.
+- Projection and DML executors apply insert, update, and delete.
 
 ### Transactions and Recovery
 
-- MVCC version store with snapshot-isolation visibility and first-updater-wins
-  write-write conflict detection.
-- Lock manager with wait-for-graph deadlock detection and wait-die victim
-  selection. Rollback undoes writes through compensation log records.
-- Write-ahead log is fsync'd on commit. ARIES-style recovery runs analysis,
-  redo, and undo phases, anchored at the last checkpoint with page-LSN-gated redo.
+- MVCC version store: snapshot isolation, first-updater-wins conflicts.
+- Lock manager with wait-for-graph deadlock detection, wait-die victims.
+- Rollback undoes writes through compensation log records.
+- Write-ahead log fsync'd on commit, replayed on recovery.
+- ARIES-style recovery in analysis, redo, and undo phases from a checkpoint.
+- Redo is page-LSN-gated and idempotent, so recovery is safe to re-run.
 
 ### Storage and Buffering
 
 - Slotted pages back a table heap for variable length tuples.
 - B+ tree and extendible hash indexes support range and point access.
 - Buffer pool uses an LRU replacer with pin and dirty tracking.
-- Disk manager handles page and WAL IO and verifies a CRC-32 checksum on every
-  page read, so torn writes and bit rot surface as an explicit corruption error.
+- Disk manager handles page and WAL IO.
+- CRC-32 verified on every page read, catching torn writes and bit rot.
 
 ## Crash Simulation
 
@@ -110,15 +109,12 @@ drives the engine through fault-injected storage and replays failures from a
 seed. One 64-bit seed drives independent PRNG streams for the workload, the page
 device, and the log store, so a failing schedule replays byte for byte.
 
-- `SimDiskManager` and `SimLogStore` stand in for the file backend and model a
-  durability boundary at `fsync`. On a simulated crash, unsynced page and log
-  writes resolve to lost, torn, or durably-kept outcomes, and transient write
-  errors can be injected on the way there.
-- Named, replayable schedules place the crash at specific points, for example
-  between the WAL flush and the page flush, or partway through the WAL tail.
-- After each crash the harness reopens the database, runs recovery, and checks
-  invariants against an oracle: every committed row is present byte for byte,
-  and no uncommitted or rolled-back write is visible.
+- `SimDiskManager` and `SimLogStore` replace the file backend.
+- A crash keeps fsync'd writes and drops or tears the unsynced ones.
+- Transient write errors are injectable at the same seam.
+- Named schedules place the crash between WAL and page flush, replayable.
+- After a crash, recovery runs and an oracle checks its result.
+- Every committed row must survive, no uncommitted write visible.
 
 Run a sweep of seeds:
 
@@ -243,10 +239,9 @@ ctest --preset dev
 ## CI/CD and Releases
 
 - CI builds and tests on Linux/macOS/Windows via GitHub Actions.
-- AddressSanitizer + UBSan and ThreadSanitizer jobs run the full suite on Linux.
-- A downstream job installs the package and consumes it through
-  `find_package(entropy)` linking `entropy::entropy`, proving the exported
-  package config is usable.
+- ASan, UBSan, and TSan jobs run the full suite on Linux.
+- A downstream job installs the package and consumes it with `find_package`.
+- It links `entropy::entropy`, proving the exported config is usable.
 - Releases are created automatically on `v*` tags with OS-specific binaries.
 
 ## Roadmap
@@ -255,10 +250,8 @@ The heap is the authoritative copy and always reflects writes. Sequential scans
 and the transactional engine do not use secondary indexes, so the gaps below do
 not affect them. Secondary indexes are scoped roadmap work:
 
-- Equality on a non-unique indexed column returns a single row, and index build
-  drops duplicate keys ([#8](https://github.com/ShreeChaturvedi/entropy/issues/8)).
-- INSERT, UPDATE, and DELETE do not yet maintain secondary indexes, so an index
-  can desync from the heap after writes ([#11](https://github.com/ShreeChaturvedi/entropy/issues/11)).
+- Non-unique index equality returns one row, build drops duplicates ([#8]).
+- INSERT, UPDATE, and DELETE do not update secondary indexes ([#11]).
 
 ## Documentation
 
@@ -268,3 +261,6 @@ not affect them. Secondary indexes are scoped roadmap work:
 ## License
 
 MIT. See `LICENSE`.
+
+[#8]: https://github.com/ShreeChaturvedi/entropy/issues/8
+[#11]: https://github.com/ShreeChaturvedi/entropy/issues/11
