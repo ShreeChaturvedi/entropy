@@ -2,19 +2,22 @@
 
 /**
  * @file recovery.hpp
- * @brief ARIES-style Crash Recovery Manager
+ * @brief ARIES-lite Crash Recovery Manager
  *
  * Implements the Analysis, Redo, Undo (ARU) recovery protocol:
  *
- * 1. Analysis Phase: Scan log from last checkpoint to build:
- *    - Active Transaction Table (ATT): transactions that were active at crash
- *    - Dirty Page Table (DPT): pages that may need redo
+ * 1. Analysis Phase: Scan the log to build the Active Transaction Table
+ *    (ATT: transactions uncommitted at crash), the committed set, the redo
+ *    anchor (the last checkpoint's begin_lsn), and the recovered next
+ *    transaction id.
  *
- * 2. Redo Phase: Replay all operations from the log to bring the database
- *    to the state it was in at the time of the crash.
+ * 2. Redo Phase: Repeat history from the redo anchor forward, applying each
+ *    page mutation only when the page LSN shows it is missing (idempotent).
  *
- * 3. Undo Phase: Rollback all uncommitted transactions by traversing
- *    their prevLSN chains in reverse order.
+ * 3. Undo Phase: Roll back all loser transactions in one merged global
+ *    reverse-LSN scan with state-checked inverse operations, flush the
+ *    compensated pages, then append an ABORT per loser (no CLRs; the
+ *    durability ordering plus idempotent undo make re-runs safe).
  */
 
 #include <memory>
