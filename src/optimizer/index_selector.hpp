@@ -7,12 +7,17 @@
  * IndexSelector decides when to use IndexScan vs SeqScan:
  * 1. Check if column has an index (via Catalog)
  * 2. Estimate costs of both approaches
- * 3. Choose lower cost option
+ * 3. Choose the lower-cost option
  *
- * Heuristics:
- * - Point lookup (=): Always prefer index if available
- * - Range scan (<, >, BETWEEN): Prefer index if selectivity < 30%
- * - Full scan: Prefer SeqScan (better sequential I/O)
+ * Access paths considered:
+ * - Point lookup (=): index seek + one random fetch
+ * - Range scan (<, <=, >, >=, and conjunctions on one column): index seek +
+ *   one random fetch per estimated matching row, where the row count comes
+ *   from the column's range selectivity
+ * - Full scan: SeqScan (sequential I/O)
+ *
+ * The lower estimated cost wins; there is no fixed selectivity cutoff. Range
+ * bounds are returned as inclusive B+ tree keys.
  */
 
 #include <memory>

@@ -5,6 +5,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
+
 #include "catalog/catalog.hpp"
 #include "catalog/column.hpp"
 #include "catalog/schema.hpp"
@@ -60,6 +62,36 @@ protected:
       RID rid;
       ASSERT_TRUE(table_info_->table_heap->insert_tuple(tuple, &rid).ok());
     }
+  }
+
+  // Highest key value present in a scaled indexed table's `k` column.
+  static constexpr BPTreeKey kDomainMax = 99900;
+
+  // Build an indexed table whose column `k` (index 1) spans [0, kDomainMax],
+  // then scale the cached row count to `simulated_rows`. An index scan only
+  // beats a sequential scan on a large table, so the two boundary rows pin the
+  // selectivity domain while the scaled row count drives the cost comparison.
+  TableInfo *make_scaled_indexed_table(const std::string &name,
+                                       size_t simulated_rows) {
+    Schema schema(
+        {Column("id", TypeId::INTEGER), Column("k", TypeId::INTEGER)});
+    EXPECT_TRUE(catalog_->create_table(name, schema).ok());
+    TableInfo *info = catalog_->get_table(name);
+    EXPECT_NE(info, nullptr);
+
+    for (int k : {0, static_cast<int>(kDomainMax)}) {
+      std::vector<TupleValue> values = {TupleValue(k), TupleValue(k)};
+      Tuple tuple(values, schema);
+      RID rid;
+      EXPECT_TRUE(info->table_heap->insert_tuple(tuple, &rid).ok());
+    }
+    EXPECT_TRUE(catalog_->create_index("idx_" + name + "_k", name, "k").ok());
+
+    statistics_->collect_statistics(info->oid);
+    if (simulated_rows > 2) {
+      statistics_->on_rows_inserted(info->oid, simulated_rows - 2);
+    }
+    return info;
   }
 
   std::shared_ptr<DiskManager> disk_manager_;
@@ -136,15 +168,59 @@ TEST_F(OptimizerTest, CollectStatisticsManyColumns) {
     ASSERT_NE(it, stats->columns.end()) << "missing stats for column " << c;
     const ColumnStatistics &cs = it->second;
     if (c == kNullColumn) {
-      // All-null column: no distinct non-null values, null_fraction == 1.0.
+      // All-null column: no distinct non-null values, null_fraction == 1.0,
+      // and no min/max were observed.
       EXPECT_DOUBLE_EQ(cs.null_fraction, 1.0) << "column " << c;
       EXPECT_DOUBLE_EQ(cs.distinct_values, 0.0) << "column " << c;
+      EXPECT_FALSE(cs.min_value.has_value()) << "column " << c;
+      EXPECT_FALSE(cs.max_value.has_value()) << "column " << c;
     } else {
-      // Non-null column: distinct_estimates == row_count, scaled by 0.9.
+      // Non-null column: every row holds a distinct value (r*100 + c), so the
+      // exact distinct-value count is kNumRows (not the old ~0.9 * rows fudge),
+      // with min at r=0 and max at r=kNumRows-1.
       EXPECT_DOUBLE_EQ(cs.null_fraction, 0.0) << "column " << c;
-      EXPECT_DOUBLE_EQ(cs.distinct_values, kNumRows * 0.9) << "column " << c;
+      EXPECT_DOUBLE_EQ(cs.distinct_values, static_cast<double>(kNumRows))
+          << "column " << c;
+      ASSERT_TRUE(cs.min_value.has_value()) << "column " << c;
+      ASSERT_TRUE(cs.max_value.has_value()) << "column " << c;
+      EXPECT_EQ(cs.min_value->as_integer(), static_cast<int>(c)) << "column "
+                                                                 << c;
+      EXPECT_EQ(cs.max_value->as_integer(),
+                (kNumRows - 1) * 100 + static_cast<int>(c))
+          << "column " << c;
     }
   }
+}
+
+// Issue #12: NDV was computed as 0.9 * non_null_rows, so a low-cardinality
+// column over many rows reported a nonsensically high distinct count (e.g. a
+// boolean over 1M rows -> ~900k). NDV must reflect the true distinct count.
+TEST_F(OptimizerTest, NdvReflectsTrueDistinctCount) {
+  Schema flags_schema({
+      Column("id", TypeId::INTEGER),
+      Column("flag", TypeId::INTEGER), // only two distinct values (0/1)
+  });
+  ASSERT_TRUE(catalog_->create_table("flags", flags_schema).ok());
+  TableInfo *flags_info = catalog_->get_table("flags");
+  ASSERT_NE(flags_info, nullptr);
+
+  constexpr int kRows = 200;
+  for (int i = 0; i < kRows; ++i) {
+    std::vector<TupleValue> values = {TupleValue(i), TupleValue(i % 2)};
+    Tuple tuple(values, flags_schema);
+    RID rid;
+    ASSERT_TRUE(flags_info->table_heap->insert_tuple(tuple, &rid).ok());
+  }
+
+  statistics_->collect_statistics(flags_info->oid);
+  const auto *stats = statistics_->get_table_stats(flags_info->oid);
+  ASSERT_NE(stats, nullptr);
+  EXPECT_EQ(stats->row_count, static_cast<size_t>(kRows));
+
+  // id is unique -> NDV == kRows; flag has exactly 2 distinct values.
+  EXPECT_DOUBLE_EQ(stats->columns.at(0).distinct_values,
+                   static_cast<double>(kRows));
+  EXPECT_DOUBLE_EQ(stats->columns.at(1).distinct_values, 2.0);
 }
 
 TEST_F(OptimizerTest, PredicateSelectivity) {
@@ -155,6 +231,94 @@ TEST_F(OptimizerTest, PredicateSelectivity) {
   double sel =
       statistics_->estimate_selectivity(table_info_->oid, eq_expr.get());
   EXPECT_DOUBLE_EQ(sel, Statistics::EQUALITY_SELECTIVITY);
+}
+
+// Builds `column CMP const`, binding the column to its schema index so the
+// optimizer can resolve it (the binder does this at runtime).
+static std::unique_ptr<ComparisonExpression>
+make_cmp(ComparisonType cmp, const std::string &column, size_t column_index,
+         TupleValue value) {
+  auto col = std::make_unique<ColumnRefExpression>(column);
+  col->set_column_index(column_index);
+  return std::make_unique<ComparisonExpression>(
+      cmp, std::move(col),
+      std::make_unique<ConstantExpression>(std::move(value)));
+}
+
+// Issue #12: equality selectivity was a flat 0.01 constant that ignored the
+// column's real distinct-value count. With stats, `col = const` must be 1/NDV.
+TEST_F(OptimizerTest, EqualitySelectivityUsesNdv) {
+  statistics_->collect_statistics(table_info_->oid);
+
+  // id: 100 distinct -> 1/100; age: 50 distinct (20..69, each twice) -> 1/50.
+  auto id_eq = make_cmp(ComparisonType::EQUAL, "id", 0, TupleValue(42));
+  auto age_eq = make_cmp(ComparisonType::EQUAL, "age", 2, TupleValue(30));
+  EXPECT_DOUBLE_EQ(
+      statistics_->estimate_selectivity(table_info_->oid, id_eq.get()),
+      1.0 / 100.0);
+  EXPECT_DOUBLE_EQ(
+      statistics_->estimate_selectivity(table_info_->oid, age_eq.get()),
+      1.0 / 50.0);
+
+  // Inequality is the complement of equality selectivity: 1 - 1/NDV.
+  auto age_neq = make_cmp(ComparisonType::NOT_EQUAL, "age", 2, TupleValue(30));
+  EXPECT_DOUBLE_EQ(
+      statistics_->estimate_selectivity(table_info_->oid, age_neq.get()),
+      1.0 - 1.0 / 50.0);
+}
+
+// Issue #12: logical connectives returned fixed constants and never recursed.
+TEST_F(OptimizerTest, LogicalSelectivityRecursesIntoOperands) {
+  statistics_->collect_statistics(table_info_->oid);
+
+  // id = 42 (1/100) AND age = 30 (1/50) -> product under independence.
+  auto conj = std::make_unique<LogicalExpression>(
+      LogicalOpType::AND,
+      make_cmp(ComparisonType::EQUAL, "id", 0, TupleValue(42)),
+      make_cmp(ComparisonType::EQUAL, "age", 2, TupleValue(30)));
+  EXPECT_DOUBLE_EQ(
+      statistics_->estimate_selectivity(table_info_->oid, conj.get()),
+      (1.0 / 100.0) * (1.0 / 50.0));
+
+  // OR combines by inclusion-exclusion: sL + sR - sL*sR.
+  auto disj = std::make_unique<LogicalExpression>(
+      LogicalOpType::OR,
+      make_cmp(ComparisonType::EQUAL, "id", 0, TupleValue(42)),
+      make_cmp(ComparisonType::EQUAL, "age", 2, TupleValue(30)));
+  double sl = 1.0 / 100.0;
+  double sr = 1.0 / 50.0;
+  EXPECT_DOUBLE_EQ(
+      statistics_->estimate_selectivity(table_info_->oid, disj.get()),
+      sl + sr - sl * sr);
+}
+
+// Issue #12: range selectivity must reflect the covered fraction of the
+// column's [min,max] domain, not a flat constant.
+TEST_F(OptimizerTest, RangeSelectivityFromMinMax) {
+  statistics_->collect_statistics(table_info_->oid);
+  // age domain is [20, 69] -> span of 50 integer values.
+  const column_id_t age_col = 2;
+
+  // age <= 24  -> {20..24} = 5/50.
+  EXPECT_DOUBLE_EQ(
+      statistics_->range_selectivity(table_info_->oid, age_col,
+                                     std::nullopt, BPTreeKey{24}),
+      5.0 / 50.0);
+  // Full domain -> 1.0.
+  EXPECT_DOUBLE_EQ(
+      statistics_->range_selectivity(table_info_->oid, age_col, BPTreeKey{20},
+                                     BPTreeKey{69}),
+      1.0);
+  // Entirely above the domain -> 0.0.
+  EXPECT_DOUBLE_EQ(
+      statistics_->range_selectivity(table_info_->oid, age_col, BPTreeKey{70},
+                                     std::nullopt),
+      0.0);
+  // Without collected stats, falls back to the Selinger 1/3 default.
+  EXPECT_DOUBLE_EQ(
+      statistics_->range_selectivity(9999, age_col, std::nullopt,
+                                     BPTreeKey{24}),
+      Statistics::RANGE_SELECTIVITY);
 }
 
 // CostModel Tests
@@ -174,6 +338,52 @@ TEST_F(OptimizerTest, IndexScanCost) {
 
   double cost = cost_model_->estimate_cost(index_scan.get());
   EXPECT_GT(cost, 0);
+}
+
+// Minimal plan node reporting a DML type, used to exercise the cost model's
+// default (INSERT/UPDATE/DELETE) branch, which has no concrete node class.
+class ModifyTestNode : public PlanNode {
+public:
+  explicit ModifyTestNode(const Schema *schema)
+      : PlanNode(PlanNodeType::INSERT), schema_(schema) {}
+  [[nodiscard]] const Schema *output_schema() const override { return schema_; }
+
+private:
+  const Schema *schema_;
+};
+
+// Issue #12: the DML/default cost branch set cost = children_cost and then
+// returned cost + children_cost, counting the child subtree twice.
+TEST_F(OptimizerTest, DmlCostDoesNotDoubleCountChild) {
+  auto child = std::make_unique<SeqScanPlanNode>(table_info_->oid,
+                                                 &output_schema_, nullptr);
+  double child_cost = cost_model_->estimate_cost(child.get());
+  ASSERT_GT(child_cost, 0.0);
+
+  auto modify = std::make_unique<ModifyTestNode>(&output_schema_);
+  modify->add_child(std::move(child));
+  double modify_cost = cost_model_->estimate_cost(modify.get());
+
+  // Child counted exactly once (no intrinsic DML cost), not doubled.
+  EXPECT_DOUBLE_EQ(modify_cost, child_cost);
+}
+
+// Issue #12: an index tuple fetch cost less than a sequential tuple (0.005 vs
+// 0.01) and ignored random I/O. The marginal cost of fetching one matching
+// tuple via the index must now exceed a plain sequential tuple.
+TEST_F(OptimizerTest, IndexFetchCostsMoreThanSequentialTuple) {
+  size_t rows = statistics_->table_cardinality(table_info_->oid);
+  double seek = std::log2(static_cast<double>(rows)) *
+                CostModel::RANDOM_PAGE_COST;
+
+  // Index full scan touches every row via random fetches.
+  auto index_full = std::make_unique<IndexScanPlanNode>(
+      table_info_->oid, 1, &output_schema_,
+      IndexScanPlanNode::ScanType::FULL_SCAN);
+  double full_cost = cost_model_->estimate_cost(index_full.get());
+
+  double marginal_per_tuple = (full_cost - seek) / static_cast<double>(rows);
+  EXPECT_GT(marginal_per_tuple, CostModel::TUPLE_CPU_COST);
 }
 
 TEST_F(OptimizerTest, CostComparison) {
@@ -271,6 +481,119 @@ TEST_F(OptimizerTest, IndexScanResolvesByOidNotColumnId) {
   EXPECT_EQ(wrong_row->get_value(output_schema_, 2).as_integer(), 42);
 }
 
+// Issue #12: the range branch was gated on `Statistics::RANGE_SELECTIVITY < 0.3`
+// (0.33 < 0.3), always false, so a range scan was never selected regardless of
+// how selective the predicate was. A selective range on a large indexed table
+// must now choose the index range scan.
+TEST_F(OptimizerTest, SelectiveRangeChoosesIndexRangeScan) {
+  TableInfo *big = make_scaled_indexed_table("big", 10'000'000);
+
+  // k < 100 covers ~0.1% of the [0, 99900] domain: index is far cheaper.
+  auto pred = make_cmp(ComparisonType::LESS_THAN, "k", 1, TupleValue(100));
+  auto sel = index_selector_->select_access_method(big->oid, pred.get());
+
+  ASSERT_TRUE(sel.use_index);
+  EXPECT_EQ(sel.scan_type, IndexScanPlanNode::ScanType::RANGE_SCAN);
+}
+
+// Issue #12: the flip side of the dead branch -- a broad range must stay on the
+// sequential scan because random per-tuple fetches cost more than a heap scan.
+TEST_F(OptimizerTest, BroadRangeStaysOnSeqScan) {
+  TableInfo *big = make_scaled_indexed_table("big", 10'000'000);
+
+  // k < 50000 covers ~half the domain: sequential scan wins.
+  auto pred = make_cmp(ComparisonType::LESS_THAN, "k", 1, TupleValue(50000));
+  auto sel = index_selector_->select_access_method(big->oid, pred.get());
+
+  EXPECT_FALSE(sel.use_index);
+}
+
+// Issue #12: `<` and `>` were treated identically to `<=`/`>=` (both bounds
+// inclusive), so `k < 100` incorrectly included k == 100. Bounds are now
+// returned as inclusive integer keys, so the exclusive operators are adjusted
+// by 1.
+TEST_F(OptimizerTest, RangeBoundsTrackInclusiveExclusive) {
+  TableInfo *big = make_scaled_indexed_table("big", 10'000'000);
+  auto choose = [&](std::unique_ptr<Expression> pred) {
+    return index_selector_->select_access_method(big->oid, pred.get());
+  };
+
+  // k < 100  -> inclusive end 99, no lower bound.
+  auto lt = choose(make_cmp(ComparisonType::LESS_THAN, "k", 1, TupleValue(100)));
+  ASSERT_TRUE(lt.use_index);
+  EXPECT_FALSE(lt.start_key.has_value());
+  ASSERT_TRUE(lt.end_key.has_value());
+  EXPECT_EQ(*lt.end_key, 99);
+
+  // k <= 100 -> inclusive end 100.
+  auto le =
+      choose(make_cmp(ComparisonType::LESS_EQUAL, "k", 1, TupleValue(100)));
+  ASSERT_TRUE(le.use_index);
+  ASSERT_TRUE(le.end_key.has_value());
+  EXPECT_EQ(*le.end_key, 100);
+
+  // k > 99800 -> inclusive start 99801, no upper bound.
+  auto gt =
+      choose(make_cmp(ComparisonType::GREATER_THAN, "k", 1, TupleValue(99800)));
+  ASSERT_TRUE(gt.use_index);
+  EXPECT_FALSE(gt.end_key.has_value());
+  ASSERT_TRUE(gt.start_key.has_value());
+  EXPECT_EQ(*gt.start_key, 99801);
+
+  // k >= 99800 -> inclusive start 99800.
+  auto ge = choose(
+      make_cmp(ComparisonType::GREATER_EQUAL, "k", 1, TupleValue(99800)));
+  ASSERT_TRUE(ge.use_index);
+  ASSERT_TRUE(ge.start_key.has_value());
+  EXPECT_EQ(*ge.start_key, 99800);
+}
+
+// Issue #12: only `column OP const` was recognized (`30 < age` was missed) and
+// there was no conjunction support. Both are now handled.
+TEST_F(OptimizerTest, RangeScanHandlesConstOpColumnAndConjunction) {
+  TableInfo *big = make_scaled_indexed_table("big", 10'000'000);
+
+  // `50 > k`  ==  k < 50  -> inclusive end 49 (constant on the left).
+  auto k_col = std::make_unique<ColumnRefExpression>("k");
+  k_col->set_column_index(1);
+  auto const_op = std::make_unique<ComparisonExpression>(
+      ComparisonType::GREATER_THAN,
+      std::make_unique<ConstantExpression>(TupleValue(50)), std::move(k_col));
+  auto s1 = index_selector_->select_access_method(big->oid, const_op.get());
+  ASSERT_TRUE(s1.use_index);
+  EXPECT_EQ(s1.scan_type, IndexScanPlanNode::ScanType::RANGE_SCAN);
+  EXPECT_FALSE(s1.start_key.has_value());
+  ASSERT_TRUE(s1.end_key.has_value());
+  EXPECT_EQ(*s1.end_key, 49);
+
+  // k >= 100 AND k < 200 -> inclusive [100, 199].
+  auto conj = std::make_unique<LogicalExpression>(
+      LogicalOpType::AND,
+      make_cmp(ComparisonType::GREATER_EQUAL, "k", 1, TupleValue(100)),
+      make_cmp(ComparisonType::LESS_THAN, "k", 1, TupleValue(200)));
+  auto s2 = index_selector_->select_access_method(big->oid, conj.get());
+  ASSERT_TRUE(s2.use_index);
+  EXPECT_EQ(s2.scan_type, IndexScanPlanNode::ScanType::RANGE_SCAN);
+  ASSERT_TRUE(s2.start_key.has_value());
+  ASSERT_TRUE(s2.end_key.has_value());
+  EXPECT_EQ(*s2.start_key, 100);
+  EXPECT_EQ(*s2.end_key, 199);
+}
+
+// Issue #12: a point lookup on a high-NDV indexed column of a large table must
+// prefer the index over a full sequential scan.
+TEST_F(OptimizerTest, EqualityOnLargeIndexedTablePrefersIndex) {
+  TableInfo *big = make_scaled_indexed_table("big", 10'000'000);
+
+  auto eq = make_cmp(ComparisonType::EQUAL, "k", 1, TupleValue(500));
+  auto sel = index_selector_->select_access_method(big->oid, eq.get());
+
+  ASSERT_TRUE(sel.use_index);
+  EXPECT_EQ(sel.scan_type, IndexScanPlanNode::ScanType::POINT_LOOKUP);
+  ASSERT_TRUE(sel.start_key.has_value());
+  EXPECT_EQ(*sel.start_key, 500);
+}
+
 // PlanNode Tests
 
 TEST_F(OptimizerTest, PlanNodeTypes) {
@@ -287,6 +610,41 @@ TEST_F(OptimizerTest, PlanNodeTypes) {
 
   auto limit = std::make_unique<LimitPlanNode>(10, 0, &output_schema_);
   EXPECT_EQ(limit->type(), PlanNodeType::LIMIT);
+}
+
+// Issue #12: filter cardinality was child_card * 0.1 for every predicate,
+// ignoring the predicate entirely. It must vary with the predicate shape.
+TEST_F(OptimizerTest, FilterCardinalityDependsOnPredicate) {
+  auto make_filter = [&](std::unique_ptr<Expression> pred) {
+    auto child = std::make_unique<SeqScanPlanNode>(table_info_->oid,
+                                                   &output_schema_, nullptr);
+    auto filter =
+        std::make_unique<FilterPlanNode>(std::move(pred), &output_schema_);
+    filter->add_child(std::move(child));
+    return filter;
+  };
+
+  size_t base = cost_model_->estimate_cardinality(
+      std::make_unique<SeqScanPlanNode>(table_info_->oid, &output_schema_,
+                                        nullptr)
+          .get());
+  ASSERT_EQ(base, 100u);
+
+  auto eq_filter =
+      make_filter(make_cmp(ComparisonType::EQUAL, "id", 0, TupleValue(42)));
+  auto range_filter =
+      make_filter(make_cmp(ComparisonType::LESS_THAN, "age", 2, TupleValue(30)));
+
+  size_t eq_card = cost_model_->estimate_cardinality(eq_filter.get());
+  size_t range_card = cost_model_->estimate_cardinality(range_filter.get());
+
+  // Equality (1/10 default) is more selective than a range (1/3 default), and
+  // the range no longer collapses to the old flat 0.1 result (10).
+  EXPECT_EQ(eq_card, static_cast<size_t>(static_cast<double>(base) *
+                                         Statistics::EQUALITY_SELECTIVITY));
+  EXPECT_EQ(range_card, static_cast<size_t>(static_cast<double>(base) *
+                                            Statistics::RANGE_SELECTIVITY));
+  EXPECT_LT(eq_card, range_card);
 }
 
 TEST_F(OptimizerTest, CardinalityEstimation) {
