@@ -39,6 +39,7 @@ int main(int argc, char **argv) {
   std::string capture;
   int cols = 120;
   int rows = 40;
+  double phase = -1.0;  // >= 0 drives the boot galaxy's animated sweep
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -49,10 +50,17 @@ int main(int argc, char **argv) {
         std::cerr << "entropy-tui: invalid --size (expected <cols>x<rows>)\n";
         return 2;
       }
+    } else if (arg == "--phase" && i + 1 < argc) {
+      try {
+        phase = std::stod(argv[++i]);
+      } catch (...) {
+        std::cerr << "entropy-tui: invalid --phase (expected a number)\n";
+        return 2;
+      }
     } else if (arg == "-h" || arg == "--help") {
       std::cout
           << "Usage: entropy-tui [--capture-frame <boot|dashboard|console>]"
-             " [--size <cols>x<rows>]\n";
+             " [--size <cols>x<rows>] [--phase <0..1>]\n";
       return 0;
     } else {
       std::cerr << "entropy-tui: unknown argument '" << arg << "'\n";
@@ -61,7 +69,7 @@ int main(int argc, char **argv) {
   }
 
   if (!capture.empty()) {
-    return entropy::tui::CaptureFrame(capture, cols, rows);
+    return entropy::tui::CaptureFrame(capture, cols, rows, phase);
   }
   return entropy::tui::RunApp();
 }
