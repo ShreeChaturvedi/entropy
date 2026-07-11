@@ -16,6 +16,7 @@
 
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 
@@ -150,8 +151,23 @@ public:
   static constexpr double RANGE_SELECTIVITY = 1.0 / 3.0;
 
 private:
+  // Lock-free implementations assuming mutex_ is already held. The public
+  // accessors take the lock once and delegate here, so recursive estimation
+  // (estimate_selectivity -> column_selectivity, range_selectivity ->
+  // get_table_stats) never re-enters the non-reentrant shared_mutex.
+  [[nodiscard]] double column_selectivity_impl(oid_t table_oid,
+                                               column_id_t column_id) const;
+  [[nodiscard]] double
+  estimate_selectivity_impl(oid_t table_oid, const Expression *predicate) const;
+  [[nodiscard]] const TableStatistics *
+  get_table_stats_impl(oid_t table_oid) const;
+
   std::shared_ptr<Catalog> catalog_;
   std::unordered_map<oid_t, TableStatistics> table_stats_;
+  // Guards table_stats_. Autocommit inserts mutate the map from worker threads
+  // while the optimizer reads cardinality/selectivity concurrently, so every
+  // accessor synchronizes here. Readers share; mutators take it exclusively.
+  mutable std::shared_mutex mutex_;
 };
 
 } // namespace entropy
