@@ -15,7 +15,7 @@
 
 namespace entropy {
 
-class ExecutorContext;
+struct ExecutorContext;
 
 /**
  * @brief True only when a predicate evaluated to boolean true.
