@@ -352,11 +352,12 @@ private:
     /**
      * @brief Abort another transaction chosen as a deadlock victim (latch held).
      *
-     * Releases the victim's GRANTED locks and wakes their queues so survivors
-     * acquire immediately, but leaves any request the victim is actively waiting
-     * on for the victim's own thread to clean up (only notifies it) to avoid a
-     * cross-thread iterator hazard. The victim's state is set to ABORTED so its
-     * waiter loop terminates on wake instead of stalling until timeout.
+     * Marks the victim ABORTED (with the deadlock mark, so
+     * TransactionManager::abort() still finalizes it) and wakes every queue it
+     * participates in. The victim's own thread then releases all of its locks
+     * and returns Aborted, so survivors acquire immediately instead of stalling
+     * until timeout. Its requests are never erased cross-thread: the victim's
+     * wait loops retain list iterators into the queues.
      */
     void abort_victim_locked(Transaction* victim);
 
