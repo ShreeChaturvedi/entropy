@@ -12,6 +12,8 @@
 
 #include "entropy/database.hpp"
 
+#include <atomic>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -48,6 +50,127 @@
 #include "transaction/wal.hpp"
 
 namespace entropy {
+
+namespace {
+
+// Process-global monotonic session-identity source. Every explicit-transaction
+// binding stamps the epoch its creating session held; a thread that reuses a
+// recycled OS thread id carries a different epoch (or none), so it can never be
+// mistaken for the session that created a stale binding.
+std::atomic<uint64_t> g_next_session_epoch{1};
+
+}  // namespace
+
+// Per-thread explicit-transaction binding. A null txn is a FAILED binding (its
+// transaction was aborted by a statement error) kept until the caller issues
+// rollback. txn_id + epoch identify the exact transaction and the exact session
+// that created the entry, so a recycled thread id can inherit neither.
+struct SessionBinding {
+  Transaction *txn = nullptr;
+  txn_id_t txn_id = INVALID_TXN_ID;
+  uint64_t epoch = 0;
+};
+
+// Shared between a DatabaseImpl and each of its threads' exit guards so an
+// abandoned session (a thread that opened an explicit transaction and exited
+// without commit/rollback) is rolled back deterministically at thread exit or
+// at database teardown, never left to leak its locks until a timeout.
+struct SessionTable {
+  std::mutex mutex;
+  std::unordered_map<std::thread::id, SessionBinding> bindings;
+  // The owning database's transaction manager, used by cleanup to abort an
+  // abandoned transaction. Valid while alive is true.
+  TransactionManager *txn_manager = nullptr;
+  // Cleared under mutex by the database's teardown so a later thread-exit guard
+  // never touches a half-destroyed database.
+  bool alive = true;
+};
+
+// Thread-local guard whose destructor runs at thread exit: it rolls back any
+// explicit transaction this thread abandoned in any database, releasing its
+// locks deterministically instead of leaking them until a timeout. A weak_ptr
+// to each database's SessionTable keeps this safe when the database was
+// destroyed first (the lock() then simply yields null). A thread id can only be
+// recycled by the OS after the thread fully exits — i.e. after this destructor
+// has run — so a fresh session on a recycled id never finds the prior session's
+// binding still present.
+class ThreadSessionGuard {
+public:
+  // Record (or refresh) this thread's session epoch in @p table so the exit
+  // path and the identity checks can find it.
+  void track(const std::shared_ptr<SessionTable> &table, uint64_t epoch) {
+    for (auto &e : entries_) {
+      if (e.table.lock() == table) {
+        e.epoch = epoch;
+        return;
+      }
+    }
+    entries_.push_back({table, epoch});
+  }
+
+  // Epoch this thread currently holds in @p table, or 0 if none. Distinguishes
+  // a binding this session owns from one left by a prior session that happened
+  // to run on the same (later recycled) thread id.
+  [[nodiscard]] uint64_t
+  epoch_for(const std::shared_ptr<SessionTable> &table) const {
+    for (const auto &e : entries_) {
+      if (e.table.lock() == table) {
+        return e.epoch;
+      }
+    }
+    return 0;
+  }
+
+  // Forget this thread's session in @p table after a clean commit/rollback, so
+  // the exit path does not try to roll back an already-unbound transaction.
+  void forget(const std::shared_ptr<SessionTable> &table) {
+    for (auto &e : entries_) {
+      if (e.table.lock() == table) {
+        e.epoch = 0;
+        return;
+      }
+    }
+  }
+
+  ~ThreadSessionGuard() {
+    const auto tid = std::this_thread::get_id();
+    for (auto &e : entries_) {
+      if (e.epoch == 0) {
+        continue;
+      }
+      auto table = e.table.lock();
+      if (!table) {
+        continue;
+      }
+      std::lock_guard<std::mutex> lock(table->mutex);
+      if (!table->alive) {
+        continue;
+      }
+      auto it = table->bindings.find(tid);
+      if (it == table->bindings.end() || it->second.epoch != e.epoch) {
+        continue;
+      }
+      Transaction *txn = it->second.txn;
+      const txn_id_t txn_id = it->second.txn_id;
+      table->bindings.erase(it);
+      // Roll back the abandoned transaction (undo writes + release locks),
+      // guarding against a stale pointer with the manager's identity check.
+      if (txn != nullptr && table->txn_manager != nullptr &&
+          table->txn_manager->is_active_transaction(txn_id, txn)) {
+        table->txn_manager->abort(txn);
+      }
+    }
+  }
+
+private:
+  struct Entry {
+    std::weak_ptr<SessionTable> table;
+    uint64_t epoch;
+  };
+  std::vector<Entry> entries_;
+};
+
+thread_local ThreadSessionGuard t_session_guard;
 
 class DatabaseImpl {
 public:
@@ -120,6 +243,10 @@ public:
     txn_manager_->set_mvcc(mvcc_);
     txn_manager_->set_version_store(version_store_);
     txn_manager_->set_buffer_pool(buffer_pool_.get());
+
+    // Share the transaction manager with the session table so a thread-exit
+    // guard (or teardown) can roll back an abandoned session's transaction.
+    sessions_->txn_manager = txn_manager_.get();
 
     // Crash recovery, BEFORE the catalog is constructed: recovery is
     // catalog-independent (it replays raw pages by page id), and the
@@ -735,16 +862,31 @@ public:
     if (!is_open_) {
       return Status::InvalidArgument("Database is not open");
     }
-    std::lock_guard<std::mutex> lock(session_mutex_);
     const auto tid = std::this_thread::get_id();
-    if (thread_txns_.count(tid) != 0) {
-      return Status::Error("Already in a transaction");
+    std::lock_guard<std::mutex> lock(sessions_->mutex);
+    auto it = sessions_->bindings.find(tid);
+    if (it != sessions_->bindings.end()) {
+      if (it->second.epoch == t_session_guard.epoch_for(sessions_)) {
+        // This thread's own session already has a transaction open.
+        return Status::Error("Already in a transaction");
+      }
+      // A stale binding left by a prior session whose thread id was recycled:
+      // roll back its abandoned transaction (releasing its locks) before this
+      // fresh session rebinds, so nothing leaks or is silently inherited.
+      if (it->second.txn != nullptr &&
+          txn_manager_->is_active_transaction(it->second.txn_id,
+                                              it->second.txn)) {
+        txn_manager_->abort(it->second.txn);
+      }
+      sessions_->bindings.erase(it);
     }
     Transaction *txn = txn_manager_->begin();
     if (txn == nullptr) {
       return Status::Internal("Failed to begin transaction");
     }
-    thread_txns_[tid] = txn;
+    const uint64_t epoch = g_next_session_epoch.fetch_add(1);
+    sessions_->bindings[tid] = SessionBinding{txn, txn->txn_id(), epoch};
+    t_session_guard.track(sessions_, epoch);
     return Status::Ok();
   }
 
@@ -782,6 +924,26 @@ public:
     Status result = Status::Ok();
     if (is_open_) {
       LOG_INFO("Closing database: {}", path_);
+      // Roll back any transaction a thread left bound but never committed or
+      // rolled back (an abandoned session). Undoing its writes and releasing
+      // its locks here — before the storage layers below are flushed and torn
+      // down — is the deterministic cleanup that keeps an abandoned session
+      // from leaking its locks until a timeout. Marking the table not-alive
+      // stops a later thread-exit guard from touching the half-destroyed
+      // database.
+      {
+        std::lock_guard<std::mutex> lock(sessions_->mutex);
+        sessions_->alive = false;
+        for (auto &entry : sessions_->bindings) {
+          SessionBinding &binding = entry.second;
+          if (binding.txn != nullptr &&
+              txn_manager_->is_active_transaction(binding.txn_id,
+                                                  binding.txn)) {
+            txn_manager_->abort(binding.txn);
+          }
+        }
+        sessions_->bindings.clear();
+      }
       // Clean shutdown: WAL first, then every dirty page. Surface the first
       // failure instead of swallowing it — a caller that checks close() must
       // be able to tell durability was not achieved.
@@ -805,6 +967,29 @@ public:
   // Test-only seam: hands out the internal Catalog pointer (see header).
   Catalog *catalog_for_testing() noexcept { return catalog_.get(); }
 
+  // Test-only seam (see header). Re-stamp the calling thread's explicit-
+  // transaction binding with a fresh session epoch this thread does not own,
+  // and drop this thread's guard ownership of it. The binding stays present
+  // under this thread's id but is now attributed to a different session —
+  // exactly the state a recycled OS thread id inherits from a prior, abandoned
+  // session. This drives the recycled-thread-id identity-validation path
+  // (begin_transaction / session_state reject a binding whose epoch this
+  // session does not hold) deterministically, with no dependence on the OS
+  // actually recycling a std::thread::id. It touches only the session-binding
+  // bookkeeping; no production code path calls it, so production behavior is
+  // unchanged.
+  void orphan_current_session_for_testing() {
+    std::lock_guard<std::mutex> lock(sessions_->mutex);
+    auto it = sessions_->bindings.find(std::this_thread::get_id());
+    if (it == sessions_->bindings.end()) {
+      return;
+    }
+    // A freshly minted, never-owned session identity: precisely what a recycled
+    // thread id carries relative to the prior session that left the binding.
+    it->second.epoch = g_next_session_epoch.fetch_add(1);
+    t_session_guard.forget(sessions_);
+  }
+
 private:
   /// Result of looking up the calling thread's explicit-transaction binding.
   struct SessionState {
@@ -813,33 +998,51 @@ private:
   };
 
   [[nodiscard]] SessionState session_state() const {
-    std::lock_guard<std::mutex> lock(session_mutex_);
-    auto it = thread_txns_.find(std::this_thread::get_id());
-    if (it == thread_txns_.end()) {
+    std::lock_guard<std::mutex> lock(sessions_->mutex);
+    auto it = sessions_->bindings.find(std::this_thread::get_id());
+    if (it == sessions_->bindings.end()) {
       return {};
     }
-    return {true, it->second};
+    if (it->second.epoch != t_session_guard.epoch_for(sessions_)) {
+      // The binding belongs to a prior session on a since-recycled thread id,
+      // not this caller. Ignore it so this session gets a fresh transaction
+      // instead of misbinding to the stale one.
+      return {};
+    }
+    // A live binding this session owns. If its transaction is somehow no longer
+    // active, treat it as a failed binding rather than hand back a dead one (a
+    // failed binding already carries a null txn).
+    if (it->second.txn != nullptr &&
+        !txn_manager_->is_active_transaction(it->second.txn_id,
+                                             it->second.txn)) {
+      return {true, nullptr};
+    }
+    return {true, it->second.txn};
   }
 
   /// Mark the calling thread's binding failed (its transaction was aborted);
   /// the binding survives until rollback/commit so later statements error.
   void mark_thread_txn_failed() {
-    std::lock_guard<std::mutex> lock(session_mutex_);
-    auto it = thread_txns_.find(std::this_thread::get_id());
-    if (it != thread_txns_.end()) {
-      it->second = nullptr;
+    std::lock_guard<std::mutex> lock(sessions_->mutex);
+    auto it = sessions_->bindings.find(std::this_thread::get_id());
+    if (it != sessions_->bindings.end() &&
+        it->second.epoch == t_session_guard.epoch_for(sessions_)) {
+      it->second.txn = nullptr;
+      it->second.txn_id = INVALID_TXN_ID;
     }
   }
 
   /// Remove the calling thread's binding, returning its state before removal.
   SessionState unbind_thread_txn() {
-    std::lock_guard<std::mutex> lock(session_mutex_);
-    auto it = thread_txns_.find(std::this_thread::get_id());
-    if (it == thread_txns_.end()) {
+    std::lock_guard<std::mutex> lock(sessions_->mutex);
+    auto it = sessions_->bindings.find(std::this_thread::get_id());
+    if (it == sessions_->bindings.end() ||
+        it->second.epoch != t_session_guard.epoch_for(sessions_)) {
       return {};
     }
-    SessionState state{true, it->second};
-    thread_txns_.erase(it);
+    SessionState state{true, it->second.txn};
+    sessions_->bindings.erase(it);
+    t_session_guard.forget(sessions_);
     return state;
   }
 
@@ -868,13 +1071,16 @@ private:
   std::shared_ptr<CostModel> cost_model_;
   std::unique_ptr<IndexSelector> index_selector_;
 
-  // Per-thread explicit transactions ("a connection is a thread"). A mapped
-  // null value is a FAILED binding: the transaction was aborted by a
-  // statement error or write-write conflict, and the entry stays until the
-  // caller issues rollback (or commit, which errors and clears) — statements
-  // meanwhile are rejected instead of silently autocommitting.
-  mutable std::mutex session_mutex_;
-  std::unordered_map<std::thread::id, Transaction *> thread_txns_;
+  // Per-thread explicit transactions ("a connection is a thread"), shared with
+  // each thread's exit guard so an abandoned session is rolled back
+  // deterministically (see SessionTable / ThreadSessionGuard). A binding with a
+  // null txn is a FAILED binding: the transaction was aborted by a statement
+  // error or write-write conflict, and the entry stays until the caller issues
+  // rollback (or commit, which errors and clears) — statements meanwhile are
+  // rejected instead of silently autocommitting. The per-entry epoch stamps
+  // which session owns it, so a recycled thread id gets a fresh transaction
+  // rather than inheriting a stale one.
+  std::shared_ptr<SessionTable> sessions_ = std::make_shared<SessionTable>();
 };
 
 Database::Database(const std::string &path, const DatabaseOptions &options)
@@ -916,6 +1122,12 @@ std::string_view Database::path() const noexcept {
 
 Catalog *Database::catalog_for_testing() noexcept {
   return impl_ ? impl_->catalog_for_testing() : nullptr;
+}
+
+void Database::orphan_current_session_for_testing() {
+  if (impl_) {
+    impl_->orphan_current_session_for_testing();
+  }
 }
 
 } // namespace entropy
