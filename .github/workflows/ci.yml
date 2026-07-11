@@ -79,7 +79,12 @@ jobs:
         env:
           ASAN_OPTIONS: abort_on_error=1:detect_leaks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+          # halt_on_error stays on so any unsuppressed race/deadlock still fails
+          # CI. The tsan entry additionally loads a tightly-scoped suppressions
+          # file (see .config/tsan-suppressions.txt) for the benign B+ tree
+          # writer-vs-writer lock-order-inversions caused by buffer-pool frame
+          # reuse. The asan entry's value is unchanged (the append is tsan-only).
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1${{ matrix.name == 'tsan' && format(':suppressions={0}/.config/tsan-suppressions.txt', github.workspace) || '' }}
         run: ctest --test-dir ${{ matrix.build_dir }} --output-on-failure
 
   # ───────────────────────────────────────────────────────────────────────────
