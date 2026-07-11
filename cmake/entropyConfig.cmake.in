@@ -1,0 +1,12 @@
+@PACKAGE_INIT@
+
+# Entropy links spdlog PUBLICly, so a consumer needs spdlog's imported target
+# available before the exported entropy targets are loaded.
+include(CMakeFindDependencyMacro)
+# Entropy is built against spdlog 1.15.x (bundled fmt 11); require at least that
+# minor so a consumer does not resolve an ABI-incompatible older spdlog.
+find_dependency(spdlog 1.15)
+
+include("${CMAKE_CURRENT_LIST_DIR}/entropyTargets.cmake")
+
+check_required_components(entropy)
