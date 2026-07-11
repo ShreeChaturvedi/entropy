@@ -102,6 +102,7 @@ gtest_discover_tests(lock_manager_tests)
 add_executable(integration_tests
     integration/database_test.cpp
     integration/transaction_api_test.cpp
+    integration/api_safety_test.cpp
 )
 
 target_link_libraries(integration_tests
