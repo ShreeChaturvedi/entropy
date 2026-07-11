@@ -9,10 +9,17 @@ namespace entropy {
 
 namespace {
 
-/// True if the SQL type belongs to the numeric family (ints and floats are
-/// mutually assignable with widening/narrowing conversions).
-[[nodiscard]] bool is_numeric_type(TypeId type) {
+/// Broad type families used for expression type checking. Values from
+/// different families have no implicit conversion between them.
+enum class TypeFamily { kNumeric, kString, kBoolean, kUnknown };
+
+/// Map a SQL type to its family. INVALID (an unbound column or a NULL literal)
+/// maps to kUnknown, which is treated as compatible with everything so NULLs
+/// and not-yet-typed sub-expressions never spuriously fail type checking.
+[[nodiscard]] TypeFamily type_family(TypeId type) {
   switch (type) {
+  case TypeId::BOOLEAN:
+    return TypeFamily::kBoolean;
   case TypeId::TINYINT:
   case TypeId::SMALLINT:
   case TypeId::INTEGER:
@@ -20,10 +27,33 @@ namespace {
   case TypeId::DECIMAL:
   case TypeId::FLOAT:
   case TypeId::DOUBLE:
-    return true;
+    return TypeFamily::kNumeric;
+  case TypeId::VARCHAR:
+    return TypeFamily::kString;
   default:
-    return false;
+    return TypeFamily::kUnknown;
   }
+}
+
+/// True if the SQL type belongs to the numeric family (ints and floats are
+/// mutually assignable with widening/narrowing conversions).
+[[nodiscard]] bool is_numeric_type(TypeId type) {
+  return type_family(type) == TypeFamily::kNumeric;
+}
+
+/// Human-readable family name for type-error messages.
+[[nodiscard]] const char *family_name(TypeFamily family) {
+  switch (family) {
+  case TypeFamily::kNumeric:
+    return "numeric";
+  case TypeFamily::kString:
+    return "string";
+  case TypeFamily::kBoolean:
+    return "boolean";
+  case TypeFamily::kUnknown:
+    return "unknown";
+  }
+  return "unknown";
 }
 
 /// Human-readable kind of an INSERT literal, for strict-mode error messages.
@@ -126,8 +156,23 @@ Status Binder::bind_expression(Expression *expr, const TableInfo *table_info) {
         bind_expression(const_cast<Expression *>(binary->left()), table_info);
     if (!status.ok())
       return status;
-    return bind_expression(const_cast<Expression *>(binary->right()),
-                           table_info);
+    status = bind_expression(const_cast<Expression *>(binary->right()),
+                             table_info);
+    if (!status.ok())
+      return status;
+
+    // Arithmetic is defined only on numeric operands. A string or boolean
+    // operand is a type error, not something to silently coerce to 0. NULL /
+    // not-yet-typed sub-expressions (kUnknown) are allowed through.
+    for (const Expression *operand : {binary->left(), binary->right()}) {
+      TypeFamily family = type_family(operand->result_type());
+      if (family != TypeFamily::kNumeric && family != TypeFamily::kUnknown) {
+        return Status::InvalidArgument(
+            std::string("arithmetic operator requires numeric operands, got ") +
+            family_name(family));
+      }
+    }
+    return Status::Ok();
   }
 
   case ExpressionType::COMPARISON: {
@@ -139,7 +184,23 @@ Status Binder::bind_expression(Expression *expr, const TableInfo *table_info) {
         bind_expression(const_cast<Expression *>(cmp->left()), table_info);
     if (!status.ok())
       return status;
-    return bind_expression(const_cast<Expression *>(cmp->right()), table_info);
+    status = bind_expression(const_cast<Expression *>(cmp->right()), table_info);
+    if (!status.ok())
+      return status;
+
+    // Operands must share a type family. Comparing across families (e.g. a
+    // VARCHAR column to an integer literal) has no defined ordering and was
+    // previously coercing strings to 0; reject it at bind time. kUnknown (NULL
+    // or an untyped sub-expression) is compatible with anything.
+    TypeFamily left_family = type_family(cmp->left()->result_type());
+    TypeFamily right_family = type_family(cmp->right()->result_type());
+    if (left_family != TypeFamily::kUnknown &&
+        right_family != TypeFamily::kUnknown && left_family != right_family) {
+      return Status::InvalidArgument(
+          std::string("cannot compare ") + family_name(left_family) + " with " +
+          family_name(right_family));
+    }
+    return Status::Ok();
   }
 
   case ExpressionType::LOGICAL: {
@@ -301,6 +362,24 @@ Status Binder::bind_update(UpdateStatement *stmt, BoundUpdateContext *context) {
       if (!status.ok()) {
         return status;
       }
+
+      // Strict mode: reject a SET value whose type family does not match the
+      // target column (e.g. SET int_col = 'text'), mirroring INSERT. A
+      // kUnknown value type (NULL literal or an untyped sub-expression) is
+      // always allowed.
+      if (strict_mode_) {
+        TypeFamily value_family = type_family(set_clause.value->result_type());
+        TypeFamily column_family = type_family(type);
+        if (value_family != TypeFamily::kUnknown &&
+            value_family != column_family) {
+          return Status::InvalidArgument(
+              std::string("strict mode: cannot assign ") +
+              family_name(value_family) + " value to " +
+              family_name(column_family) + " column '" +
+              set_clause.column_name + "'");
+        }
+      }
+
       context->values.push_back(std::move(set_clause.value));
     }
   }

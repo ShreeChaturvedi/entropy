@@ -5,6 +5,8 @@
 
 #include "parser/expression.hpp"
 
+#include <limits>
+
 #include "catalog/schema.hpp"
 
 namespace entropy {
@@ -71,6 +73,65 @@ static bool is_integer_type(const TupleValue &val) {
 // Helper to check if value is floating point
 static bool is_float_type(const TupleValue &val) {
   return val.is_float() || val.is_double();
+}
+
+// Helper to check if value is any numeric type (integer or floating point)
+static bool is_numeric_value(const TupleValue &val) {
+  return is_integer_type(val) || is_float_type(val);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Checked 64-bit integer arithmetic
+//
+// Signed integer overflow is undefined behaviour in C++. These helpers detect
+// overflow before it happens and report it via the return value so callers can
+// surface a defined result instead of tripping UB (or -fsanitize=undefined).
+// They use the compiler overflow builtins where available and fall back to a
+// portable pre-check otherwise.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static bool checked_add(int64_t a, int64_t b, int64_t &out) {
+#if defined(__GNUC__) || defined(__clang__)
+  return __builtin_add_overflow(a, b, &out);
+#else
+  if ((b > 0 && a > std::numeric_limits<int64_t>::max() - b) ||
+      (b < 0 && a < std::numeric_limits<int64_t>::min() - b)) {
+    return true;
+  }
+  out = a + b;
+  return false;
+#endif
+}
+
+static bool checked_sub(int64_t a, int64_t b, int64_t &out) {
+#if defined(__GNUC__) || defined(__clang__)
+  return __builtin_sub_overflow(a, b, &out);
+#else
+  if ((b < 0 && a > std::numeric_limits<int64_t>::max() + b) ||
+      (b > 0 && a < std::numeric_limits<int64_t>::min() + b)) {
+    return true;
+  }
+  out = a - b;
+  return false;
+#endif
+}
+
+static bool checked_mul(int64_t a, int64_t b, int64_t &out) {
+#if defined(__GNUC__) || defined(__clang__)
+  return __builtin_mul_overflow(a, b, &out);
+#else
+  if (a == 0 || b == 0) {
+    out = 0;
+    return false;
+  }
+  const int64_t result = a * b;
+  // Recover an operand by division; a mismatch means the product wrapped.
+  if (result / b != a) {
+    return true;
+  }
+  out = result;
+  return false;
+#endif
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -149,28 +210,36 @@ TupleValue BinaryOpExpression::evaluate(const Tuple &tuple,
     return TupleValue(); // NULL
   }
 
-  // Integer operations
+  // Integer operations: use checked arithmetic so overflow yields a defined
+  // NULL result (matching division-by-zero below) instead of undefined
+  // behaviour.
   if (is_integer_type(lval) && is_integer_type(rval)) {
     int64_t l = to_int64(lval);
     int64_t r = to_int64(rval);
+    int64_t out = 0;
 
     switch (op_) {
     case BinaryOpType::ADD:
-      return TupleValue(l + r);
+      return checked_add(l, r, out) ? TupleValue() : TupleValue(out);
     case BinaryOpType::SUBTRACT:
-      return TupleValue(l - r);
+      return checked_sub(l, r, out) ? TupleValue() : TupleValue(out);
     case BinaryOpType::MULTIPLY:
-      return TupleValue(l * r);
+      return checked_mul(l, r, out) ? TupleValue() : TupleValue(out);
     case BinaryOpType::DIVIDE:
       if (r == 0)
         return TupleValue(); // NULL on division by zero
+      // INT64_MIN / -1 overflows the signed range and traps: guard it.
+      if (l == std::numeric_limits<int64_t>::min() && r == -1)
+        return TupleValue();
       return TupleValue(l / r);
     }
   }
 
-  // Float operations (if either is float)
-  if (is_float_type(lval) || is_float_type(rval) || is_integer_type(lval) ||
-      is_integer_type(rval)) {
+  // Floating-point operations: only when BOTH operands are numeric. A
+  // non-numeric operand (e.g. a string) has no arithmetic meaning and is NOT
+  // silently coerced to 0 — bind-time checking rejects such expressions, and
+  // this evaluation path returns NULL as a defensive fallback.
+  if (is_numeric_value(lval) && is_numeric_value(rval)) {
     double l = to_double(lval);
     double r = to_double(rval);
 
@@ -188,7 +257,7 @@ TupleValue BinaryOpExpression::evaluate(const Tuple &tuple,
     }
   }
 
-  return TupleValue(); // Unsupported operation
+  return TupleValue(); // Non-numeric operands: no coercion, result is NULL
 }
 
 TypeId BinaryOpExpression::result_type() const {
@@ -236,7 +305,10 @@ TupleValue ComparisonExpression::evaluate(const Tuple &tuple,
     int64_t l = to_int64(lval);
     int64_t r = to_int64(rval);
     cmp_result = (l < r) ? -1 : (l > r) ? 1 : 0;
-  } else if (is_float_type(lval) || is_float_type(rval)) {
+  } else if (is_numeric_value(lval) && is_numeric_value(rval)) {
+    // Mixed integer/float comparison. Both operands are numeric; a non-numeric
+    // operand is NOT coerced to 0 but falls through to the incompatible-type
+    // case below (SQL unknown / NULL).
     double l = to_double(lval);
     double r = to_double(rval);
     cmp_result = (l < r) ? -1 : (l > r) ? 1 : 0;
