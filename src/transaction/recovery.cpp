@@ -138,32 +138,29 @@ Status RecoveryManager::create_checkpoint(
   // exclusively, no logging writer can be mid-append (they take it shared
   // across append + page-LSN stamp), so every record with LSN < begin_lsn has
   // already stamped and dirtied its page and is captured by flush_all_pages.
-  // A null barrier keeps the historical single-threaded contract.
-  auto do_capture_and_flush = [&](lsn_t &begin_lsn) -> Status {
-    if (!buffer_pool_) {
-      return Status::Ok();
-    }
-    begin_lsn = wal_->next_lsn();
-    Status flush_status = wal_->flush();
-    if (!flush_status.ok()) {
-      return flush_status;
-    }
-    // The anchor is a promise that every pre-anchor effect is on disk; a page
-    // that failed to flush breaks that promise, so surface the error rather
-    // than record an unsound anchor.
-    return buffer_pool_->flush_all_pages();
-  };
-
+  // A null barrier keeps the historical single-threaded contract. The lock is
+  // released as soon as the flush window closes: appending the CHECKPOINT
+  // record itself needs no quiesce.
   lsn_t begin_lsn = INVALID_LSN;
-  Status captured = Status::Ok();
-  if (write_barrier != nullptr) {
-    std::unique_lock<std::shared_mutex> quiesce(*write_barrier);
-    captured = do_capture_and_flush(begin_lsn);
-  } else {
-    captured = do_capture_and_flush(begin_lsn);
-  }
-  if (!captured.ok()) {
-    return captured;
+  {
+    std::unique_lock<std::shared_mutex> quiesce;
+    if (write_barrier != nullptr) {
+      quiesce = std::unique_lock<std::shared_mutex>(*write_barrier);
+    }
+    if (buffer_pool_) {
+      begin_lsn = wal_->next_lsn();
+      Status flush_status = wal_->flush();
+      if (!flush_status.ok()) {
+        return flush_status;
+      }
+      // The anchor is a promise that every pre-anchor effect is on disk; a
+      // page that failed to flush breaks that promise, so surface the error
+      // rather than record an unsound anchor.
+      Status pages_flushed = buffer_pool_->flush_all_pages();
+      if (!pages_flushed.ok()) {
+        return pages_flushed;
+      }
+    }
   }
 
   LogRecord checkpoint = LogRecord::make_checkpoint(active_txn_ids, begin_lsn);

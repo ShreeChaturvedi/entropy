@@ -16,6 +16,7 @@
 #include <string>
 #include <thread>
 
+#include "common/config.hpp"
 #include "entropy/entropy.hpp"
 #include "test_utils.hpp"
 
@@ -33,7 +34,11 @@ protected:
 
   void TearDown() override { temp_file_.reset(); }
 
-  [[nodiscard]] std::string wal_path() const { return path_ + ".wal"; }
+  // Derive the WAL path exactly the way DatabaseImpl does, so this test can
+  // never silently diverge from the path the engine actually writes.
+  [[nodiscard]] std::string wal_path() const {
+    return path_ + config::kWALFileExtension;
+  }
 
   static size_t count_rows(Database &db, const std::string &table) {
     auto result = db.execute("SELECT * FROM " + table);
