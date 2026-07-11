@@ -35,26 +35,6 @@ crash simulator exercises the whole stack.
 - Benchmarks vs SQLite with reproducible scripts.
 - CI across Linux/macOS/Windows, ASan/UBSan/TSan, `find_package` smoke.
 
-## Terminal UI
-
-The engine drives a live terminal UI, rendered amber on charcoal.
-
-<p align="center">
-  <img src="docs/assets/tui/dashboard.png" width="820" alt="Crash-simulator dashboard with a seed run table and a live fault feed using btop-style row lighting">
-</p>
-
-<p align="center">
-  <em>Live crash-simulator dashboard: seed runs and pass/fail beside a streaming fault feed with btop-style row lighting.</em>
-</p>
-
-<p align="center">
-  <img src="docs/assets/tui/console.png" width="820" alt="Interactive SQL console showing a query and its result grid">
-</p>
-
-<p align="center">
-  <em>Interactive SQL console: type a query, read the result grid.</em>
-</p>
-
 ## Architecture
 
 <p align="center">
@@ -71,6 +51,14 @@ the storage engine.
 
 - Recursive-descent parser: SELECT/INSERT/UPDATE/DELETE, CREATE/DROP, EXPLAIN.
 - Binder resolves names and types, rejecting type errors at bind time.
+
+<p align="center">
+  <img src="docs/assets/tui/console.gif" width="820" alt="A live SQL session in the Entropy console: CREATE, INSERT, a filtered SELECT, ORDER BY with LIMIT, and EXPLAIN">
+</p>
+
+<p align="center">
+  <em>A live SQL session: CREATE and INSERT, a filtered SELECT, ORDER BY with LIMIT, and EXPLAIN.</em>
+</p>
 
 ### Planning and Optimization
 
@@ -109,6 +97,14 @@ drives the engine through fault-injected storage and replays failures from a
 seed. One 64-bit seed drives independent PRNG streams for the workload, the page
 device, and the log store, so a failing schedule replays byte for byte.
 
+<p align="center">
+  <img src="docs/assets/tui/dashboard.gif" width="820" alt="The Entropy crash-simulator dashboard streaming seed runs with their crash-to-recovery outcomes">
+</p>
+
+<p align="center">
+  <em>The simulator dashboard, streaming seed runs and their crash-to-recovery outcomes.</em>
+</p>
+
 - `SimDiskManager` and `SimLogStore` replace the file backend.
 - A crash keeps fsync'd writes and drops or tears the unsynced ones.
 - Transient write errors are injectable at the same seam.
@@ -133,9 +129,9 @@ Run file: `docs/benchmarks/runs/bench-20251226-214051.json`
 - Machine: Apple M2 (arm64), macOS 15.5
 - Compiler: Apple clang 17.0.0 (clang-1700.0.13.5)
 - Build: Release (`-O3`)
+
 SQLite baselines are collected when `ENTROPY_BENCH_COMPARE_SQLITE=ON`.
 
-<!-- numbers pending re-measure: durable-vs-durable run in progress -->
 Per-iteration ns/op (ratio = Entropy / SQLite, lower is better):
 
 | Case | Rows | Entropy (ns/op) | SQLite (ns/op) | Ratio |
