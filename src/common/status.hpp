@@ -23,13 +23,19 @@ namespace entropy {
     } while (false)
 
 /**
- * @brief Macro to assign or return error
+ * @brief Bind @p lhs to a successful Result's rows, or early-return its Status.
+ *
+ * Evaluates @p expr once (it must yield a Result). On failure the enclosing
+ * function returns the Result's Status; on success @p lhs is assigned the
+ * result rows. The enclosing function's return type must be constructible from
+ * Status. Declares `_result` in the caller's scope, so use at most once per
+ * scope.
  */
 #define ENTROPY_ASSIGN_OR_RETURN(lhs, expr) \
     auto _result = (expr);                  \
     if (!_result.ok()) {                    \
         return _result.status();            \
     }                                       \
-    lhs = std::move(_result.value())
+    lhs = _result.rows()
 
 }  // namespace entropy

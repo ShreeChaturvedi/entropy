@@ -6,9 +6,18 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <random>
+#include <string>
+#include <thread>
 #include <vector>
 
 #include "storage/b_plus_tree.hpp"
@@ -719,6 +728,459 @@ TEST_F(BPlusTreeTest, ReuseExistingRoot) {
     for (int i = 0; i < 100; ++i) {
         auto result = tree2.find(i);
         ASSERT_TRUE(result.has_value()) << "Key " << i << " not found after reopen";
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Concurrency tests (issue #5): latch crabbing under concurrent readers/writers.
+//
+// Structural writers are serialized internally, so these exercise the
+// reader-vs-writer crabbing protocol: point reads, range scans, inserts, and
+// deletes running together while splits and merges reshape the tree. A latch
+// ordering bug would surface as a hang (caught by the test's join + the ctest
+// timeout); a missing latch would surface as a torn/wrong value or an
+// inconsistent scan (checked below). Built to run clean under ThreadSanitizer.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class ConcurrentBPlusTreeTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        // Unique temp dir per test: high-resolution clock + a process-lifetime
+        // counter + a random draw make collisions effectively impossible even
+        // under parallel test execution.
+        static std::atomic<uint64_t> counter{0};
+        const auto stamp =
+            std::chrono::steady_clock::now().time_since_epoch().count();
+        std::random_device rd;
+        const std::string unique = std::to_string(stamp) + "_" +
+                                   std::to_string(counter.fetch_add(1)) + "_" +
+                                   std::to_string(rd());
+        test_dir_ = std::filesystem::temp_directory_path() /
+                    ("entropy_bptree_conc_" + unique);
+        std::filesystem::create_directories(test_dir_);
+        db_file_ = test_dir_ / "test.db";
+
+        disk_manager_ = std::make_shared<FileDiskManager>(db_file_.string());
+        // Generous pool so a burst of concurrent pins never exhausts frames.
+        buffer_pool_ = std::make_shared<BufferPoolManager>(2048, disk_manager_);
+    }
+
+    void TearDown() override {
+        // Close handles before removing the directory (Windows CI).
+        buffer_pool_.reset();
+        disk_manager_.reset();
+        std::error_code ec;
+        std::filesystem::remove_all(test_dir_, ec);
+    }
+
+    static RID rid_for(int64_t key) {
+        return RID(static_cast<page_id_t>(key), 0);
+    }
+
+    std::filesystem::path test_dir_;
+    std::filesystem::path db_file_;
+    std::shared_ptr<DiskManager> disk_manager_;
+    std::shared_ptr<BufferPoolManager> buffer_pool_;
+};
+
+// Many threads inserting disjoint key blocks concurrently: every key must end up
+// present exactly once with its correct value.
+TEST_F(ConcurrentBPlusTreeTest, ConcurrentDisjointInsertsAreAllVisible) {
+    BPlusTree tree(buffer_pool_);
+    constexpr int kThreads = 8;
+    constexpr int kPerThread = 1000;
+
+    std::atomic<int> insert_fail{0};
+    std::atomic<bool> go{false};
+    const auto start = std::chrono::steady_clock::now();
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            while (!go.load(std::memory_order_acquire)) {
+            }
+            for (int i = 0; i < kPerThread; ++i) {
+                int64_t key = static_cast<int64_t>(t) * kPerThread + i;
+                if (!tree.insert(key, rid_for(key)).ok()) {
+                    insert_fail.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    go.store(true, std::memory_order_release);
+    for (auto& th : threads) th.join();
+
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_LT(
+        std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(), 60);
+    EXPECT_EQ(insert_fail.load(), 0);
+
+    const int total = kThreads * kPerThread;
+    for (int64_t key = 0; key < total; ++key) {
+        auto v = tree.find(key);
+        ASSERT_TRUE(v.has_value()) << "missing key " << key;
+        EXPECT_EQ(v->page_id, static_cast<page_id_t>(key));
+    }
+    auto scan = tree.range_scan(0, total - 1);
+    ASSERT_EQ(scan.size(), static_cast<size_t>(total));
+    for (size_t i = 0; i < scan.size(); ++i) {
+        EXPECT_EQ(scan[i].first, static_cast<int64_t>(i));
+    }
+}
+
+// Inserts, deletes, point reads, and range scans all running together. Reads
+// must never observe a torn/wrong value or an out-of-order scan, and the final
+// contents must match the deterministic expected set.
+TEST_F(ConcurrentBPlusTreeTest, ConcurrentMixedInsertDeleteRead) {
+    BPlusTree tree(buffer_pool_);
+    constexpr int64_t P = 2000;        // pre-populate [0, P)
+    constexpr int64_t D = 800;         // delete [0, D)
+    constexpr int64_t kExtra = 2000;   // insert [P, P + kExtra)
+    for (int64_t k = 0; k < P; ++k) {
+        ASSERT_TRUE(tree.insert(k, rid_for(k)).ok());
+    }
+
+    std::atomic<int> insert_fail{0}, delete_fail{0}, read_bad{0};
+    std::atomic<bool> go{false};
+    auto wait = [&] {
+        while (!go.load(std::memory_order_acquire)) {
+        }
+    };
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 2; ++t) {  // inserters split [P, P + kExtra)
+        threads.emplace_back([&, t] {
+            wait();
+            for (int64_t k = P + t; k < P + kExtra; k += 2) {
+                if (!tree.insert(k, rid_for(k)).ok()) {
+                    insert_fail.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (int t = 0; t < 2; ++t) {  // deleters split [0, D)
+        threads.emplace_back([&, t] {
+            wait();
+            for (int64_t k = t; k < D; k += 2) {
+                if (!tree.remove(k).ok()) {
+                    delete_fail.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (int t = 0; t < 4; ++t) {  // readers: point reads + range scans
+        threads.emplace_back([&, t] {
+            wait();
+            std::mt19937 gen(1234u + static_cast<unsigned>(t));
+            std::uniform_int_distribution<int64_t> dist(0, P + kExtra - 1);
+            for (int i = 0; i < 3000; ++i) {
+                int64_t k = dist(gen);
+                auto v = tree.find(k);
+                if (v.has_value() && v->page_id != static_cast<page_id_t>(k)) {
+                    read_bad.fetch_add(1, std::memory_order_relaxed);
+                }
+                if ((i & 63) == 0) {
+                    auto scan = tree.range_scan(k, k + 40);
+                    int64_t prev = -1;
+                    for (auto& [key, val] : scan) {
+                        if (key <= prev) {
+                            read_bad.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        if (val.page_id != static_cast<page_id_t>(key)) {
+                            read_bad.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        prev = key;
+                    }
+                }
+            }
+        });
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    go.store(true, std::memory_order_release);
+    for (auto& th : threads) th.join();
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_LT(
+        std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(), 60);
+
+    EXPECT_EQ(insert_fail.load(), 0);
+    EXPECT_EQ(delete_fail.load(), 0);
+    EXPECT_EQ(read_bad.load(), 0);
+
+    // Final expected set: [D, P) + [P, P + kExtra) = [D, P + kExtra).
+    auto scan = tree.range_scan(D, P + kExtra - 1);
+    ASSERT_EQ(scan.size(), static_cast<size_t>(P + kExtra - D));
+    for (size_t i = 0; i < scan.size(); ++i) {
+        int64_t expected = D + static_cast<int64_t>(i);
+        EXPECT_EQ(scan[i].first, expected);
+        EXPECT_EQ(scan[i].second.page_id, static_cast<page_id_t>(expected));
+    }
+    EXPECT_FALSE(tree.find(0).has_value());
+    EXPECT_FALSE(tree.find(D - 1).has_value());
+    EXPECT_TRUE(tree.find(D).has_value());
+}
+
+// Tiny fanout so inserts/deletes constantly split, merge, and borrow. Churners
+// hammer disjoint high blocks while scanners read a stable low block that they
+// must always see in full -- exercising the crabbing protocol (and would hang on
+// a latch-order deadlock) while proving reads stay correct through structural
+// churn of shared ancestors.
+TEST_F(ConcurrentBPlusTreeTest, ConcurrentSmallFanoutChurn) {
+    constexpr uint32_t kLeafMax = 4;
+    constexpr uint32_t kInternalMax = 4;
+    BPlusTree tree(buffer_pool_, INVALID_PAGE_ID, kLeafMax, kInternalMax);
+
+    constexpr int64_t P = 1200;  // stable low block [0, P)
+    for (int64_t k = 0; k < P; ++k) {
+        ASSERT_TRUE(tree.insert(k, rid_for(k)).ok());
+    }
+
+    constexpr int kChurners = 4;
+    constexpr int64_t kBlock = 300;
+    constexpr int kRounds = 20;
+
+    std::atomic<int> bad{0};
+    std::atomic<bool> go{false};
+    auto wait = [&] {
+        while (!go.load(std::memory_order_acquire)) {
+        }
+    };
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kChurners; ++t) {
+        threads.emplace_back([&, t] {
+            wait();
+            const int64_t base = P + static_cast<int64_t>(t) * kBlock;
+            for (int round = 0; round < kRounds; ++round) {
+                for (int64_t j = 0; j < kBlock; ++j) {
+                    if (!tree.insert(base + j, rid_for(base + j)).ok()) {
+                        bad.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                for (int64_t j = 0; j < kBlock; ++j) {
+                    if (!tree.remove(base + j).ok()) {
+                        bad.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+        });
+    }
+    for (int t = 0; t < 2; ++t) {  // scanners of the stable block
+        threads.emplace_back([&] {
+            wait();
+            for (int i = 0; i < 50; ++i) {
+                auto scan = tree.range_scan(0, P - 1);
+                if (scan.size() != static_cast<size_t>(P)) {
+                    bad.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                int64_t prev = -1;
+                for (auto& [key, val] : scan) {
+                    if (key != prev + 1) {
+                        bad.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    if (val.page_id != static_cast<page_id_t>(key)) {
+                        bad.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    prev = key;
+                }
+            }
+        });
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    go.store(true, std::memory_order_release);
+    for (auto& th : threads) th.join();
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_LT(
+        std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(), 120);
+    EXPECT_EQ(bad.load(), 0);
+
+    // Stable block fully intact; every churn key removed.
+    auto scan = tree.range_scan(0, P - 1);
+    ASSERT_EQ(scan.size(), static_cast<size_t>(P));
+    for (size_t i = 0; i < scan.size(); ++i) {
+        EXPECT_EQ(scan[i].first, static_cast<int64_t>(i));
+    }
+    for (int64_t k = P; k < P + kChurners * kBlock; ++k) {
+        EXPECT_FALSE(tree.find(k).has_value()) << "leftover churn key " << k;
+    }
+}
+
+// Regression test for the merged-page disk leak found in review: delete_page
+// refuses a page still pinned by a reader in its unlatch-then-unpin window, and
+// the old code ignored the refusal, leaking the page id on disk forever. The
+// fix queues the refused id and retries on the next structural write. This
+// simulates the reader's transient pin deterministically with an explicit
+// fetch_page pin held across a tree-emptying delete storm.
+TEST_F(ConcurrentBPlusTreeTest, RefusedPageDeleteIsRetriedNotLeaked) {
+    constexpr uint32_t kLeafMax = 4;
+    constexpr uint32_t kInternalMax = 4;
+    const size_t free_at_start = buffer_pool_->free_list_size();
+
+    BPlusTree tree(buffer_pool_, INVALID_PAGE_ID, kLeafMax, kInternalMax);
+    constexpr int64_t N = 24;
+    for (int64_t k = 0; k < N; ++k) {
+        ASSERT_TRUE(tree.insert(k, rid_for(k)).ok());
+    }
+
+    // Walk to the leftmost leaf and hold an extra pin on it, standing in for a
+    // reader that has unlatched but not yet unpinned.
+    page_id_t pinned_id = tree.root_page_id();
+    ASSERT_NE(pinned_id, INVALID_PAGE_ID);
+    while (true) {
+        Page* page = buffer_pool_->fetch_page(pinned_id);
+        ASSERT_NE(page, nullptr);
+        BPTreePage node(page);
+        if (node.is_leaf()) {
+            // Keep this fetch's pin; it blocks delete_page for pinned_id.
+            break;
+        }
+        page_id_t next = BPTreeInternalPage(page).child_at(0);
+        buffer_pool_->unpin_page(pinned_id, false);
+        pinned_id = next;
+    }
+
+    // Empty the tree. Every page is eventually discarded; the pinned one gets
+    // refused by delete_page and must be queued, not dropped.
+    for (int64_t k = 0; k < N; ++k) {
+        ASSERT_TRUE(tree.remove(k).ok()) << "remove " << k;
+    }
+    EXPECT_TRUE(tree.is_empty());
+    EXPECT_EQ(buffer_pool_->free_list_size(), free_at_start - 1)
+        << "exactly the pinned page should remain undeleted";
+
+    // Reader finishes (pin released); the next structural write must drain the
+    // deferred id. insert+remove nets zero pages, so the pool returns to full.
+    buffer_pool_->unpin_page(pinned_id, false);
+    ASSERT_TRUE(tree.insert(1, rid_for(1)).ok());
+    ASSERT_TRUE(tree.remove(1).ok());
+    EXPECT_EQ(buffer_pool_->free_list_size(), free_at_start)
+        << "deferred page was not reclaimed";
+}
+
+// Regression test for the latch-order deadlock found in review: full-range
+// scanners crab the SAME leaf chain that churners are merging and borrowing in.
+// The broken protocol kept a failed borrow's right-sibling latch while
+// re-latching the node left of it; a rightward scanner holding the node and
+// waiting for that right sibling completed the shared-vs-exclusive cycle and
+// the process hard-hung. Shape mirrors the reviewer's repro: fanout 4, 400
+// dense keys, 6 delete/insert churn threads over the whole keyspace plus 6
+// full-range scanners crossing it concurrently.
+//
+// A deadlock here must FAIL fast, not eat the ctest timeout: workers signal a
+// condition variable on completion and a watchdog aborts the process (ctest
+// failure) if they do not all finish within a hard deadline. Blocked-in-
+// pthread threads cannot be recovered, so abort is the only honest exit.
+TEST_F(ConcurrentBPlusTreeTest, ConcurrentScanChurnOverlapDoesNotDeadlock) {
+    constexpr uint32_t kLeafMax = 4;
+    constexpr uint32_t kInternalMax = 4;
+    BPlusTree tree(buffer_pool_, INVALID_PAGE_ID, kLeafMax, kInternalMax);
+
+    constexpr int64_t kKeys = 400;      // dense [0, kKeys)
+    constexpr int kChurners = 6;
+    constexpr int kScanners = 6;
+    constexpr int kRounds = 30;         // delete+reinsert rounds per churner
+    constexpr int kScansPerScanner = 40;
+#if defined(__SANITIZE_THREAD__)
+    constexpr auto kDeadline = std::chrono::seconds(600);
+#else
+    constexpr auto kDeadline = std::chrono::seconds(120);
+#endif
+
+    for (int64_t k = 0; k < kKeys; ++k) {
+        ASSERT_TRUE(tree.insert(k, rid_for(k)).ok());
+    }
+
+    std::atomic<int> bad{0};
+    std::atomic<int> workers_done{0};
+    std::mutex done_mu;
+    std::condition_variable done_cv;
+    const int total_workers = kChurners + kScanners;
+    auto worker_finished = [&] {
+        if (workers_done.fetch_add(1) + 1 == total_workers) {
+            std::lock_guard<std::mutex> lk(done_mu);
+            done_cv.notify_all();
+        }
+    };
+
+    std::atomic<bool> go{false};
+    auto wait_go = [&] {
+        while (!go.load(std::memory_order_acquire)) {
+        }
+    };
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kChurners; ++t) {
+        // Churner t owns residue class t (mod kChurners): interleaved keys, so
+        // every churner's deletes/inserts split and merge the same leaves the
+        // scanners are crossing. Each round deletes the class then reinserts
+        // it, ending with all keys present.
+        threads.emplace_back([&, t] {
+            wait_go();
+            for (int round = 0; round < kRounds; ++round) {
+                for (int64_t k = t; k < kKeys; k += kChurners) {
+                    if (!tree.remove(k).ok()) {
+                        bad.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                for (int64_t k = t; k < kKeys; k += kChurners) {
+                    if (!tree.insert(k, rid_for(k)).ok()) {
+                        bad.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+            worker_finished();
+        });
+    }
+    for (int t = 0; t < kScanners; ++t) {
+        // Full-range scans across the churned keyspace: every step crabs
+        // through leaves that are concurrently merging, borrowing, splitting.
+        threads.emplace_back([&] {
+            wait_go();
+            for (int i = 0; i < kScansPerScanner; ++i) {
+                auto scan = tree.range_scan(0, kKeys - 1);
+                int64_t prev = -1;
+                for (auto& [key, val] : scan) {
+                    if (key <= prev || key < 0 || key >= kKeys) {
+                        bad.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    if (val.page_id != static_cast<page_id_t>(key)) {
+                        bad.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    prev = key;
+                }
+            }
+            worker_finished();
+        });
+    }
+
+    go.store(true, std::memory_order_release);
+
+    {
+        std::unique_lock<std::mutex> lk(done_mu);
+        bool finished = done_cv.wait_for(lk, kDeadline, [&] {
+            return workers_done.load() == total_workers;
+        });
+        if (!finished) {
+            std::fprintf(stderr,
+                         "FATAL: scan/churn workers deadlocked (%d/%d finished "
+                         "within the deadline); aborting so ctest fails fast\n",
+                         workers_done.load(), total_workers);
+            std::fflush(stderr);
+            std::abort();
+        }
+    }
+    for (auto& th : threads) th.join();
+
+    EXPECT_EQ(bad.load(), 0);
+
+    // Every churner ends its last round with reinserts: full keyspace present.
+    auto scan = tree.range_scan(0, kKeys - 1);
+    ASSERT_EQ(scan.size(), static_cast<size_t>(kKeys));
+    for (size_t i = 0; i < scan.size(); ++i) {
+        EXPECT_EQ(scan[i].first, static_cast<int64_t>(i));
+        EXPECT_EQ(scan[i].second.page_id, static_cast<page_id_t>(i));
     }
 }
 

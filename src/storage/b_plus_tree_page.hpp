@@ -325,6 +325,20 @@ public:
     return left;
   }
 
+  /**
+   * @brief Find the child slot currently holding @p child_id
+   *
+   * Linear scan over the child array; returns 0 if not present.
+   */
+  [[nodiscard]] uint32_t child_index_of(page_id_t child_id) const {
+    for (uint32_t i = 0; i <= num_keys(); ++i) {
+      if (child_at(i) == child_id) {
+        return i;
+      }
+    }
+    return 0;
+  }
+
   // ─────────────────────────────────────────────────────────────────────────
   // Insertion
   // ─────────────────────────────────────────────────────────────────────────
