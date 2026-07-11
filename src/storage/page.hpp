@@ -6,6 +6,7 @@
  */
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <shared_mutex>
@@ -45,6 +46,97 @@ struct PageHeader {
 };
 
 static_assert(sizeof(PageHeader) == 32, "PageHeader must be 32 bytes");
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Page integrity (checksums)
+//
+// A page's 4-byte header checksum (offset 12) lets the disk manager DETECT a
+// torn/partial write at read time instead of silently returning corrupt bytes.
+// The disk manager computes it over the whole page image on write and re-checks
+// it on read; a mismatch is surfaced as a Corruption Status. See the disk
+// manager for how the two backends opt in, and recovery for how a detected torn
+// page is treated (its contents are discarded and rebuilt from the WAL redo).
+//
+// NOTE: the checksum lives at the PageHeader offset, which only PageHeader-style
+// pages (table heap, catalog/header pages) reserve. B+ tree pages use a
+// different header whose bytes 12-15 hold parent_page_id, so checksumming is
+// applied only where every page carries a PageHeader (the simulator's page
+// store, and FileDiskManager when explicitly enabled) — never blanket-stamped
+// across a store that also holds B+ tree pages.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Byte offset of PageHeader::checksum within a page image.
+inline constexpr size_t kPageChecksumOffset = 12;
+static_assert(offsetof(PageHeader, checksum) == kPageChecksumOffset,
+              "checksum must live at offset 12 for the disk-manager stamp");
+
+namespace detail {
+
+/// One incremental step of a reflected CRC-32 (IEEE polynomial 0xEDB88320),
+/// branchless so it is constant-time and free of undefined behaviour. Caller
+/// supplies the running value (pre-inverted) and inverts the final result.
+[[nodiscard]] inline uint32_t crc32_update(uint32_t crc, const unsigned char* p,
+                                           size_t n) noexcept {
+    for (size_t i = 0; i < n; ++i) {
+        crc ^= p[i];
+        for (int k = 0; k < 8; ++k) {
+            const uint32_t mask = 0u - (crc & 1u);  // 0x00000000 or 0xFFFFFFFF
+            crc = (crc >> 1) ^ (0xEDB88320u & mask);
+        }
+    }
+    return crc;
+}
+
+}  // namespace detail
+
+/// CRC-32 over a full page image with the 4-byte checksum field itself treated
+/// as zero, so the value never depends on whatever currently sits in that field
+/// (write can stamp it, read can re-check it, and both agree).
+[[nodiscard]] inline uint32_t compute_page_checksum(const char* page_data) noexcept {
+    const auto* p = reinterpret_cast<const unsigned char*>(page_data);
+    const unsigned char zeros[4] = {0, 0, 0, 0};
+    uint32_t crc = 0xFFFFFFFFu;
+    crc = detail::crc32_update(crc, p, kPageChecksumOffset);           // [0, 12)
+    crc = detail::crc32_update(crc, zeros, sizeof(zeros));             // field -> 0
+    crc = detail::crc32_update(crc, p + kPageChecksumOffset + 4,       // [16, end)
+                               config::kDefaultPageSize - kPageChecksumOffset - 4);
+    return crc ^ 0xFFFFFFFFu;
+}
+
+/// Stamp the computed checksum into the page header (offset 12). @p page_data
+/// must point at a full kDefaultPageSize image. Uses memcpy to avoid any
+/// alignment/strict-aliasing assumption on the raw byte buffer.
+inline void stamp_page_checksum(char* page_data) noexcept {
+    const uint32_t sum = compute_page_checksum(page_data);
+    std::memcpy(page_data + kPageChecksumOffset, &sum, sizeof(sum));
+}
+
+/// True when every byte of the page image is zero. A freshly allocated or
+/// deallocated page is all-zero and carries no integrity stamp; it is a valid
+/// EMPTY page, not a corruption, so verification accepts it.
+[[nodiscard]] inline bool page_is_all_zero(const char* page_data) noexcept {
+    const auto* p = reinterpret_cast<const unsigned char*>(page_data);
+    for (size_t i = 0; i < config::kDefaultPageSize; ++i) {
+        if (p[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Verify a page image against its stored checksum. An all-zero page is a valid
+/// empty page (accepted). Otherwise the stored checksum (offset 12) must equal
+/// the recomputed value; any mismatch — including a torn page whose header was
+/// zeroed while its body kept data, which reads as checksum 0 over non-zero
+/// bytes — signals a torn/corrupt page. Returns true iff the page is trustworthy.
+[[nodiscard]] inline bool verify_page_checksum(const char* page_data) noexcept {
+    if (page_is_all_zero(page_data)) {
+        return true;
+    }
+    uint32_t stored = 0;
+    std::memcpy(&stored, page_data + kPageChecksumOffset, sizeof(stored));
+    return stored == compute_page_checksum(page_data);
+}
 
 /**
  * @brief Base page class

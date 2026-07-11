@@ -96,9 +96,20 @@ Page* BufferPoolManager::fetch_page(page_id_t page_id) {
     page->reset();
     auto status = disk_manager_->read_page(page_id, page->data());
     if (!status.ok()) {
-        LOG_ERROR("Failed to read page {}: {}", page_id, status.to_string());
-        free_list_.push_back(frame_id);
-        return nullptr;
+        if (recovery_mode_ && status.code() == StatusCode::kCorruption) {
+            // A torn/corrupt page cannot be trusted, but recovery rebuilds its
+            // correct contents from the WAL. Hand back a fresh, empty frame
+            // (LSN = INVALID_LSN) so the redo phase replays every change onto
+            // it. Outside recovery this stays a hard error (below).
+            LOG_WARN("Torn/corrupt page {} detected during recovery; "
+                     "reinitializing for WAL redo",
+                     page_id);
+            page->reset();
+        } else {
+            LOG_ERROR("Failed to read page {}: {}", page_id, status.to_string());
+            free_list_.push_back(frame_id);
+            return nullptr;
+        }
     }
 
     page->set_page_id(page_id);
@@ -251,6 +262,11 @@ size_t BufferPoolManager::free_list_size() const {
 void BufferPoolManager::set_wal_flush_hook(std::function<Status(lsn_t)> hook) {
     std::lock_guard<std::mutex> lock(mutex_);
     wal_flush_hook_ = std::move(hook);
+}
+
+void BufferPoolManager::set_recovery_mode(bool on) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    recovery_mode_ = on;
 }
 
 Status BufferPoolManager::flush_all_pages() {
