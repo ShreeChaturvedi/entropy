@@ -2,19 +2,22 @@
 
 /**
  * @file recovery.hpp
- * @brief ARIES-style Crash Recovery Manager
+ * @brief ARIES-lite Crash Recovery Manager
  *
  * Implements the Analysis, Redo, Undo (ARU) recovery protocol:
  *
- * 1. Analysis Phase: Scan log from last checkpoint to build:
- *    - Active Transaction Table (ATT): transactions that were active at crash
- *    - Dirty Page Table (DPT): pages that may need redo
+ * 1. Analysis Phase: Scan the log to build the Active Transaction Table
+ *    (ATT: transactions uncommitted at crash), the committed set, the redo
+ *    anchor (the last checkpoint's begin_lsn), and the recovered next
+ *    transaction id.
  *
- * 2. Redo Phase: Replay all operations from the log to bring the database
- *    to the state it was in at the time of the crash.
+ * 2. Redo Phase: Repeat history from the redo anchor forward, applying each
+ *    page mutation only when the page LSN shows it is missing (idempotent).
  *
- * 3. Undo Phase: Rollback all uncommitted transactions by traversing
- *    their prevLSN chains in reverse order.
+ * 3. Undo Phase: Roll back all loser transactions in one merged global
+ *    reverse-LSN scan with state-checked inverse operations, flush the
+ *    compensated pages, then append an ABORT per loser (no CLRs; the
+ *    durability ordering plus idempotent undo make re-runs safe).
  */
 
 #include <memory>
@@ -74,9 +77,20 @@ public:
   /**
    * @brief Create a checkpoint
    *
-   * A checkpoint reduces recovery time by recording:
-   * - Currently active transactions
-   * - Dirty pages in the buffer pool
+   * Flushes the WAL, then flushes all dirty pages, and only then appends a
+   * CHECKPOINT record whose begin_lsn anchors the redo scan: every record
+   * older than the anchor is durably reflected on disk pages at that point,
+   * so recovery may safely skip it. Without a buffer pool (analysis-only
+   * setups) no pages can be flushed and the record carries no anchor,
+   * which makes recovery fall back to a full page-LSN-gated scan.
+   *
+   * IMPORTANT: the recorded anchor is only sound when no writer runs
+   * concurrently with this call. A writer that obtained an LSN before the
+   * anchor was captured but dirtied its page after flush_all_pages would be
+   * skipped by anchored redo yet not be durable on disk. Concurrency is not
+   * wired yet; when WP7 wires concurrent writers, checkpointing must either
+   * quiesce writers for the flush window or record a real dirty-page-table
+   * anchor (min recLSN) instead.
    *
    * @param active_txn_ids List of currently active transaction IDs
    * @return Status indicating success or failure
@@ -105,14 +119,29 @@ public:
   }
 
   /**
-   * @brief Get count of redo operations performed
+   * @brief Get count of redo operations actually applied to pages
+   *
+   * A record whose change is already reflected on its page (page LSN >= record
+   * LSN) is skipped and not counted, so a second recover() over an already
+   * recovered database reports zero.
    */
   [[nodiscard]] size_t redo_count() const noexcept { return redo_count_; }
 
   /**
-   * @brief Get count of undo operations performed
+   * @brief Get count of undo operations actually applied to pages
    */
   [[nodiscard]] size_t undo_count() const noexcept { return undo_count_; }
+
+  /**
+   * @brief Next transaction id to hand out after recovery
+   *
+   * Recovered as max(highest txn id seen in the log, checkpoint high-water) + 1
+   * so post-restart transactions cannot alias recovered ones. The
+   * TransactionManager consumes this on startup.
+   */
+  [[nodiscard]] txn_id_t next_txn_id() const noexcept {
+    return recovered_next_txn_id_;
+  }
 
 private:
   // ─────────────────────────────────────────────────────────────────────────
@@ -134,7 +163,16 @@ private:
 
   /**
    * @brief Undo phase: Rollback uncommitted transactions
-   * @param records All log records for building prevLSN chains
+   *
+   * Applies inverse operations for all loser transactions in one merged
+   * descending-LSN scan, flushes the page of every loser record examined (a
+   * superset of the pages mutated this run, covering compensations that a
+   * previous failed recovery attempt left dirty in the pool), and only then
+   * appends (and flushes) an ABORT record per loser. That ordering makes the
+   * ABORT a durable promise that its compensation is already on disk; a crash
+   * at any point re-runs a state-checked, idempotent undo.
+   *
+   * @param records All log records from WAL (in LSN order)
    * @return Status indicating success or failure
    */
   Status undo_phase(const std::vector<LogRecord> &records);
@@ -147,19 +185,20 @@ private:
   Status redo_record(const LogRecord &record);
 
   /**
-   * @brief Undo a single log record
+   * @brief Undo a single log record (state-checked, idempotent)
    * @param record The log record to undo
    * @return Status indicating success or failure
+   *
+   * Each inverse op verifies the slot still reflects the logged operation
+   * before touching it: undo-INSERT deletes only if the slot holds exactly
+   * the inserted bytes (length included, so a longer committed row sharing a
+   * prefix is never destroyed), undo-UPDATE restores only if the slot holds
+   * the after-image (re-stamping the before-image's exact length), and
+   * undo-DELETE re-inserts only into an empty slot. Slots already undone
+   * (recovery re-run) or reused by a committed transaction are left
+   * untouched.
    */
   Status undo_record(const LogRecord &record);
-
-  /**
-   * @brief Build a map from LSN to log record for efficient lookup
-   * @param records All log records from WAL
-   * @return Map from LSN to log record pointer
-   */
-  std::unordered_map<lsn_t, const LogRecord *>
-  build_lsn_map(const std::vector<LogRecord> &records);
 
   // ─────────────────────────────────────────────────────────────────────────
   // Member Variables
@@ -175,6 +214,13 @@ private:
 
   // Set of committed transaction IDs
   std::unordered_set<txn_id_t> committed_txns_;
+
+  // LSN at which the redo scan starts (checkpoint begin_lsn, else 0). Records
+  // before this point are guaranteed durable on their pages.
+  lsn_t redo_start_lsn_ = INVALID_LSN;
+
+  // Next transaction id to hand out after recovery = max(seen, checkpoint) + 1.
+  txn_id_t recovered_next_txn_id_ = 1;
 
   // Statistics for testing/debugging
   size_t redo_count_ = 0;
