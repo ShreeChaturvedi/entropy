@@ -3,7 +3,7 @@
  * @brief Executor helpers shared across the execution engine
  *
  * Hosts the read-side snapshot resolution (mvcc_visible) and the write-side
- * transactional steps (txn_acquire_write / txn_register_insert / txn_log_*)
+ * transactional steps (txn_acquire_write / txn_insert_hook / txn_log_*)
  * so the individual executors carry no duplicated lock/version/WAL plumbing.
  */
 

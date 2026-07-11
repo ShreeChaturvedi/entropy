@@ -82,6 +82,16 @@ void IndexScanExecutor::init() {
 // next() - Return next matching tuple
 // ─────────────────────────────────────────────────────────────────────────────
 
+std::optional<Tuple> IndexScanExecutor::fetch_visible(RID rid) {
+  Tuple tuple;
+  Status status = table_heap_->get_tuple(rid, &tuple);
+  // On a hit, the index still points at a RID whose heap version may be
+  // invisible to this snapshot; on a miss, the slot may be a ghost whose
+  // retained before-image is still visible (uncommitted or later-committed
+  // DELETE). Either way, the version store makes the call.
+  return mvcc_visible(ctx_, status.ok() ? tuple : Tuple({}, rid));
+}
+
 std::optional<Tuple> IndexScanExecutor::next() {
   switch (scan_type_) {
   case IndexScanType::POINT_LOOKUP: {
@@ -90,18 +100,7 @@ std::optional<Tuple> IndexScanExecutor::next() {
       return std::nullopt;
     }
     point_lookup_done_ = true;
-
-    // Fetch tuple from table heap
-    Tuple tuple;
-    Status status = table_heap_->get_tuple(*point_lookup_rid_, &tuple);
-    if (status.ok()) {
-      // Filter through the snapshot: the index still points at a RID whose
-      // heap version may be invisible to this transaction.
-      return mvcc_visible(ctx_, tuple);
-    }
-    // Empty slot: the row may be a ghost whose retained before-image is
-    // still visible to this snapshot (uncommitted or later-committed DELETE).
-    return mvcc_visible(ctx_, Tuple({}, *point_lookup_rid_));
+    return fetch_visible(*point_lookup_rid_);
   }
 
   case IndexScanType::RANGE_SCAN: {
@@ -115,13 +114,7 @@ std::optional<Tuple> IndexScanExecutor::next() {
         return std::nullopt;
       }
 
-      // Fetch tuple from table heap; an empty slot may still be a ghost row
-      // whose retained before-image is visible to this snapshot.
-      Tuple tuple;
-      Status status = table_heap_->get_tuple(rid, &tuple);
-      std::optional<Tuple> visible =
-          mvcc_visible(ctx_, status.ok() ? tuple : Tuple({}, rid));
-      if (visible.has_value()) {
+      if (std::optional<Tuple> visible = fetch_visible(rid); visible) {
         return visible;
       }
       // Deleted or invisible to this snapshot; continue.
@@ -135,13 +128,7 @@ std::optional<Tuple> IndexScanExecutor::next() {
       auto [key, rid] = *iterator_;
       ++iterator_;
 
-      // Fetch tuple from table heap; an empty slot may still be a ghost row
-      // whose retained before-image is visible to this snapshot.
-      Tuple tuple;
-      Status status = table_heap_->get_tuple(rid, &tuple);
-      std::optional<Tuple> visible =
-          mvcc_visible(ctx_, status.ok() ? tuple : Tuple({}, rid));
-      if (visible.has_value()) {
+      if (std::optional<Tuple> visible = fetch_visible(rid); visible) {
         return visible;
       }
       // Deleted or invisible to this snapshot; continue.
