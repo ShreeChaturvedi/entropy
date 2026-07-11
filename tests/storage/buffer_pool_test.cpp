@@ -64,6 +64,45 @@ private:
     page_id_t num_pages_ = 0;
 };
 
+// In-memory disk manager that records every deallocate_page call so a test can
+// assert that delete_page frees the on-disk id even when the page is no longer
+// cached in the buffer pool.
+class DeallocRecordingDiskManager : public DiskManager {
+public:
+    Status read_page(page_id_t page_id, char* page_data) override {
+        auto it = pages_.find(page_id);
+        if (it == pages_.end()) {
+            std::memset(page_data, 0, page_size());
+        } else {
+            std::memcpy(page_data, it->second.data(), page_size());
+        }
+        return Status::Ok();
+    }
+
+    Status write_page(page_id_t page_id, const char* page_data) override {
+        std::memcpy(pages_[page_id].data(), page_data, page_size());
+        if (page_id >= num_pages_) {
+            num_pages_ = page_id + 1;
+        }
+        return Status::Ok();
+    }
+
+    page_id_t allocate_page() override { return num_pages_++; }
+    void deallocate_page(page_id_t page_id) override {
+        deallocated.push_back(page_id);
+    }
+    page_id_t num_pages() const noexcept override { return num_pages_; }
+    bool is_open() const noexcept override { return true; }
+    void sync() override {}
+
+    std::vector<page_id_t> deallocated;
+
+private:
+    std::unordered_map<page_id_t, std::array<char, DiskManager::page_size()>>
+        pages_;
+    page_id_t num_pages_ = 0;
+};
+
 class BufferPoolTest : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -284,6 +323,83 @@ TEST(BufferPoolEvictionFailureTest, FailedEvictionKeepsVictimFrameOutOfFreeList)
         << "victim page was reset while pinned";
 
     bpm.unpin_page(p0, /*is_dirty=*/false);
+}
+
+// Direct accounting check for the eviction-failure double-listing bug: after a
+// failed eviction flush, the victim frame must remain out of the free list. The
+// old code pushed the still-mapped frame onto the free list, so with a single-
+// frame pool free_list_size() would read 1 while the frame is still in the page
+// table — the frame double-listed. The fix returns it to the replacer instead,
+// leaving the free list empty.
+TEST(BufferPoolEvictionFailureTest, FailedEvictionLeavesFreeListEmpty) {
+    auto dm = std::make_shared<RecordingDiskManager>();
+    BufferPoolManager bpm(/*pool_size=*/1, dm);
+
+    page_id_t p0;
+    Page* page0 = bpm.new_page(&p0);
+    ASSERT_NE(page0, nullptr);
+    bpm.unpin_page(p0, /*is_dirty=*/true);  // dirty -> eviction must flush it
+    EXPECT_EQ(bpm.free_list_size(), 0u);    // the single frame is in use
+
+    // Make the eviction flush fail.
+    bpm.set_wal_flush_hook(
+        [](lsn_t) { return Status::IOError("wal flush failed"); });
+
+    page_id_t p1;
+    Page* page1 = bpm.new_page(&p1);
+    EXPECT_EQ(page1, nullptr);
+
+    // The victim stayed mapped and went back to the replacer, NOT the free list.
+    EXPECT_EQ(bpm.free_list_size(), 0u)
+        << "failed-eviction victim was double-listed onto the free list";
+}
+
+// Regression: delete_page must deallocate the on-disk page id even when the page
+// is not currently cached in the buffer pool. The old code returned success
+// without freeing the id for an uncached page, leaking disk space for pages that
+// were evicted and then deleted (a normal event during B+ tree merges under
+// memory pressure).
+TEST(BufferPoolDeletePageTest, DeletesUncachedPageFreesDiskId) {
+    auto dm = std::make_shared<DeallocRecordingDiskManager>();
+    BufferPoolManager bpm(/*pool_size=*/1, dm);
+
+    // Create page 0 (clean) and evict it by admitting page 1 into the one frame.
+    page_id_t p0;
+    Page* page0 = bpm.new_page(&p0);
+    ASSERT_NE(page0, nullptr);
+    bpm.unpin_page(p0, /*is_dirty=*/false);
+
+    page_id_t p1;
+    Page* page1 = bpm.new_page(&p1);
+    ASSERT_NE(page1, nullptr);
+    bpm.unpin_page(p1, /*is_dirty=*/false);
+
+    // Page 0 is no longer cached, but deleting it must still free its disk id.
+    EXPECT_TRUE(bpm.delete_page(p0, /*deallocate=*/true));
+    ASSERT_EQ(dm->deallocated.size(), 1u)
+        << "delete_page skipped disk deallocation for an uncached page";
+    EXPECT_EQ(dm->deallocated[0], p0);
+}
+
+// The deferred-deallocation contract still holds for uncached pages: with
+// deallocate=false the id is left allocated for the caller to free later.
+TEST(BufferPoolDeletePageTest, DeletesUncachedPageDeferredKeepsDiskId) {
+    auto dm = std::make_shared<DeallocRecordingDiskManager>();
+    BufferPoolManager bpm(/*pool_size=*/1, dm);
+
+    page_id_t p0;
+    Page* page0 = bpm.new_page(&p0);
+    ASSERT_NE(page0, nullptr);
+    bpm.unpin_page(p0, /*is_dirty=*/false);
+
+    page_id_t p1;
+    Page* page1 = bpm.new_page(&p1);
+    ASSERT_NE(page1, nullptr);
+    bpm.unpin_page(p1, /*is_dirty=*/false);
+
+    EXPECT_TRUE(bpm.delete_page(p0, /*deallocate=*/false));
+    EXPECT_TRUE(dm->deallocated.empty())
+        << "deferred delete_page must not free the disk id";
 }
 
 // The hook must also fire (before each write) on the flush_all_pages path.

@@ -215,7 +215,15 @@ bool BufferPoolManager::delete_page(page_id_t page_id, bool deallocate) {
 
     auto it = page_table_.find(page_id);
     if (it == page_table_.end()) {
-        return true;  // Page not in buffer pool
+        // Page is not currently cached (e.g. it was evicted before deletion).
+        // There is no buffered frame to reclaim, but the on-disk id must still
+        // be returned to the free list when the caller allows it — otherwise an
+        // evicted-then-deleted page (common during B+ tree merges under memory
+        // pressure) leaks disk space forever.
+        if (deallocate) {
+            disk_manager_->deallocate_page(page_id);
+        }
+        return true;
     }
 
     frame_id_t frame_id = it->second;

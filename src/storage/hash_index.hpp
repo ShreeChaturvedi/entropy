@@ -243,13 +243,34 @@ Status HashIndex<KeyType, ValueType>::insert(const KeyType &key,
     return Status::Ok();
   }
 
-  // Bucket is full, need to split
-  split_bucket(idx);
-
-  // Retry insert after split
+  // Bucket is full: split until the new key has room. A single split is not
+  // always enough — if every resident key plus the new one shares the current
+  // split bit, redistribution moves nothing and the bucket is still full, so we
+  // must keep splitting at successively higher bits (growing the directory as
+  // needed) until the keys finally separate. This is proper extendible-hashing
+  // directory growth rather than giving up after one attempt.
+  const size_t key_hash = std::hash<KeyType>{}(key);
   idx = get_index(key);
-  bucket = directory_[idx];
-  if (bucket->insert(key, value)) {
+  while (directory_[idx]->is_full()) {
+    // Guard against genuinely unsplittable keys: if every entry in the full
+    // bucket hashes to the same value as the new key, no bit can ever separate
+    // them, so stop instead of growing the directory forever.
+    bool separable = false;
+    for (const auto &entry : directory_[idx]->entries()) {
+      if (std::hash<KeyType>{}(entry.first) != key_hash) {
+        separable = true;
+        break;
+      }
+    }
+    if (!separable) {
+      return Status::InvalidArgument(
+          "Hash bucket overflow: keys share an identical hash value");
+    }
+    split_bucket(idx);
+    idx = get_index(key);
+  }
+
+  if (directory_[idx]->insert(key, value)) {
     return Status::Ok();
   }
 
