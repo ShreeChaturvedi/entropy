@@ -34,6 +34,14 @@ class TransactionManager;
 /// Maximum timestamp - indicates a version is still active/valid
 static constexpr uint64_t TIMESTAMP_MAX = std::numeric_limits<uint64_t>::max();
 
+/// Commit timestamp reserved for synthetic "pre-history" base versions — the
+/// stand-in committed version materialized for a row that predates its chain
+/// (e.g. loaded from disk before any live transaction). It sits strictly below
+/// the first timestamp @ref MVCCManager::get_timestamp ever hands out, so it
+/// can never collide with a real commit_ts while still comparing as committed
+/// and visible to every snapshot.
+static constexpr uint64_t TIMESTAMP_PREHISTORY = 1;
+
 /// Transaction ID indicating no transaction
 static constexpr txn_id_t TXN_ID_NONE = INVALID_TXN_ID;
 
@@ -237,8 +245,10 @@ public:
   void rollback_version(VersionInfo &version, const Transaction *txn);
 
 private:
-  /// Global monotonic timestamp counter
-  std::atomic<uint64_t> global_timestamp_{1};
+  /// Global monotonic timestamp counter. Starts one past the pre-history
+  /// sentinel so the first allocated timestamp is strictly greater than
+  /// TIMESTAMP_PREHISTORY and can never alias a synthetic base version.
+  std::atomic<uint64_t> global_timestamp_{TIMESTAMP_PREHISTORY + 1};
 };
 
 } // namespace entropy
