@@ -51,7 +51,7 @@ TEST(CatalogPersistence, SurvivesReopen) {
 
   // Phase 1: create table + index, insert rows.
   {
-    auto disk = std::make_shared<DiskManager>(db_path);
+    auto disk = std::make_shared<FileDiskManager>(db_path);
     auto buffer_pool = std::make_shared<BufferPoolManager>(64, disk);
     Catalog catalog(buffer_pool, manifest_path);
 
@@ -83,7 +83,7 @@ TEST(CatalogPersistence, SurvivesReopen) {
 
   // Phase 2: rebuild everything from the same files.
   {
-    auto disk = std::make_shared<DiskManager>(db_path);
+    auto disk = std::make_shared<FileDiskManager>(db_path);
     auto buffer_pool = std::make_shared<BufferPoolManager>(64, disk);
     Catalog catalog(buffer_pool, manifest_path);
 
@@ -140,7 +140,7 @@ TEST(CatalogPersistence, SurvivesReopen) {
 
 TEST(CatalogPersistence, DropReclaimsPages) {
   test::TempDir dir("cat_reclaim_");
-  auto disk = std::make_shared<DiskManager>((dir.path() / "d.db").string());
+  auto disk = std::make_shared<FileDiskManager>((dir.path() / "d.db").string());
   auto buffer_pool = std::make_shared<BufferPoolManager>(128, disk);
   Catalog catalog(buffer_pool, (dir.path() / "d.catalog").string());
 
@@ -175,7 +175,7 @@ TEST(CatalogPersistence, DropReclaimsPages) {
 
 TEST(CatalogPersistence, SharedHandleSurvivesDrop) {
   test::TempDir dir("cat_handle_");
-  auto disk = std::make_shared<DiskManager>((dir.path() / "h.db").string());
+  auto disk = std::make_shared<FileDiskManager>((dir.path() / "h.db").string());
   auto buffer_pool = std::make_shared<BufferPoolManager>(64, disk);
   Catalog catalog(buffer_pool, (dir.path() / "h.catalog").string());
 
@@ -231,7 +231,7 @@ TEST(CatalogPersistence, CrashImageWithUnflushedPagesDoesNotHang) {
   manifest.indexes.push_back(mi);
   ASSERT_TRUE(manifest.save(manifest_path).ok());
 
-  auto disk = std::make_shared<DiskManager>(db_path); // empty file
+  auto disk = std::make_shared<FileDiskManager>(db_path); // empty file
   auto buffer_pool = std::make_shared<BufferPoolManager>(64, disk);
   Catalog catalog(buffer_pool, manifest_path); // must not hang
 
@@ -280,7 +280,7 @@ TEST(CatalogPersistence, IndexRootChangeSurvivesReopen) {
   const std::string db_path = (dir.path() / "r.db").string();
   const std::string manifest_path = (dir.path() / "r.catalog").string();
 
-  auto disk = std::make_shared<DiskManager>(db_path);
+  auto disk = std::make_shared<FileDiskManager>(db_path);
   auto buffer_pool = std::make_shared<BufferPoolManager>(64, disk);
   Catalog catalog(buffer_pool, manifest_path);
 
@@ -311,7 +311,7 @@ TEST(CatalogPersistence, IndexRootChangeSurvivesReopen) {
   // Simulated kill -9: reopen through a fresh disk manager + pool while the
   // first pool still holds its unflushed frames.
   {
-    auto disk2 = std::make_shared<DiskManager>(db_path);
+    auto disk2 = std::make_shared<FileDiskManager>(db_path);
     auto buffer_pool2 = std::make_shared<BufferPoolManager>(64, disk2);
     Catalog catalog2(buffer_pool2, manifest_path);
 
@@ -335,7 +335,7 @@ TEST(CatalogPersistence, DamagedIndexRootRebuildsFromHeap) {
   const Schema schema = make_users_schema();
 
   {
-    auto disk = std::make_shared<DiskManager>(db_path);
+    auto disk = std::make_shared<FileDiskManager>(db_path);
     auto buffer_pool = std::make_shared<BufferPoolManager>(64, disk);
     Catalog catalog(buffer_pool, manifest_path);
 
@@ -363,7 +363,7 @@ TEST(CatalogPersistence, DamagedIndexRootRebuildsFromHeap) {
   }
 
   {
-    auto disk = std::make_shared<DiskManager>(db_path);
+    auto disk = std::make_shared<FileDiskManager>(db_path);
     auto buffer_pool = std::make_shared<BufferPoolManager>(64, disk);
     Catalog catalog(buffer_pool, manifest_path);
 
@@ -386,7 +386,7 @@ TEST(CatalogPersistence, DropTableDropsIndexes) {
   const std::string manifest_path = (dir.path() / "i.catalog").string();
 
   {
-    auto disk = std::make_shared<DiskManager>(db_path);
+    auto disk = std::make_shared<FileDiskManager>(db_path);
     auto buffer_pool = std::make_shared<BufferPoolManager>(64, disk);
     Catalog catalog(buffer_pool, manifest_path);
 
@@ -414,7 +414,7 @@ TEST(CatalogPersistence, DropTableDropsIndexes) {
 
   // The drop is durable: nothing comes back after a reopen.
   {
-    auto disk = std::make_shared<DiskManager>(db_path);
+    auto disk = std::make_shared<FileDiskManager>(db_path);
     auto buffer_pool = std::make_shared<BufferPoolManager>(64, disk);
     Catalog catalog(buffer_pool, manifest_path);
 
@@ -430,7 +430,7 @@ TEST(CatalogPersistence, DropTableDropsIndexes) {
 
 TEST(CatalogPersistence, ConcurrentCreateGetDrop) {
   test::TempDir dir("cat_concurrent_");
-  auto disk = std::make_shared<DiskManager>((dir.path() / "c.db").string());
+  auto disk = std::make_shared<FileDiskManager>((dir.path() / "c.db").string());
   auto buffer_pool = std::make_shared<BufferPoolManager>(256, disk);
   Catalog catalog(buffer_pool, (dir.path() / "c.catalog").string());
 
