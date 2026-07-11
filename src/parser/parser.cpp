@@ -5,6 +5,7 @@
 
 #include "parser/parser.hpp"
 
+#include <cctype>
 #include <stdexcept>
 #include <string>
 
@@ -173,18 +174,18 @@ std::unique_ptr<SelectStatement> Parser::parse_select() {
   auto stmt = std::make_unique<SelectStatement>();
   expect(TokenType::SELECT, "Expected SELECT");
 
-  // Parse columns: * or column list
+  // Parse columns: * or a comma-separated projection list. Each item may be a
+  // plain column, a computed expression, or an aggregate call, with an optional
+  // alias.
   if (match(TokenType::STAR)) {
     stmt->columns.push_back(SelectColumn::star());
   } else {
     do {
-      if (check(TokenType::IDENTIFIER)) {
-        stmt->columns.push_back(SelectColumn::column(current_.value));
-        advance();
-      } else {
-        set_error("Expected column name");
+      SelectColumn col;
+      if (!parse_select_column(&col)) {
         return nullptr;
       }
+      stmt->columns.push_back(std::move(col));
     } while (match(TokenType::COMMA));
   }
 
@@ -339,6 +340,117 @@ std::unique_ptr<SelectStatement> Parser::parse_select() {
 
   match(TokenType::SEMICOLON); // Optional trailing semicolon
   return stmt;
+}
+
+namespace {
+
+// Map an identifier to its aggregate function, or NONE if it is not one of the
+// recognised aggregate names (case-insensitive).
+AggregateFunc aggregate_from_name(const std::string &name) {
+  std::string upper;
+  upper.reserve(name.size());
+  for (char c : name) {
+    upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+  }
+  if (upper == "COUNT") return AggregateFunc::COUNT;
+  if (upper == "SUM") return AggregateFunc::SUM;
+  if (upper == "AVG") return AggregateFunc::AVG;
+  if (upper == "MIN") return AggregateFunc::MIN;
+  if (upper == "MAX") return AggregateFunc::MAX;
+  return AggregateFunc::NONE;
+}
+
+// Default output name for an aggregate over @p arg (e.g. "sum(age)").
+std::string aggregate_display_name(const std::string &fn,
+                                   const std::string &arg) {
+  std::string lower;
+  lower.reserve(fn.size());
+  for (char c : fn) {
+    lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+  }
+  return lower + "(" + arg + ")";
+}
+
+} // namespace
+
+bool Parser::parse_select_column(SelectColumn *out) {
+  // Aggregate call: NAME '(' ( '*' | expr ) ')'. Detected by an identifier that
+  // names an aggregate and is immediately followed by '('.
+  if (check(TokenType::IDENTIFIER)) {
+    AggregateFunc fn = aggregate_from_name(current_.value);
+    if (fn != AggregateFunc::NONE && peek_token().type == TokenType::LPAREN) {
+      const std::string fn_name = current_.value;
+      advance(); // consume function name
+      expect(TokenType::LPAREN, "Expected '(' after aggregate function");
+      if (match(TokenType::STAR)) {
+        if (fn != AggregateFunc::COUNT) {
+          set_error("Only COUNT supports '*' as its argument");
+          return false;
+        }
+        out->agg_func = AggregateFunc::COUNT_STAR;
+        out->alias = "count(*)";
+      } else {
+        auto arg = parse_expression();
+        if (!arg) {
+          return false;
+        }
+        // Derive a readable default name from a bare column argument.
+        std::string arg_name = "expr";
+        if (auto *col = dynamic_cast<const ColumnRefExpression *>(arg.get())) {
+          arg_name = col->column_name();
+        }
+        out->agg_func = fn;
+        out->expression = std::move(arg);
+        out->alias = aggregate_display_name(fn_name, arg_name);
+      }
+      expect(TokenType::RPAREN, "Expected ')' after aggregate argument");
+      // Optional explicit alias overrides the derived name.
+      if (match(TokenType::AS)) {
+        if (!check(TokenType::IDENTIFIER)) {
+          set_error("Expected alias name after AS");
+          return false;
+        }
+        out->alias = current_.value;
+        advance();
+      } else if (check(TokenType::IDENTIFIER)) {
+        out->alias = current_.value;
+        advance();
+      }
+      return true;
+    }
+  }
+
+  // Otherwise parse a general expression. A bare, unqualified column reference
+  // is stored as a plain column so the single-table fast path keeps working;
+  // anything else is a computed projection.
+  auto expr = parse_expression();
+  if (!expr) {
+    return false;
+  }
+  if (auto *col = dynamic_cast<const ColumnRefExpression *>(expr.get());
+      col != nullptr && col->table_name().empty()) {
+    out->column_name = col->column_name();
+  } else if (auto *qual = dynamic_cast<const ColumnRefExpression *>(expr.get())) {
+    out->column_name = qual->column_name();
+    out->table_alias = qual->table_name();
+    out->expression = std::move(expr);
+  } else {
+    out->expression = std::move(expr);
+  }
+
+  // Optional alias: `AS name` or a bare trailing identifier.
+  if (match(TokenType::AS)) {
+    if (!check(TokenType::IDENTIFIER)) {
+      set_error("Expected alias name after AS");
+      return false;
+    }
+    out->alias = current_.value;
+    advance();
+  } else if (check(TokenType::IDENTIFIER)) {
+    out->alias = current_.value;
+    advance();
+  }
+  return true;
 }
 
 std::unique_ptr<InsertStatement> Parser::parse_insert() {
