@@ -361,6 +361,16 @@ Transaction* TransactionManager::get_transaction(txn_id_t txn_id) {
     return (it != txn_map_.end()) ? it->second.get() : nullptr;
 }
 
+bool TransactionManager::is_active_transaction(txn_id_t txn_id,
+                                               const Transaction* txn) const {
+    if (txn == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = txn_map_.find(txn_id);
+    return it != txn_map_.end() && it->second.get() == txn;
+}
+
 std::vector<txn_id_t> TransactionManager::get_active_txn_ids() const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<txn_id_t> ids;

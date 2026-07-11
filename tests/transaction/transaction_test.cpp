@@ -846,6 +846,34 @@ TEST_F(TransactionManagerTest, GetTransaction) {
   EXPECT_EQ(tm.get_transaction(id), nullptr);
 }
 
+// is_active_transaction is the identity check a session uses to validate a
+// cached thread->transaction binding: it must accept only the exact live
+// (id, pointer) pair and reject a mismatched pointer, an unknown id, a null
+// pointer, and — critically — a transaction that has since ended. This is what
+// lets a recycled thread id that inherited a stale binding avoid misbinding to
+// a dead transaction.
+TEST_F(TransactionManagerTest, IsActiveTransactionValidatesIdentity) {
+  TransactionManager tm;
+
+  auto *txn = tm.begin();
+  const txn_id_t id = txn->txn_id();
+
+  // The exact live pair is accepted.
+  EXPECT_TRUE(tm.is_active_transaction(id, txn));
+
+  // A null pointer, a mismatched id, and a mismatched pointer are all rejected.
+  EXPECT_FALSE(tm.is_active_transaction(id, nullptr));
+  EXPECT_FALSE(tm.is_active_transaction(id + 1000, txn));
+  Transaction stranger(id, IsolationLevel::REPEATABLE_READ);
+  EXPECT_FALSE(tm.is_active_transaction(id, &stranger));
+
+  // Once the transaction commits it is no longer active: a binding that still
+  // held its id is now recognized as dead (the id is dropped from the active
+  // set, so the lookup fails before any pointer is examined).
+  tm.commit(txn);
+  EXPECT_FALSE(tm.is_active_transaction(id, &stranger));
+}
+
 TEST_F(TransactionManagerTest, GetActiveTransactionIds) {
   TransactionManager tm;
 
