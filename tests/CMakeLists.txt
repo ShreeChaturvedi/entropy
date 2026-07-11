@@ -82,6 +82,21 @@ target_link_libraries(transaction_tests
 
 gtest_discover_tests(transaction_tests)
 
+# Lock manager concurrency / deadlock (wait-die) tests
+add_executable(lock_manager_tests
+    transaction/lock_manager_test.cpp
+)
+
+target_link_libraries(lock_manager_tests
+    PRIVATE
+        entropy_transaction
+        test_utils
+        GTest::gtest
+        GTest::gtest_main
+)
+
+gtest_discover_tests(lock_manager_tests)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Integration Tests
 # ─────────────────────────────────────────────────────────────────────────────
