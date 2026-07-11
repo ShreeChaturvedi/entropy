@@ -15,7 +15,9 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "catalog/catalog.hpp"
 #include "common/config.hpp"
@@ -37,6 +39,7 @@
 #include "parser/statement.hpp"
 #include "storage/buffer_pool.hpp"
 #include "storage/disk_manager.hpp"
+#include "storage/table_heap.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/mvcc.hpp"
 #include "transaction/recovery.hpp"
@@ -194,8 +197,16 @@ public:
 
     // Every DML/query statement runs inside a transaction: the calling
     // thread's explicit one if open, otherwise an implicit autocommit
-    // transaction spanning just this statement.
-    Transaction *txn = current_txn();
+    // transaction spanning just this statement. A failed explicit
+    // transaction (aborted by an earlier error) rejects statements until the
+    // caller rolls it back — it must never fall through to autocommit.
+    const SessionState session = session_state();
+    if (session.bound && session.txn == nullptr) {
+      return Result(Status::Aborted(
+          "Current transaction is aborted; statements are rejected until "
+          "rollback"));
+    }
+    Transaction *txn = session.txn;
     const bool autocommit = (txn == nullptr);
     if (autocommit) {
       txn = txn_manager_->begin();
@@ -229,11 +240,13 @@ public:
     if (!result.ok()) {
       // Executor error or write-write conflict: the transaction's writes may
       // be partially applied, so abort it (write-set undo + version rollback
-      // + lock release) and surface the error. An explicit transaction ends
-      // here too — its effects are gone, and later statements must not run
-      // on an aborted transaction. (Autocommit has no thread binding to drop;
-      // take_thread_txn is then a nullptr-returning no-op.)
-      (void)take_thread_txn();
+      // + lock release) and surface the error. An explicit transaction stays
+      // BOUND in a failed state: subsequent statements are rejected and only
+      // rollback (or commit, which errors) clears it, so the caller can
+      // never silently fall back to autocommit mid-transaction.
+      if (!autocommit) {
+        mark_thread_txn_failed();
+      }
       txn_manager_->abort(txn);
       return result;
     }
@@ -488,9 +501,49 @@ public:
 
   Result execute_drop_table(DropTableStatement *stmt) {
     oid_t table_oid = catalog_->get_table_oid(stmt->table_name);
+
+    // Snapshot the heap's page ids before the drop reclaims them: both the
+    // version-store purge and nothing else can recover them afterwards.
+    std::vector<page_id_t> dropped_pages;
+    if (auto info = catalog_->get_table_shared(stmt->table_name);
+        info && info->table_heap) {
+      dropped_pages = info->table_heap->page_ids();
+    }
+
     Status status = catalog_->drop_table(stmt->table_name);
     if (!status.ok()) {
       return Result(status);
+    }
+
+    // The dropped table's pages return to the disk manager's free list and
+    // may be handed to a different table. Two kinds of stale state must not
+    // outlive the drop:
+    //
+    // 1. Version chains keyed by RIDs on those pages — a later table reusing
+    //    a page would inherit visibility decisions from dropped rows.
+    version_store_->purge_pages(std::unordered_set<page_id_t>(
+        dropped_pages.begin(), dropped_pages.end()));
+
+    // 2. The dropped table's WAL records. Redo replays records in LSN order
+    //    onto pages by id; without a boundary, a reused page's fresh content
+    //    would first be rebuilt from the dropped table's records (whose page
+    //    LSNs are gone with the zeroed page) and the new table's own inserts
+    //    would then collide with the resurrected slots. A checkpoint HERE
+    //    advances the redo anchor past every record that targeted the freed
+    //    pages, exactly like the startup checkpoint does after recovery. The
+    //    writer barrier quiesces concurrent appends for the anchor capture.
+    //    On failure the anchor simply does not advance — correctness after a
+    //    crash-without-reuse is unaffected, so log loudly and continue.
+    if (wal_manager_) {
+      RecoveryManager recovery(buffer_pool_, wal_manager_, disk_manager_);
+      Status checkpointed = recovery.create_checkpoint(
+          txn_manager_->get_active_txn_ids(),
+          &txn_manager_->checkpoint_barrier());
+      if (!checkpointed.ok()) {
+        LOG_ERROR("Post-drop checkpoint failed; freed pages must not be "
+                  "reused before the next successful checkpoint: {}",
+                  checkpointed.message());
+      }
     }
 
     if (table_oid != INVALID_OID) {
@@ -663,29 +716,39 @@ public:
     if (txn == nullptr) {
       return Status::Internal("Failed to begin transaction");
     }
-    thread_txns_[tid] = txn;
+    thread_txns_[tid] = ThreadTxn{txn};
     return Status::Ok();
   }
 
   Status commit() {
-    Transaction *txn = take_thread_txn();
-    if (txn == nullptr) {
+    SessionState state = unbind_thread_txn();
+    if (!state.bound) {
       return Status::Error("No active transaction");
     }
-    txn_manager_->commit(txn);
+    if (state.txn == nullptr) {
+      // The transaction was already aborted by a failed statement; there is
+      // nothing to make durable. Clear the binding and tell the caller.
+      return Status::Aborted(
+          "Cannot commit: transaction was aborted and has been rolled back");
+    }
+    txn_manager_->commit(state.txn);
     return Status::Ok();
   }
 
   Status rollback() {
-    Transaction *txn = take_thread_txn();
-    if (txn == nullptr) {
+    SessionState state = unbind_thread_txn();
+    if (!state.bound) {
       return Status::Error("No active transaction");
     }
-    txn_manager_->abort(txn);
+    if (state.txn != nullptr) {
+      txn_manager_->abort(state.txn);
+    }
+    // A failed binding was already aborted; clearing it completes the
+    // rollback the caller owed.
     return Status::Ok();
   }
 
-  bool in_transaction() const noexcept { return current_txn() != nullptr; }
+  bool in_transaction() const noexcept { return session_state().bound; }
 
   Status close() {
     Status result = Status::Ok();
@@ -715,23 +778,41 @@ public:
   Catalog *catalog_for_testing() noexcept { return catalog_.get(); }
 
 private:
-  /// The calling thread's explicit transaction, or nullptr.
-  Transaction *current_txn() const noexcept {
-    std::lock_guard<std::mutex> lock(session_mutex_);
-    auto it = thread_txns_.find(std::this_thread::get_id());
-    return it == thread_txns_.end() ? nullptr : it->second;
-  }
+  /// Result of looking up the calling thread's explicit-transaction binding.
+  struct SessionState {
+    bool bound = false;          ///< an explicit transaction is open (or failed)
+    Transaction *txn = nullptr;  ///< live transaction; null when failed
+  };
 
-  /// Remove and return the calling thread's transaction (nullptr if none).
-  Transaction *take_thread_txn() {
+  [[nodiscard]] SessionState session_state() const {
     std::lock_guard<std::mutex> lock(session_mutex_);
     auto it = thread_txns_.find(std::this_thread::get_id());
     if (it == thread_txns_.end()) {
-      return nullptr;
+      return {};
     }
-    Transaction *txn = it->second;
+    return {true, it->second.txn};
+  }
+
+  /// Mark the calling thread's binding failed (its transaction was aborted);
+  /// the binding survives until rollback/commit so later statements error.
+  void mark_thread_txn_failed() {
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    auto it = thread_txns_.find(std::this_thread::get_id());
+    if (it != thread_txns_.end()) {
+      it->second.txn = nullptr;
+    }
+  }
+
+  /// Remove the calling thread's binding, returning its state before removal.
+  SessionState unbind_thread_txn() {
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    auto it = thread_txns_.find(std::this_thread::get_id());
+    if (it == thread_txns_.end()) {
+      return {};
+    }
+    SessionState state{true, it->second.txn};
     thread_txns_.erase(it);
-    return txn;
+    return state;
   }
 
   std::string path_;
@@ -759,9 +840,16 @@ private:
   std::shared_ptr<CostModel> cost_model_;
   std::unique_ptr<IndexSelector> index_selector_;
 
-  // Per-thread explicit transactions ("a connection is a thread").
+  // Per-thread explicit transactions ("a connection is a thread"). A binding
+  // whose transaction failed (aborted by a statement error or write-write
+  // conflict) stays bound with txn == nullptr until the caller issues
+  // rollback (or commit, which errors and clears): statements meanwhile are
+  // rejected instead of silently autocommitting.
+  struct ThreadTxn {
+    Transaction *txn = nullptr; ///< null once the transaction was aborted
+  };
   mutable std::mutex session_mutex_;
-  std::unordered_map<std::thread::id, Transaction *> thread_txns_;
+  std::unordered_map<std::thread::id, ThreadTxn> thread_txns_;
 };
 
 Database::Database(const std::string &path, const DatabaseOptions &options)

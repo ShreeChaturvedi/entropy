@@ -214,8 +214,15 @@ TEST_F(TransactionApiTest, ConcurrentUpdatesOneWinnerOneConflict) {
     } else {
       EXPECT_EQ(result.status().code(), StatusCode::kAborted)
           << result.status().to_string();
-      // The conflict already aborted the transaction; the thread's explicit
-      // transaction is closed.
+      // The conflict aborted the transaction, but the binding stays in a
+      // failed state until this thread acknowledges it with rollback —
+      // statements must not silently fall back to autocommit.
+      EXPECT_TRUE(db.in_transaction());
+      auto rejected = db.execute("UPDATE t SET v = 999 WHERE id = 1");
+      EXPECT_FALSE(rejected.ok())
+          << "statement accepted on an aborted transaction";
+      Status rolled_back = db.rollback();
+      EXPECT_TRUE(rolled_back.ok()) << rolled_back.to_string();
       EXPECT_FALSE(db.in_transaction());
       conflict_count.fetch_add(1);
     }
@@ -309,6 +316,286 @@ TEST_F(TransactionApiTest, SnapshotReadSeesBeforeImageOfUncommittedUpdate) {
   ASSERT_TRUE(result.ok());
   ASSERT_EQ(result.row_count(), 1u);
   EXPECT_EQ(result.rows()[0][0].as_int32(), 20);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Snapshot isolation: deletes and relocations (ghost reads)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// An uncommitted DELETE must not erase the row from a concurrent snapshot: the
+// deleter frees the heap slot at execute time, but the retained before-image
+// stays visible through the version chain until the delete commits — and a
+// rollback makes it plainly visible again.
+TEST_F(TransactionApiTest, UncommittedDeleteKeepsRowVisibleToOlderSnapshot) {
+  Database db(path_);
+  ASSERT_TRUE(db.execute("CREATE TABLE t (id INTEGER, v INTEGER)").ok());
+  ASSERT_TRUE(db.execute("INSERT INTO t VALUES (1, 10)").ok());
+
+  // Snapshot A (main thread) predates the delete.
+  ASSERT_TRUE(db.begin_transaction().ok());
+  EXPECT_EQ(count_rows(db, "t"), 1u);
+
+  std::atomic<bool> deleted{false};
+  std::atomic<bool> resume{false};
+  std::thread deleter([&] {
+    ASSERT_TRUE(db.begin_transaction().ok());
+    auto result = db.execute("DELETE FROM t WHERE id = 1");
+    ASSERT_TRUE(result.ok()) << result.status().to_string();
+    ASSERT_EQ(result.affected_rows(), 1u);
+    deleted.store(true);
+    while (!resume.load()) {
+      std::this_thread::yield();
+    }
+    ASSERT_TRUE(db.rollback().ok());
+  });
+
+  while (!deleted.load()) {
+    std::this_thread::yield();
+  }
+
+  // The delete is uncommitted: A must still see the row (this was the
+  // reviewer's dirty-read-of-absence — a never-durable delete erased a
+  // committed row from a concurrent snapshot).
+  EXPECT_EQ(count_rows(db, "t"), 1u)
+      << "uncommitted DELETE hid the row from an older snapshot";
+
+  resume.store(true);
+  deleter.join();
+
+  // The delete rolled back: still visible to A, and to a fresh snapshot.
+  EXPECT_EQ(count_rows(db, "t"), 1u);
+  ASSERT_TRUE(db.commit().ok());
+  EXPECT_EQ(count_rows(db, "t"), 1u);
+}
+
+// True SI: even after the deleter COMMITS, a still-open older snapshot keeps
+// seeing the pre-image; only snapshots taken after the commit see it gone.
+TEST_F(TransactionApiTest, CommittedDeleteKeepsRowVisibleToOpenOlderSnapshot) {
+  Database db(path_);
+  ASSERT_TRUE(db.execute("CREATE TABLE t (id INTEGER, v INTEGER)").ok());
+  ASSERT_TRUE(db.execute("INSERT INTO t VALUES (1, 10)").ok());
+
+  ASSERT_TRUE(db.begin_transaction().ok());
+  EXPECT_EQ(count_rows(db, "t"), 1u);
+
+  std::thread deleter([&] {
+    auto result = db.execute("DELETE FROM t WHERE id = 1"); // autocommit
+    ASSERT_TRUE(result.ok()) << result.status().to_string();
+    ASSERT_EQ(result.affected_rows(), 1u);
+  });
+  deleter.join();
+
+  // The deleter committed, but A's snapshot predates it.
+  EXPECT_EQ(count_rows(db, "t"), 1u)
+      << "committed DELETE erased the row from an older open snapshot";
+  ASSERT_TRUE(db.commit().ok());
+
+  // A fresh snapshot sees the delete.
+  EXPECT_EQ(count_rows(db, "t"), 0u);
+}
+
+// A grow-update's relocation must not make the old row vanish from an older
+// snapshot through its delete leg — before or after the writer commits.
+TEST_F(TransactionApiTest, RelocatedUpdateKeepsOldRowVisibleToOlderSnapshot) {
+  const std::string small(850, 'a');
+  const std::string big(900, 'b');
+
+  Database db(path_);
+  ASSERT_TRUE(db.execute("CREATE TABLE t (id INTEGER, v VARCHAR(1000))").ok());
+  for (int i = 1; i <= 4; ++i) {
+    ASSERT_TRUE(db.execute("INSERT INTO t VALUES (" + std::to_string(i) +
+                           ", '" + small + "')")
+                    .ok());
+  }
+
+  // Snapshot A predates the update.
+  ASSERT_TRUE(db.begin_transaction().ok());
+  auto pre = db.execute("SELECT v FROM t WHERE id = 1");
+  ASSERT_TRUE(pre.ok());
+  ASSERT_EQ(pre.row_count(), 1u);
+
+  std::atomic<bool> updated{false};
+  std::atomic<bool> resume{false};
+  std::thread writer([&] {
+    ASSERT_TRUE(db.begin_transaction().ok());
+    auto result = db.execute("UPDATE t SET v = '" + big + "' WHERE id = 1");
+    ASSERT_TRUE(result.ok()) << result.status().to_string();
+    ASSERT_EQ(result.affected_rows(), 1u);
+    updated.store(true);
+    while (!resume.load()) {
+      std::this_thread::yield();
+    }
+    ASSERT_TRUE(db.commit().ok());
+  });
+
+  while (!updated.load()) {
+    std::this_thread::yield();
+  }
+
+  // Uncommitted relocation: A must still see the old value at the old row.
+  auto mid = db.execute("SELECT v FROM t WHERE id = 1");
+  ASSERT_TRUE(mid.ok()) << mid.status().to_string();
+  ASSERT_EQ(mid.row_count(), 1u)
+      << "relocated row vanished from an older snapshot";
+  EXPECT_EQ(mid.rows()[0][0].as_string(), small);
+  EXPECT_EQ(count_rows(db, "t"), 4u) << "relocation duplicated rows";
+
+  resume.store(true);
+  writer.join();
+
+  // Writer committed; A's snapshot still predates it.
+  auto post = db.execute("SELECT v FROM t WHERE id = 1");
+  ASSERT_TRUE(post.ok());
+  ASSERT_EQ(post.row_count(), 1u)
+      << "committed relocation erased the row from an older open snapshot";
+  EXPECT_EQ(post.rows()[0][0].as_string(), small);
+  EXPECT_EQ(count_rows(db, "t"), 4u);
+  ASSERT_TRUE(db.commit().ok());
+
+  // A fresh snapshot sees the new value, exactly once.
+  auto fresh = db.execute("SELECT v FROM t WHERE id = 1");
+  ASSERT_TRUE(fresh.ok());
+  ASSERT_EQ(fresh.row_count(), 1u);
+  EXPECT_EQ(fresh.rows()[0][0].as_string(), big);
+  EXPECT_EQ(count_rows(db, "t"), 4u);
+}
+
+// Hammer the insert publication window: a rolled-back INSERT must never be
+// observed by a concurrent reader, not even transiently (the reviewer caught
+// the unfixed window at ~26k reads: heap bytes readable before their version
+// existed). WAL off so thousands of iterations stay fast; the publication
+// mechanics under test are WAL-independent.
+TEST_F(TransactionApiTest, RolledBackInsertsNeverVisibleToConcurrentReaders) {
+  DatabaseOptions options;
+  options.enable_wal = false;
+  Database db(path_, options);
+  ASSERT_TRUE(db.execute("CREATE TABLE t (id INTEGER)").ok());
+
+  constexpr int kIterations = 10000;
+  std::atomic<bool> done{false};
+  std::atomic<size_t> reads{0};
+  std::atomic<size_t> dirty_reads{0};
+
+  std::thread writer([&] {
+    for (int i = 0; i < kIterations; ++i) {
+      Status begun = db.begin_transaction();
+      ASSERT_TRUE(begun.ok()) << begun.to_string();
+      auto ins = db.execute("INSERT INTO t VALUES (" + std::to_string(i) + ")");
+      ASSERT_TRUE(ins.ok()) << ins.status().to_string();
+      Status rolled = db.rollback();
+      ASSERT_TRUE(rolled.ok()) << rolled.to_string();
+    }
+    done.store(true);
+  });
+
+  // Several concurrent readers: their autocommit commits also run version GC,
+  // which prunes the rollback tombstones between writer iterations — exactly
+  // the state in which an unordered insert publication would be observable.
+  auto read_loop = [&] {
+    while (!done.load()) {
+      auto result = db.execute("SELECT * FROM t");
+      ASSERT_TRUE(result.ok()) << result.status().to_string();
+      reads.fetch_add(1);
+      if (result.row_count() > 0) {
+        dirty_reads.fetch_add(1);
+      }
+    }
+  };
+  std::thread r1(read_loop);
+  std::thread r2(read_loop);
+  read_loop();
+  r1.join();
+  r2.join();
+  writer.join();
+
+  EXPECT_EQ(dirty_reads.load(), 0u)
+      << "observed uncommitted/rolled-back inserts in " << reads.load()
+      << " reads";
+  EXPECT_EQ(count_rows(db, "t"), 0u);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Failed-transaction semantics
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A failed statement aborts the explicit transaction but keeps it BOUND in a
+// failed state: later statements are rejected (never silently autocommitted),
+// commit errors and clears, rollback clears. The reviewer's repro exploited
+// the old unbind-on-error: follow-up statements autocommitted and the final
+// rollback() no-opped, leaving exactly the wrong rows behind.
+TEST_F(TransactionApiTest, FailedStatementPoisonsExplicitTransaction) {
+  Database db(path_);
+  ASSERT_TRUE(db.execute("CREATE TABLE t (id INTEGER, v VARCHAR(16))").ok());
+  ASSERT_TRUE(db.execute("INSERT INTO t VALUES (1, 'keep')").ok());
+
+  // Variant 1: commit on a failed transaction errors and clears.
+  ASSERT_TRUE(db.begin_transaction().ok());
+  ASSERT_TRUE(db.execute("INSERT INTO t VALUES (2, 'mine')").ok());
+  auto bad = db.execute("INSERT INTO missing VALUES (1)");
+  ASSERT_FALSE(bad.ok());
+
+  EXPECT_TRUE(db.in_transaction()) << "error silently unbound the transaction";
+  auto rejected = db.execute("INSERT INTO t VALUES (3, 'no')");
+  EXPECT_FALSE(rejected.ok()) << "statement ran on an aborted transaction";
+  EXPECT_EQ(rejected.status().code(), StatusCode::kAborted);
+  rejected = db.execute("SELECT * FROM t");
+  EXPECT_FALSE(rejected.ok()) << "read ran on an aborted transaction";
+
+  Status committed = db.commit();
+  EXPECT_FALSE(committed.ok()) << "commit succeeded on an aborted transaction";
+  EXPECT_FALSE(db.in_transaction());
+
+  // Everything from the failed transaction is gone; only 'keep' remains.
+  auto result = db.execute("SELECT v FROM t");
+  ASSERT_TRUE(result.ok()) << result.status().to_string();
+  ASSERT_EQ(result.row_count(), 1u);
+  EXPECT_EQ(result.rows()[0][0].as_string(), "keep");
+
+  // Variant 2: rollback acknowledges the failure cleanly.
+  ASSERT_TRUE(db.begin_transaction().ok());
+  ASSERT_TRUE(db.execute("INSERT INTO t VALUES (4, 'gone')").ok());
+  ASSERT_FALSE(db.execute("SELECT * FROM missing").ok());
+  EXPECT_TRUE(db.in_transaction());
+  EXPECT_TRUE(db.rollback().ok());
+  EXPECT_FALSE(db.in_transaction());
+  EXPECT_EQ(count_rows(db, "t"), 1u);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DDL page reuse vs. recovery
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Dropping a table frees its pages for reuse, but its WAL records remain. A
+// crash after a new table reused a freed page must not resurrect the dropped
+// table's rows into it (the reviewer's repro: table b contained a's two
+// dropped rows and b's own committed row was gone, because redo replayed a's
+// inserts into the zeroed reused page and b's insert then collided). The
+// post-drop checkpoint advances the redo anchor past the stale records.
+TEST_F(TransactionApiTest, DroppedTablePageReuseSurvivesCrashRecovery) {
+  auto db1 = std::make_unique<Database>(path_);
+  ASSERT_TRUE(db1->execute("CREATE TABLE a (id INTEGER, v VARCHAR(32))").ok());
+  ASSERT_TRUE(
+      db1->execute("INSERT INTO a VALUES (1, 'a-one'), (2, 'a-two')").ok());
+  ASSERT_TRUE(db1->execute("DROP TABLE a").ok());
+
+  // b's first heap page reuses a's freed page.
+  ASSERT_TRUE(db1->execute("CREATE TABLE b (id INTEGER, v VARCHAR(32))").ok());
+  ASSERT_TRUE(db1->execute("INSERT INTO b VALUES (10, 'b-row')").ok());
+
+  // Crash: reopen without a clean close of db1.
+  {
+    Database db2(path_);
+    ASSERT_TRUE(db2.is_open());
+    auto result = db2.execute("SELECT * FROM b");
+    ASSERT_TRUE(result.ok()) << result.status().to_string();
+    ASSERT_EQ(result.row_count(), 1u)
+        << "recovery resurrected dropped rows into the reused page";
+    EXPECT_EQ(result.rows()[0][0].as_int32(), 10);
+    EXPECT_EQ(result.rows()[0][1].as_string(), "b-row");
+    (void)db2.close();
+  }
+
+  db1.reset();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
