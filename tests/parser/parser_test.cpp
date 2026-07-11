@@ -996,5 +996,45 @@ TEST_F(ParserTest, UnterminatedBlockCommentIsParseError) {
   EXPECT_FALSE(parser.parse(&stmt).ok());
 }
 
+// -- Lexer/parser: extended column types -------------------------------------
+
+TEST_F(LexerTest, TokenizeExtendedTypeKeywords) {
+  Lexer lexer("DECIMAL TIMESTAMP DATE CHAR");
+  EXPECT_EQ(lexer.next_token().type, TokenType::DECIMAL);
+  EXPECT_EQ(lexer.next_token().type, TokenType::TIMESTAMP);
+  EXPECT_EQ(lexer.next_token().type, TokenType::DATE);
+  EXPECT_EQ(lexer.next_token().type, TokenType::CHAR);
+}
+
+TEST_F(ParserTest, ParseCreateTableExtendedTypes) {
+  Parser parser("CREATE TABLE t (a DECIMAL, b DECIMAL(10, 2), c TIMESTAMP, "
+                "d DATE, e CHAR(8))");
+  std::unique_ptr<Statement> stmt;
+  Status status = parser.parse(&stmt);
+  ASSERT_TRUE(status.ok()) << status.to_string();
+
+  auto *create = dynamic_cast<CreateTableStatement *>(stmt.get());
+  ASSERT_NE(create, nullptr);
+  ASSERT_EQ(create->columns.size(), 5u);
+  EXPECT_EQ(create->columns[0].type, TypeId::DECIMAL);
+  EXPECT_EQ(create->columns[1].type, TypeId::DECIMAL);
+  EXPECT_EQ(create->columns[2].type, TypeId::TIMESTAMP);
+  EXPECT_EQ(create->columns[3].type, TypeId::TIMESTAMP); // DATE bridges to it
+  EXPECT_EQ(create->columns[4].type, TypeId::VARCHAR);   // CHAR bridges to it
+  EXPECT_EQ(create->columns[4].length, 8u);
+}
+
+TEST_F(ParserTest, DecimalPrecisionOverflowIsError) {
+  Parser parser("CREATE TABLE t (a DECIMAL(99999999999999999999999))");
+  std::unique_ptr<Statement> stmt;
+  EXPECT_FALSE(parser.parse(&stmt).ok());
+}
+
+TEST_F(ParserTest, DecimalMissingPrecisionIsError) {
+  Parser parser("CREATE TABLE t (a DECIMAL())");
+  std::unique_ptr<Statement> stmt;
+  EXPECT_FALSE(parser.parse(&stmt).ok());
+}
+
 } // namespace
 } // namespace entropy
