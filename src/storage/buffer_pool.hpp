@@ -126,6 +126,21 @@ public:
      */
     void set_wal_flush_hook(std::function<Status(lsn_t)> hook);
 
+    /**
+     * @brief Toggle recovery mode for torn/corrupt-page handling
+     *
+     * Off (default): a corrupt read from the disk manager (torn-page checksum
+     * mismatch) fails fetch_page, surfacing the data-loss error to the caller.
+     *
+     * On: a torn/corrupt page cannot be trusted, but recovery reconstructs its
+     * correct contents from the WAL. fetch_page then hands back a fresh, empty
+     * frame (page id set, LSN = INVALID_LSN) for that page so the redo phase
+     * replays every change onto it. This is the seam that lets recovery survive
+     * a detected torn write; it is enabled only on a pool used exclusively for
+     * recovery.
+     */
+    void set_recovery_mode(bool on);
+
 private:
     /// Find a frame to use (evict if necessary)
     [[nodiscard]] frame_id_t find_victim_frame();
@@ -140,6 +155,7 @@ private:
     std::unordered_map<page_id_t, frame_id_t> page_table_;
     std::vector<frame_id_t> free_list_;
     std::function<Status(lsn_t)> wal_flush_hook_;
+    bool recovery_mode_ = false;
     mutable std::mutex mutex_;
 };
 
