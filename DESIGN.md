@@ -418,16 +418,22 @@ Leaf Node:
 ## Threading Model
 
 ### Concurrency Strategy
-1. **Buffer Pool**: Thread-safe with per-page latches (shared/exclusive)
-2. **B+ Tree**: Latch crabbing protocol for concurrent access
+1. **Buffer Pool**: Thread-safe (internal mutex); every `Page` carries a
+   shared/exclusive latch used by the B+ tree
+2. **B+ Tree**: Latch crabbing (hand-over-hand page latches) — concurrent
+   readers and range scans; structural writers (insert/delete) are serialized
+   and shed ancestor latches once a node is split/merge-safe
 3. **Transaction Manager**: Centralized lock manager with 2PL + MVCC
 4. **WAL**: Single-writer with group commit optimization
 
 ### Lock Hierarchy (to prevent deadlocks)
 1. Lock Manager mutex
 2. Transaction mutexes
-3. Buffer pool frame latches
-4. Page latches (acquired via crabbing)
+3. B+ tree writer mutex (serializes structural writers)
+4. Page latches (acquired via crabbing: ancestors before descendants,
+   left siblings before right)
+5. Buffer pool internal mutex (leaf-level; never held while waiting on a
+   page latch)
 
 ---
 
