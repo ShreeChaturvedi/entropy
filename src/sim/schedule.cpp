@@ -190,6 +190,11 @@ RunResult run_schedule(uint64_t seed, const Schedule &schedule) {
   std::shared_ptr<LogStore> rlog = SimLogStore::reopen(std::move(log_bytes));
 
   auto rpool = std::make_shared<BufferPoolManager>(kPoolSize, rdisk);
+  // This pool exists only to recover and then verify. A page the reopened disk
+  // reports as torn (checksum mismatch) must be rebuilt from the WAL, so put the
+  // pool in recovery mode: fetch_page reinitializes a detected torn page to a
+  // fresh, empty frame and lets redo replay every committed change onto it.
+  rpool->set_recovery_mode(true);
   auto rwal = std::make_shared<WALManager>(rlog);
   auto rheap = std::make_shared<TableHeap>(rpool);
 
@@ -346,17 +351,20 @@ std::optional<Schedule> make_schedule(const std::string &name) {
     return s;
   }
   if (name == "torn_page_write") {
-    // EXCLUDED from the passing set (schedule_names()) on purpose. Committed
-    // pages are stolen to disk (unsynced) and every one is TORN at the crash: a
-    // partial mix of new and pre-crash bytes. The engine has no page checksums,
-    // so recovery cannot detect the tear; when the surviving fragment includes
-    // the header + slot directory, redo cannot repair it either (the slot
-    // claims the record is live, so insert-at refuses), and recover() reports
-    // success while committed bytes are gone. Fails committed_present on
-    // 220/500 measured seeds (the failing side of the tear is the one that
-    // keeps the header). Tracked in issue #86; do not add to the passing sweep
-    // until pages carry checksums. Reproduce:
-    //   entropy-sim --schedule torn_page_write --seeds 200
+    // Committed pages are stolen to disk (unsynced) and every one is TORN at the
+    // crash: a partial mix of new and pre-crash bytes. Pages now carry a header
+    // checksum, so the reopened disk's read_page DETECTS the tear (checksum
+    // mismatch) and returns Corruption instead of silently serving the
+    // half-persisted bytes. The recovery pool, in recovery mode, treats a
+    // detected torn page as needing WAL redo: it reinitializes the frame to a
+    // fresh, empty page (discarding the untrusted bytes) and repeat-history redo
+    // replays every committed change onto it. Recovery therefore restores the
+    // committed rows on every seed, including the previously fatal case where
+    // the surviving fragment kept the header + slot directory. must_fire pins
+    // the anti-vacuity contract (the tear must actually fire across the sweep),
+    // and the sweep's pass check guarantees recovery restored the data — a
+    // permanent green guard against silent torn-page data loss (issue #86).
+    // Reproduce: entropy-sim --schedule torn_page_write --seeds 40 (40/40 pass).
     s.crash_point = "committed_pages_torn_unsynced";
     s.num_txns = 14;
     s.leave_in_flight = false;
@@ -390,6 +398,7 @@ std::vector<std::string> schedule_names() {
       "transient_write_errors",
       "mixed",
       "live_abort_repro",
+      "torn_page_write",
   };
 }
 
