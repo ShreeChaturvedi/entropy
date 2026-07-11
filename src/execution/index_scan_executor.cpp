@@ -99,7 +99,9 @@ std::optional<Tuple> IndexScanExecutor::next() {
       // heap version may be invisible to this transaction.
       return mvcc_visible(ctx_, tuple);
     }
-    return std::nullopt;
+    // Empty slot: the row may be a ghost whose retained before-image is
+    // still visible to this snapshot (uncommitted or later-committed DELETE).
+    return mvcc_visible(ctx_, Tuple({}, *point_lookup_rid_));
   }
 
   case IndexScanType::RANGE_SCAN: {
@@ -113,16 +115,16 @@ std::optional<Tuple> IndexScanExecutor::next() {
         return std::nullopt;
       }
 
-      // Fetch tuple from table heap
+      // Fetch tuple from table heap; an empty slot may still be a ghost row
+      // whose retained before-image is visible to this snapshot.
       Tuple tuple;
       Status status = table_heap_->get_tuple(rid, &tuple);
-      if (status.ok()) {
-        std::optional<Tuple> visible = mvcc_visible(ctx_, tuple);
-        if (visible.has_value()) {
-          return visible;
-        }
+      std::optional<Tuple> visible =
+          mvcc_visible(ctx_, status.ok() ? tuple : Tuple({}, rid));
+      if (visible.has_value()) {
+        return visible;
       }
-      // RID might be invalid (deleted) or invisible to this snapshot; continue.
+      // Deleted or invisible to this snapshot; continue.
     }
     return std::nullopt;
   }
@@ -133,16 +135,16 @@ std::optional<Tuple> IndexScanExecutor::next() {
       auto [key, rid] = *iterator_;
       ++iterator_;
 
-      // Fetch tuple from table heap
+      // Fetch tuple from table heap; an empty slot may still be a ghost row
+      // whose retained before-image is visible to this snapshot.
       Tuple tuple;
       Status status = table_heap_->get_tuple(rid, &tuple);
-      if (status.ok()) {
-        std::optional<Tuple> visible = mvcc_visible(ctx_, tuple);
-        if (visible.has_value()) {
-          return visible;
-        }
+      std::optional<Tuple> visible =
+          mvcc_visible(ctx_, status.ok() ? tuple : Tuple({}, rid));
+      if (visible.has_value()) {
+        return visible;
       }
-      // Continue to next if current RID invalid or invisible to this snapshot.
+      // Deleted or invisible to this snapshot; continue.
     }
     return std::nullopt;
   }

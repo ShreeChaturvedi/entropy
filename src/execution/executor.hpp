@@ -5,6 +5,7 @@
  * @brief Executor interface
  */
 
+#include <functional>
 #include <memory>
 #include <optional>
 
@@ -68,15 +69,31 @@ enum class TxnWriteKind { kUpdate, kDelete };
                                        const Tuple &before, TxnWriteKind kind);
 
 /**
- * @brief Post-mutation step for a freshly inserted row
+ * @brief Publication hook for a transactional INSERT
  *
- * Locks the newly placed RID, registers the uncommitted version (invisible to
- * every other snapshot until commit), and logs the insert to the WAL and the
- * transaction's write set (undo = delete).
+ * Returns the hook to pass to TableHeap::insert_tuple. It runs while the heap
+ * still holds its exclusive lock — before any reader can observe the new
+ * slot — and registers the uncommitted version (so the row is invisible to
+ * every other snapshot from its first reachable instant) and logs the insert
+ * to the WAL and the write set (undo = delete). Returns an empty function
+ * when there is no transaction. @p tuple must outlive the insert_tuple call
+ * the hook is passed to.
+ *
+ * Row locking is NOT part of the hook (a lock wait must never happen inside
+ * the heap's critical section); call txn_lock_row after the insert returns.
  */
-[[nodiscard]] Status txn_register_insert(const ExecutorContext *ctx,
-                                         oid_t table_oid, RID rid,
-                                         const Tuple &tuple);
+[[nodiscard]] std::function<Status(RID)>
+txn_insert_hook(const ExecutorContext *ctx, oid_t table_oid,
+                const Tuple &tuple);
+
+/**
+ * @brief Acquire the row-level exclusive lock (held until commit/abort)
+ *
+ * Idempotent for a lock the transaction already holds; no-op without a
+ * transaction context or lock manager.
+ */
+[[nodiscard]] Status txn_lock_row(const ExecutorContext *ctx, oid_t table_oid,
+                                  RID rid);
 
 /// Log an in-place UPDATE to the WAL and the write set (undo = restore
 /// @p before). Called after the heap mutation succeeded.
