@@ -317,6 +317,34 @@ TEST_F(VersionStoreTest, FirstUpdaterWinsBothOrders) {
 // garbage buffer.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Reads the readers must collectively perform before a stress test's mutator is
+// allowed to stop. Guarantees the reader/mutator overlap the tests exist to
+// exercise, independent of when the OS schedules the reader threads.
+constexpr uint64_t kMinStressReads = 1000;
+
+// Run `mutate(i)` at least `min_iters` times, then keep mutating until the
+// readers have performed kMinStressReads reads, then set `stop`. Without the
+// reads gate the mutator can finish and stop the readers before they were ever
+// scheduled, making the "readers actually ran" guard racy on a loaded machine.
+// A generous wall-clock deadline bounds the wait so a genuinely broken (never
+// reading) reader fails the guard instead of hanging the test.
+template <typename Mutate>
+void churn_until_reads(std::atomic<bool> &stop,
+                       const std::atomic<uint64_t> &reads, int min_iters,
+                       Mutate mutate) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  for (int i = 0;; ++i) {
+    if (i >= min_iters &&
+        (reads.load(std::memory_order_relaxed) >= kMinStressReads ||
+         std::chrono::steady_clock::now() >= deadline)) {
+      break;
+    }
+    mutate(i);
+  }
+  stop.store(true, std::memory_order_relaxed);
+}
+
 // Readers hammer a RID while a single writer repeatedly stages and rolls back
 // an update. Every read must return the committed base value, never a partial
 // or freed buffer.
@@ -348,12 +376,11 @@ TEST_F(VersionStoreTest, ConcurrentReadVisibleAndRollbackStayConsistent) {
 
   std::thread writer([&] {
     Transaction w(2);
-    for (int i = 0; i < 3000; ++i) {
+    churn_until_reads(stop, reads, 3000, [&](int) {
       if (store_.on_update(&w, rid_, span_of(base)).ok()) {
         store_.rollback(&w); // frees the head + before-image the readers walk
       }
-    }
-    stop.store(true, std::memory_order_relaxed);
+    });
   });
 
   writer.join();
@@ -362,7 +389,7 @@ TEST_F(VersionStoreTest, ConcurrentReadVisibleAndRollbackStayConsistent) {
   }
 
   EXPECT_EQ(bad.load(), 0) << "a reader observed a non-base / torn value";
-  EXPECT_GT(reads.load(), 0u);
+  EXPECT_GE(reads.load(), kMinStressReads);
 }
 
 // Readers pinned to a snapshot that can only see a superseded before-image read
@@ -381,6 +408,7 @@ TEST_F(VersionStoreTest, ConcurrentReadVisibleAndGcStayConsistent) {
 
   std::atomic<bool> stop{false};
   std::atomic<int> bad{0};
+  std::atomic<uint64_t> reads{0};
 
   std::vector<std::thread> readers;
   for (int i = 0; i < 4; ++i) {
@@ -394,16 +422,15 @@ TEST_F(VersionStoreTest, ConcurrentReadVisibleAndGcStayConsistent) {
         if (v.has_value() && bytes_of(*v) != v1) {
           bad.fetch_add(1, std::memory_order_relaxed);
         }
+        reads.fetch_add(1, std::memory_order_relaxed);
       }
     });
   }
 
   // Churn gc across the boundary that prunes the superseded before-image.
   std::thread collector([&] {
-    for (int i = 0; i < 5000; ++i) {
-      store_.gc(i % 2 == 0 ? 15 : 25);
-    }
-    stop.store(true, std::memory_order_relaxed);
+    churn_until_reads(stop, reads, 5000,
+                      [&](int i) { store_.gc(i % 2 == 0 ? 15 : 25); });
   });
 
   collector.join();
@@ -412,6 +439,7 @@ TEST_F(VersionStoreTest, ConcurrentReadVisibleAndGcStayConsistent) {
   }
 
   EXPECT_EQ(bad.load(), 0) << "a reader observed a torn before-image";
+  EXPECT_GE(reads.load(), kMinStressReads);
 }
 
 // A stream of committing transactions finalizes versions (unique-lock mutation
@@ -426,6 +454,7 @@ TEST_F(VersionStoreTest, ConcurrentFinalizeAndReadStayConsistent) {
 
   std::atomic<bool> stop{false};
   std::atomic<int> bad{0};
+  std::atomic<uint64_t> reads{0};
 
   std::vector<std::thread> readers;
   for (int i = 0; i < 3; ++i) {
@@ -436,19 +465,19 @@ TEST_F(VersionStoreTest, ConcurrentFinalizeAndReadStayConsistent) {
         if (!v.has_value() || bytes_of(*v) != base) {
           bad.fetch_add(1, std::memory_order_relaxed);
         }
+        reads.fetch_add(1, std::memory_order_relaxed);
       }
     });
   }
 
   std::thread writer([&] {
-    for (int i = 0; i < 4000; ++i) {
+    churn_until_reads(stop, reads, 4000, [&](int i) {
       RID other{10, static_cast<slot_id_t>(i % 200)};
       Transaction w(static_cast<txn_id_t>(1000 + i));
       if (store_.on_insert(&w, other).ok()) {
         store_.finalize(&w, static_cast<uint64_t>(3 + i));
       }
-    }
-    stop.store(true, std::memory_order_relaxed);
+    });
   });
 
   writer.join();
@@ -457,6 +486,7 @@ TEST_F(VersionStoreTest, ConcurrentFinalizeAndReadStayConsistent) {
   }
 
   EXPECT_EQ(bad.load(), 0) << "a reader observed a torn / corrupted value";
+  EXPECT_GE(reads.load(), kMinStressReads);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
