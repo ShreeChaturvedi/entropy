@@ -188,6 +188,72 @@ TEST(LockManagerDeadlockTest, WaitDieNeverVictimizesOldest) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Overlapping cycles through one shared resource: aborting the first victim
+// must not leave the second cycle stalling to the timeout. Requires the
+// deadlock re-check on every wake of the waiting request.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(LockManagerDeadlockTest, OverlappingCyclesSharingResourceResolveFast) {
+  auto lock_mgr = std::make_unique<LockManager>(true, kLongTimeoutMs);
+
+  Transaction a(1);  // oldest: must never be victimized
+  Transaction b(2);
+  Transaction d(3);
+
+  constexpr oid_t kShared = 1;  // B and D hold S; A wants X
+  constexpr oid_t kResB = 2;    // held X by A, wanted by B
+  constexpr oid_t kResD = 3;    // held X by A, wanted by D
+
+  ASSERT_TRUE(lock_mgr->lock_table(&a, kResB, LockMode::EXCLUSIVE).ok());
+  ASSERT_TRUE(lock_mgr->lock_table(&a, kResD, LockMode::EXCLUSIVE).ok());
+  ASSERT_TRUE(lock_mgr->lock_table(&b, kShared, LockMode::SHARED).ok());
+  ASSERT_TRUE(lock_mgr->lock_table(&d, kShared, LockMode::SHARED).ok());
+
+  Status a_status = Status::Ok();
+  Status b_status = Status::Ok();
+  Status d_status = Status::Ok();
+
+  const auto start = std::chrono::steady_clock::now();
+
+  std::thread t_b([&] {
+    b_status = lock_mgr->lock_table(&b, kResB, LockMode::EXCLUSIVE);
+  });
+  std::thread t_d([&] {
+    d_status = lock_mgr->lock_table(&d, kResD, LockMode::EXCLUSIVE);
+  });
+  std::thread t_a([&] {
+    // Let B and D block first so BOTH cycles run through A's X request on the
+    // shared resource: A -> B -> A and A -> D -> A. A single detection pass at
+    // enqueue time finds only one of them.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    a_status = lock_mgr->lock_table(&a, kShared, LockMode::EXCLUSIVE);
+  });
+
+  t_a.join();
+  t_b.join();
+  t_d.join();
+
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+
+  // Oldest wins both cycles; both younger transactions die.
+  EXPECT_TRUE(a_status.ok())
+      << "oldest must win both cycles, got: " << a_status.message();
+  EXPECT_EQ(b_status.code(), StatusCode::kAborted);
+  EXPECT_EQ(d_status.code(), StatusCode::kAborted);
+  EXPECT_GE(lock_mgr->deadlock_count(), 2u);
+
+  // Both resolutions came from detection, not the 5s timeout.
+  EXPECT_LT(elapsed, kResolveBound)
+      << "overlapping-cycle resolution took "
+      << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
+      << "ms";
+
+  lock_mgr->release_all_locks(&a);
+  lock_mgr->release_all_locks(&b);
+  lock_mgr->release_all_locks(&d);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Concurrent lock / abort stress. Primary purpose: exercise the cross-thread
 // reads of Transaction::state_ and the lock-table paths so ThreadSanitizer can
 // prove they are race-free. Also asserts the lock table drains cleanly.
