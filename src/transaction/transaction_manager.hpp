@@ -14,6 +14,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -204,11 +205,40 @@ public:
         table_resolver_ = std::move(resolver);
     }
 
+    /**
+     * @brief Barrier that quiesces heap writers against a checkpoint
+     *
+     * The heap write path (TableHeap::insert_tuple/delete_tuple/
+     * update_tuple_in_place) holds this SHARED across its ENTIRE critical
+     * section — the page mutation plus the logging hook that appends the WAL
+     * record and stamps the page LSN. A checkpoint takes it EXCLUSIVELY around
+     * its redo-anchor capture + page flush (see
+     * RecoveryManager::create_checkpoint), so it can never flush a mutated page
+     * whose record is not yet appended and stamped (crash-safety F3). The
+     * barrier is acquired AFTER the heap's own lock (heap-lock → barrier), and
+     * row locks + first-updater-wins run BEFORE the mutation, so a writer never
+     * blocks on another transaction while holding this shared latch and the
+     * checkpoint's exclusive wait is bounded.
+     */
+    [[nodiscard]] std::shared_mutex& checkpoint_barrier() noexcept {
+        return checkpoint_latch_;
+    }
+
 private:
     /**
      * @brief Undo one write-set entry (inverse of the logged operation)
      */
     void undo_write_record(const WriteRecord& record);
+
+    /**
+     * @brief Stamp @p lsn onto the page holding @p rid (WAL-before-page / redo)
+     *
+     * The page LSN records the highest log record whose effect the page
+     * reflects, which the buffer pool's WAL flush hook reads to enforce
+     * WAL-before-page and recovery reads to gate idempotent redo. No-op without
+     * a buffer pool, an invalid LSN, or an invalid page id.
+     */
+    void stamp_page_lsn(RID rid, lsn_t lsn);
 
     std::shared_ptr<WALManager> wal_manager_;
     std::shared_ptr<MVCCManager> mvcc_;
@@ -218,7 +248,16 @@ private:
     TableResolver table_resolver_;
     std::unordered_map<txn_id_t, std::unique_ptr<Transaction>> txn_map_;
     txn_id_t next_txn_id_ = 1;
+    /// Highest version-GC bound already applied (guarded by mutex_). A commit
+    /// skips the store-wide GC walk while the oldest active snapshot pins the
+    /// bound, because nothing new can become collectible until it advances.
+    uint64_t last_gc_bound_ = 0;
     mutable std::mutex mutex_;
+    // Quiesces heap writers against a concurrent checkpoint (see
+    // checkpoint_barrier()). This class only stores and hands the latch out:
+    // TableHeap's write paths hold it SHARED across mutate + log, and
+    // create_checkpoint takes it EXCLUSIVELY. It never nests with mutex_.
+    std::shared_mutex checkpoint_latch_;
 };
 
 }  // namespace entropy

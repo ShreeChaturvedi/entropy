@@ -74,7 +74,15 @@ Page* BufferPoolManager::fetch_page(page_id_t page_id) {
         if (!status.ok()) {
             LOG_ERROR("Failed to flush dirty page {}: {}", page->page_id(),
                       status.to_string());
-            free_list_.push_back(frame_id);
+            // The victim is still mapped in page_table_ and still dirty. Return
+            // its frame to the replacer as an eviction candidate, NOT to the
+            // free list: a free-list frame can be popped by new_page and
+            // reset() even though the victim's page id still resolves to it, so
+            // a re-fetch that pins the victim could then have its frame reset
+            // out from under the pin. Re-insertion keeps the single mapping and
+            // retries the flush on the next eviction. (unpin marks it evictable;
+            // its pin_count is already 0, which is why it was chosen here.)
+            replacer_->unpin(frame_id);
             return nullptr;
         }
     }
@@ -177,7 +185,10 @@ Page* BufferPoolManager::new_page(page_id_t* page_id) {
         if (!status.ok()) {
             LOG_ERROR("Failed to flush dirty page {}: {}", page->page_id(),
                       status.to_string());
-            free_list_.push_back(frame_id);
+            // Return the victim to the replacer, not the free list: it is still
+            // mapped and dirty, and a free-list frame can be reset() under a
+            // later pin (see fetch_page for the full rationale).
+            replacer_->unpin(frame_id);
             return nullptr;
         }
     }
@@ -199,7 +210,7 @@ Page* BufferPoolManager::new_page(page_id_t* page_id) {
     return page;
 }
 
-bool BufferPoolManager::delete_page(page_id_t page_id) {
+bool BufferPoolManager::delete_page(page_id_t page_id, bool deallocate) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     auto it = page_table_.find(page_id);
@@ -223,7 +234,12 @@ bool BufferPoolManager::delete_page(page_id_t page_id) {
     page->reset();
     free_list_.push_back(frame_id);
 
-    disk_manager_->deallocate_page(page_id);
+    // The buffered frame is always discarded (its dirty bytes dropped, NOT
+    // flushed). The on-disk id is returned to the free list only when the
+    // caller allows it; a deferred caller frees it later itself.
+    if (deallocate) {
+        disk_manager_->deallocate_page(page_id);
+    }
     return true;
 }
 
@@ -237,12 +253,16 @@ void BufferPoolManager::set_wal_flush_hook(std::function<Status(lsn_t)> hook) {
     wal_flush_hook_ = std::move(hook);
 }
 
-void BufferPoolManager::flush_all_pages() {
+Status BufferPoolManager::flush_all_pages() {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    Status first_error = Status::Ok();
     for (auto& [page_id, frame_id] : page_table_) {
         if (!frame_id_is_valid(frame_id)) {
             LOG_ERROR("Invalid frame id {}", frame_id);
+            if (first_error.ok()) {
+                first_error = Status::Internal("Invalid frame id in page table");
+            }
             continue;
         }
         Page* page = &pages_[frame_index(frame_id)];
@@ -253,9 +273,13 @@ void BufferPoolManager::flush_all_pages() {
             } else {
                 LOG_ERROR("Failed to flush page {}: {}", page_id,
                           status.to_string());
+                if (first_error.ok()) {
+                    first_error = status;
+                }
             }
         }
     }
+    return first_error;
 }
 
 Status BufferPoolManager::write_page_to_disk(Page* page) {

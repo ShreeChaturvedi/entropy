@@ -130,13 +130,28 @@ RunResult run_schedule(uint64_t seed, const Schedule &schedule) {
     std::mt19937_64 wl_rng(wl_seed);
     WorkloadContext ctx{tm.get(), heap.get(), version_store.get(), &schema,
                         kTableOid, {}};
-    if (schedule.arm_wal_sync_failures) {
-      // From the in-flight transaction on, WAL syncs fail: overflow flushes
-      // append record bytes that never become durable — the real unsynced
-      // tail the crash resolves. The engine's retry path is written for
-      // exactly this device state.
-      ctx.on_inflight_begin = [log_ptr = sim_log.get()] {
-        log_ptr->arm_sync_failures();
+    if (schedule.arm_wal_sync_failures ||
+        schedule.steal_committed_at_inflight_begin) {
+      // Fires once, immediately before the in-flight loser's first write.
+      ctx.on_inflight_begin = [pool_ptr = pool.get(), log_ptr = sim_log.get(),
+                               steal =
+                                   schedule.steal_committed_at_inflight_begin,
+                               arm = schedule.arm_wal_sync_failures] {
+        // Steal committed pages FIRST, while their WAL is still durable: the
+        // WAL-before-page guard then lets them reach disk unsynced, so the
+        // crash can lose a genuinely committed page for redo to recover. This
+        // must precede arming — once syncs fail the guard (correctly) refuses
+        // every page whose log is not yet durable, which is why a plain
+        // end-of-run steal is vacuous under armed sync failures.
+        if (steal) {
+          (void)pool_ptr->flush_all_pages();
+        }
+        // From here on WAL syncs fail: overflow flushes append record bytes
+        // that never become durable — the real unsynced tail the crash
+        // resolves. The engine's retry path is written for exactly this state.
+        if (arm) {
+          log_ptr->arm_sync_failures();
+        }
       };
     }
     RandomWorkload workload(schedule.abort_ppk, schedule.inflight_ops);
@@ -287,14 +302,21 @@ std::optional<Schedule> make_schedule(const std::string &name) {
     return s;
   }
   if (name == "mixed") {
-    // Broad default: steal + lost pages + a WAL-buffer-overflowing in-flight
-    // loser whose appended-but-unsynced tail is lost or torn. Used for the
-    // determinism check and wide seed sweeps.
+    // Broad default: steal committed pages (lost unsynced) + a WAL-buffer-
+    // overflowing in-flight loser whose appended-but-unsynced tail is lost or
+    // torn. Used for the determinism check and wide seed sweeps.
+    //
+    // The steal happens at the loser's begin, not at the crash: this run also
+    // arms WAL-sync failures, and once the log stops advancing the WAL-before-
+    // page guard (correctly) refuses to write any page ahead of its log. So a
+    // page steal only produces a genuine unsynced-committed-page loss at the
+    // one instant the committed WAL is durable and the loser has not yet
+    // dirtied those pages — the moment the loser begins.
     s.crash_point = "mixed_steal_lost_inflight";
     s.num_txns = 16;
     s.inflight_ops = kInflightOps;
     s.arm_wal_sync_failures = true;
-    s.flush_pages_before_crash = true;
+    s.steal_committed_at_inflight_begin = true;
     s.faults.wal_tail_lost_ppk = 700;
     s.faults.wal_tail_torn_ppk = 300;
     s.must_fire = {FaultKind::kLostPageWrite, FaultKind::kLostWalTail,
