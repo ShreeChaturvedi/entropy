@@ -400,22 +400,33 @@ public:
     ExecutorContext exec_ctx{txn, txn_manager_.get(), lock_manager_.get(),
                              version_store_.get(), catalog_.get()};
 
+    // Single public chokepoint for every DML/query statement. A parseable but
+    // ill-typed expression (e.g. `name + 1` on a VARCHAR column, `SUM(name)`,
+    // `sal = name * sal`) can throw std::bad_variant_access deep in lazy
+    // evaluation as each executor tree is drained below. Catch it here for all
+    // four statement types so it becomes an error Status instead of escaping
+    // execute() and aborting the host; the error then takes the !result.ok()
+    // abort path below like any other executor failure.
     Result result = [&]() -> Result {
-      switch (stmt->type()) {
-      case StatementType::SELECT:
-        return execute_select(dynamic_cast<SelectStatement *>(stmt.get()),
-                              &exec_ctx);
-      case StatementType::INSERT:
-        return execute_insert(dynamic_cast<InsertStatement *>(stmt.get()),
-                              &exec_ctx);
-      case StatementType::UPDATE:
-        return execute_update(dynamic_cast<UpdateStatement *>(stmt.get()),
-                              &exec_ctx);
-      case StatementType::DELETE_STMT:
-        return execute_delete(dynamic_cast<DeleteStatement *>(stmt.get()),
-                              &exec_ctx);
-      default:
-        return Result(Status::Internal("Unreachable statement type"));
+      try {
+        switch (stmt->type()) {
+        case StatementType::SELECT:
+          return execute_select(dynamic_cast<SelectStatement *>(stmt.get()),
+                                &exec_ctx);
+        case StatementType::INSERT:
+          return execute_insert(dynamic_cast<InsertStatement *>(stmt.get()),
+                                &exec_ctx);
+        case StatementType::UPDATE:
+          return execute_update(dynamic_cast<UpdateStatement *>(stmt.get()),
+                                &exec_ctx);
+        case StatementType::DELETE_STMT:
+          return execute_delete(dynamic_cast<DeleteStatement *>(stmt.get()),
+                                &exec_ctx);
+        default:
+          return Result(Status::Internal("Unreachable statement type"));
+        }
+      } catch (const std::exception &) {
+        return Result(Status::InvalidArgument("type error in expression"));
       }
     }();
 
@@ -471,16 +482,8 @@ public:
   }
 
   // Drain @p executor and materialize the rows under @p output_schema.
-  //
-  // Expression evaluation (computed projections, aggregates) runs lazily as the
-  // executor tree is initialized and pulled here. An ill-typed but parseable
-  // expression (e.g. `name + 1` on a VARCHAR column, `SUM(name)`) can surface a
-  // type mismatch deep in evaluation as a thrown exception such as
-  // std::bad_variant_access. That must never escape the public execute() API and
-  // abort the host process: convert any such evaluation exception into a clean
-  // error Status here. This is a narrow guard: the caught exception is turned
-  // into a returned error (not silently swallowed), and the caller's error path
-  // aborts the transaction as it would for any other executor failure.
+  // Exceptions from ill-typed lazy evaluation here are caught at the execute()
+  // dispatch chokepoint, so this drain needs no guard of its own.
   Result collect_result(Executor *executor, const Schema *output_schema) {
     std::vector<std::string> column_names;
     column_names.reserve(output_schema->column_count());
@@ -488,25 +491,19 @@ public:
       column_names.push_back(output_schema->column(i).name());
     }
 
-    try {
-      executor->init();
-      std::vector<Row> rows;
-      while (auto tuple = executor->next()) {
-        std::vector<Value> values;
-        values.reserve(output_schema->column_count());
-        for (size_t i = 0; i < output_schema->column_count(); i++) {
-          TupleValue tv =
-              tuple->get_value(*output_schema, static_cast<uint32_t>(i));
-          values.push_back(tuple_value_to_value(tv));
-        }
-        rows.emplace_back(std::move(values), column_names);
+    executor->init();
+    std::vector<Row> rows;
+    while (auto tuple = executor->next()) {
+      std::vector<Value> values;
+      values.reserve(output_schema->column_count());
+      for (size_t i = 0; i < output_schema->column_count(); i++) {
+        TupleValue tv =
+            tuple->get_value(*output_schema, static_cast<uint32_t>(i));
+        values.push_back(tuple_value_to_value(tv));
       }
-      return Result(std::move(rows), std::move(column_names));
-    } catch (const std::exception &) {
-      // std::bad_variant_access and friends from ill-typed expression
-      // evaluation: report a clean type error instead of aborting the process.
-      return Result(Status::InvalidArgument("type error in expression"));
+      rows.emplace_back(std::move(values), column_names);
     }
+    return Result(std::move(rows), std::move(column_names));
   }
 
   // Turn a scan/join physical plan node into an executor tree. Only scan and
