@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cstring>
 
+#include "storage/page.hpp"
+
 namespace entropy::sim {
 
 namespace {
@@ -36,11 +38,18 @@ Status SimDiskManager::read_page(page_id_t page_id, char *page_data) {
   }
   auto it = current_.find(page_id);
   if (it == current_.end()) {
-    // Beyond the written range (or lost at crash): a fresh, zeroed page.
+    // Beyond the written range (or lost at crash): a fresh, zeroed page. Not
+    // stored data, so there is no checksum to verify.
     std::memset(page_data, 0, kPageBytes);
     return Status::Ok();
   }
   std::memcpy(page_data, it->second.data(), kPageBytes);
+  // Detect a torn/partial write: the stored image no longer matches its stamped
+  // checksum. Surfaced as Corruption so recovery rebuilds the page from the WAL
+  // instead of trusting the half-persisted bytes.
+  if (!verify_page_checksum(page_data)) {
+    return Status::Corruption("torn/corrupt page: checksum mismatch");
+  }
   return Status::Ok();
 }
 
@@ -64,6 +73,13 @@ Status SimDiskManager::write_page(page_id_t page_id, const char *page_data) {
 
   auto &slot = current_[page_id];
   slot.assign(page_data, page_data + kPageBytes);
+  // Stamp the integrity checksum onto the stored image (never the caller's
+  // buffer). A crash that later tears this page will break the stamp, so the
+  // reopened device's read_page detects it. All-zero pages (fresh/deallocated)
+  // are intentionally left unstamped and treated as valid empty pages on read.
+  if (!page_is_all_zero(slot.data())) {
+    stamp_page_checksum(slot.data());
+  }
   dirty_since_sync_.insert(page_id);
   if (page_id >= num_pages_) {
     num_pages_ = page_id + 1;
