@@ -570,6 +570,41 @@ TEST_F(DatabaseTest, ComputedAndAliasedProjection) {
   EXPECT_EQ(r1["doubled"].as_int64(), 500);
 }
 
+// Robustness: an ill-typed but parseable computed or aggregate expression (e.g.
+// arithmetic or SUM over a VARCHAR column) must surface a clean error Status
+// through the public API, never abort the host process. Expression evaluation
+// can throw std::bad_variant_access deep in the executor drain; that exception
+// must be caught and converted, not allowed to escape execute().
+TEST_F(DatabaseTest, IllTypedExpressionReturnsErrorNotCrash) {
+  Database db(temp_file_->string());
+  ASSERT_TRUE(
+      db.execute("CREATE TABLE t (id INTEGER, name VARCHAR(100))").ok());
+  ASSERT_TRUE(db.execute("INSERT INTO t VALUES (1,'Alice'),(2,'Bob')").ok());
+
+  // Each of these is parseable but ill-typed. None may abort the process; every
+  // one must come back as an error Status.
+  const std::vector<std::string> ill_typed = {
+      "SELECT name + 1 FROM t",
+      "SELECT sal + name FROM t",
+      "SELECT name * 2 FROM t",
+      "SELECT SUM(name) FROM t",
+      "SELECT id, name + 1 FROM t ORDER BY id",
+  };
+
+  for (const auto &sql : ill_typed) {
+    auto result = db.execute(sql);
+    EXPECT_FALSE(result.ok()) << "expected error for: " << sql;
+  }
+
+  // The database is still usable after the ill-typed queries: a well-typed
+  // query returns correct rows.
+  auto ok = db.execute("SELECT id, name FROM t ORDER BY id");
+  ASSERT_TRUE(ok.ok()) << ok.status().to_string();
+  ASSERT_EQ(ok.row_count(), 2u);
+  EXPECT_EQ(ok.rows()[0]["name"].as_string(), "Alice");
+  EXPECT_EQ(ok.rows()[1]["name"].as_string(), "Bob");
+}
+
 // #10: on a large indexed table the optimizer picks an index scan for a
 // selective point lookup and a sequential scan when there is no predicate,
 // observable through EXPLAIN's rendered plan.
