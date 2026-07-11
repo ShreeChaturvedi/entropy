@@ -13,6 +13,21 @@
 #include "transaction/transaction.hpp"
 
 namespace entropy {
+namespace {
+
+// A row loaded from disk predates its version chain. Materialize a synthetic
+// committed base version whose bytes are the current heap content: committed at
+// pre-history so it is visible to every snapshot, and never deleted.
+VersionStore::VersionNode make_prehistory_base() {
+  VersionStore::VersionNode base;
+  base.info.created_by = TXN_ID_NONE;
+  base.info.deleted_by = TXN_ID_NONE;
+  base.info.begin_ts = TIMESTAMP_PREHISTORY;
+  base.info.end_ts = TIMESTAMP_MAX;
+  return base;
+}
+
+} // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Write path
@@ -40,14 +55,7 @@ Status VersionStore::on_update(const Transaction *txn, RID rid,
   std::unique_lock lock(latch_);
   auto &chain = chains_[rid];
   if (chain.empty()) {
-    // Row predates its chain (e.g. loaded from disk): materialize a committed
-    // base version. Its bytes are the current heap content.
-    VersionNode base;
-    base.info.created_by = TXN_ID_NONE;
-    base.info.deleted_by = TXN_ID_NONE;
-    base.info.begin_ts = TIMESTAMP_PREHISTORY; // committed before any live txn
-    base.info.end_ts = TIMESTAMP_MAX;
-    chain.push_back(std::move(base));
+    chain.push_back(make_prehistory_base());
   }
 
   const txn_id_t tid = txn->txn_id();
@@ -80,12 +88,7 @@ Status VersionStore::on_delete(const Transaction *txn, RID rid,
   std::unique_lock lock(latch_);
   auto &chain = chains_[rid];
   if (chain.empty()) {
-    VersionNode base;
-    base.info.created_by = TXN_ID_NONE;
-    base.info.deleted_by = TXN_ID_NONE;
-    base.info.begin_ts = TIMESTAMP_PREHISTORY;
-    base.info.end_ts = TIMESTAMP_MAX;
-    chain.push_back(std::move(base));
+    chain.push_back(make_prehistory_base());
   }
 
   const txn_id_t tid = txn->txn_id();
