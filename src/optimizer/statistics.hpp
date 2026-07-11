@@ -21,6 +21,7 @@
 
 #include "common/types.hpp"
 #include "parser/expression.hpp"
+#include "storage/b_plus_tree_page.hpp" // BPTreeKey
 #include "storage/tuple.hpp"
 
 namespace entropy {
@@ -86,9 +87,25 @@ public:
 
   /**
    * @brief Estimate selectivity for an expression predicate
+   *
+   * Uses collected statistics when available (1/NDV for equality) and falls
+   * back to documented Selinger defaults otherwise. Logical connectives recurse
+   * into their operands rather than returning a fixed constant.
    */
-  [[nodiscard]] double estimate_selectivity([[maybe_unused]] oid_t table_oid,
+  [[nodiscard]] double estimate_selectivity(oid_t table_oid,
                                             const Expression *predicate) const;
+
+  /**
+   * @brief Estimate the selectivity of a range over an indexed column
+   *
+   * Bounds are inclusive B+ tree keys (std::nullopt = unbounded on that side).
+   * With a collected min/max the fraction of the [min,max] domain covered by
+   * [lower,upper] is returned (uniformity assumption); otherwise the Selinger
+   * range default (1/3) is used.
+   */
+  [[nodiscard]] double range_selectivity(oid_t table_oid, column_id_t column_id,
+                                         std::optional<BPTreeKey> lower,
+                                         std::optional<BPTreeKey> upper) const;
 
   /**
    * @brief Collect statistics for a table (scan and compute)
@@ -120,10 +137,17 @@ public:
    */
   [[nodiscard]] const TableStatistics *get_table_stats(oid_t table_oid) const;
 
-  // Default selectivity values
+  // Default selectivity constants, used only when no per-column statistics are
+  // available. Values follow the Selinger et al. (1979) "System R" defaults
+  // that every textbook cost model inherits:
+  //   - Equality with unknown NDV:  1/10  (col = const)
+  //   - Range with unknown min/max: 1/3   (col < / <= / > / >= const)
+  //   - Generic unmodeled predicate: 1/10 fallback
+  // When statistics exist, equality uses 1/NDV and range uses the covered
+  // fraction of [min,max] instead of these constants.
   static constexpr double DEFAULT_SELECTIVITY = 0.1;
-  static constexpr double EQUALITY_SELECTIVITY = 0.01;
-  static constexpr double RANGE_SELECTIVITY = 0.33;
+  static constexpr double EQUALITY_SELECTIVITY = 0.1;
+  static constexpr double RANGE_SELECTIVITY = 1.0 / 3.0;
 
 private:
   std::shared_ptr<Catalog> catalog_;
