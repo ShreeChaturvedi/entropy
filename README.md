@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <em>The Entropy terminal UI: a deterministic crash-simulator front end, amber on charcoal, opening on an animated braille galaxy boot screen.</em>
+  <em>The Entropy terminal UI at boot.</em>
 </p>
 
 Entropy is a high-performance relational database engine built from scratch in
@@ -26,19 +26,14 @@ exercised by a deterministic, FoundationDB-style crash simulator.
 
 ## Highlights
 
-- End-to-end SQL engine: recursive-descent parser, type-checking binder,
-  cost-based optimizer, and Volcano-model executors.
-- Storage engine with a slotted-page heap, a latch-crabbing B+ tree, an
-  extendible hash index, and an LRU buffer pool.
-- ACID transactions: MVCC snapshot isolation, write-ahead logging, and
-  ARIES-style crash recovery.
-- CRC-32 page checksums on by default catch torn writes and bit rot on read.
-- Deterministic, FoundationDB-style crash simulator: seeded fault injection,
-  replayable schedules, and post-recovery invariant checks.
-- Unit and integration tests wired to CTest + GoogleTest.
-- Benchmarks with optional SQLite comparison and reproducible scripts.
-- Cross-platform CMake build with Linux/macOS/Windows CI, AddressSanitizer,
-  UBSan, ThreadSanitizer, and a `find_package` consumer smoke test.
+- SQL engine: parser, binder, cost-based optimizer, executors.
+- Storage: slotted-page heap, latch-crabbing B+ tree, buffer pool.
+- ACID transactions: MVCC snapshot isolation, WAL, ARIES recovery.
+- CRC-32 checksums catch torn writes and bit rot, on by default.
+- Deterministic crash simulator: seeded faults, invariant checks.
+- Unit and integration tests on CTest + GoogleTest.
+- Benchmarks vs SQLite with reproducible scripts.
+- CI across Linux/macOS/Windows, ASan/UBSan/TSan, `find_package` smoke.
 
 ## Terminal UI
 
