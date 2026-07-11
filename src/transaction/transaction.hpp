@@ -231,6 +231,17 @@ public:
         return aborted_by_deadlock_.load(std::memory_order_acquire);
     }
 
+    /**
+     * @brief Consume the deadlock-victim mark once finalization begins
+     *
+     * Called by TransactionManager::abort() when it admits a marked victim, so
+     * a stray second abort() on a still-live object is a no-op instead of
+     * re-appending a duplicate WAL ABORT record.
+     */
+    void clear_aborted_by_deadlock() noexcept {
+        aborted_by_deadlock_.store(false, std::memory_order_release);
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Write Set Management
     // ─────────────────────────────────────────────────────────────────────────
