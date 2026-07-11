@@ -140,10 +140,12 @@ Status FileDiskManager::write_page(page_id_t page_id, const char* page_data) {
 
     // Stamp the integrity checksum into a private copy so the caller's buffer is
     // never mutated. The on-disk image then carries a checksum that read_page
-    // re-verifies to catch a later torn write.
+    // re-verifies to catch a later torn write. All-zero pages (fresh or
+    // deallocated) are left unstamped and treated as valid empty pages on read,
+    // matching SimDiskManager.
     const char* out = page_data;
     std::array<char, config::kDefaultPageSize> stamped;
-    if (enable_checksums_) {
+    if (enable_checksums_ && !page_is_all_zero(page_data)) {
         std::memcpy(stamped.data(), page_data, stamped.size());
         stamp_page_checksum(stamped.data());
         out = stamped.data();
