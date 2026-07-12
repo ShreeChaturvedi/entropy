@@ -528,7 +528,9 @@ Component MakeDashboardScreen(const DataSet &data) {
   state->data = data;
   state->model = BuildModel(data);
 
-  const auto view = [state] {
+  // Focus-aware Renderer so Container::Tab delivers keyboard events here (a bare
+  // Renderer has no focusable child and is skipped by the tab container).
+  const auto view = [state](bool /*focused*/) {
     const DataSet &d = state->data;
     const Model &m = state->model;
 
