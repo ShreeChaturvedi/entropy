@@ -1,4 +1,10 @@
-<p align="center"><img src="docs/assets/tui/boot-light.gif#gh-light-mode-only" width="820" alt="Entropy terminal UI booting into an animated braille galaxy, amber on paper"><img src="docs/assets/tui/boot.gif#gh-dark-mode-only" width="820" alt="Entropy terminal UI booting into an animated braille galaxy, amber on charcoal"></p>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/tui/boot.gif">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/tui/boot-light.gif">
+    <img src="docs/assets/tui/boot-light.gif" width="820" height="247" alt="Entropy terminal UI booting into an animated braille galaxy">
+  </picture>
+</p>
 
 ---
 
@@ -27,7 +33,13 @@ crash simulator exercises the whole stack.
 
 ## Architecture
 
-<p align="center"><img src="docs/diagrams/architecture-light.svg#gh-light-mode-only" width="860" alt="Entropy architecture diagram"><img src="docs/diagrams/architecture-dark.svg#gh-dark-mode-only" width="860" alt="Entropy architecture diagram"></p>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/architecture-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/diagrams/architecture-light.svg">
+    <img src="docs/diagrams/architecture-light.svg" width="860" height="632" alt="Entropy architecture diagram">
+  </picture>
+</p>
 
 ## Architecture Details
 
@@ -130,8 +142,13 @@ Per-iteration ns/op (ratio = Entropy / SQLite, lower is better):
 
 Rows are the batch size for inserts and the table cardinality for point selects.
 
-![Benchmark comparison chart](docs/benchmarks/charts/compare-light.svg#gh-light-mode-only)
-![Benchmark comparison chart](docs/benchmarks/charts/compare-dark.svg#gh-dark-mode-only)
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks/charts/compare-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/benchmarks/charts/compare-light.svg">
+    <img src="docs/benchmarks/charts/compare-light.svg" width="860" height="494" alt="Benchmark comparison chart">
+  </picture>
+</p>
 
 Chart units are microseconds per op. The insert and point select panels use different y axis ranges.
 
