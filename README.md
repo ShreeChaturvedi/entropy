@@ -1,7 +1,4 @@
-<p align="center">
-  <img src="docs/assets/tui/boot-light.gif#gh-light-mode-only" width="820" alt="Entropy terminal UI booting into an animated braille galaxy, amber on paper">
-  <img src="docs/assets/tui/boot.gif#gh-dark-mode-only" width="820" alt="Entropy terminal UI booting into an animated braille galaxy, amber on charcoal">
-</p>
+<p align="center"><img src="docs/assets/tui/boot-light.gif#gh-light-mode-only" width="820" alt="Entropy terminal UI booting into an animated braille galaxy, amber on paper"><img src="docs/assets/tui/boot.gif#gh-dark-mode-only" width="820" alt="Entropy terminal UI booting into an animated braille galaxy, amber on charcoal"></p>
 
 ---
 
