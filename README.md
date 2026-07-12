@@ -1,6 +1,6 @@
 <p align="center">
-  <img src="docs/branding/readme-light.svg#gh-light-mode-only" width="860" alt="Entropy Database Engine">
-  <img src="docs/branding/readme-dark.svg#gh-dark-mode-only" width="860" alt="Entropy Database Engine">
+  <img src="docs/assets/tui/boot-light.gif#gh-light-mode-only" width="820" alt="Entropy terminal UI booting into an animated braille galaxy, amber on paper">
+  <img src="docs/assets/tui/boot.gif#gh-dark-mode-only" width="820" alt="Entropy terminal UI booting into an animated braille galaxy, amber on charcoal">
 </p>
 
 ---
@@ -9,14 +9,6 @@
 [![release](https://img.shields.io/github/v/release/ShreeChaturvedi/entropy?include_prereleases)](https://github.com/ShreeChaturvedi/entropy/releases)
 [![license](https://img.shields.io/github/license/ShreeChaturvedi/entropy)](LICENSE)
 [![c++](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
-
-<p align="center">
-  <img src="docs/assets/tui/boot.gif" width="820" alt="Entropy terminal UI booting into an animated braille galaxy, amber on charcoal">
-</p>
-
-<p align="center">
-  <em>The Entropy terminal UI at boot.</em>
-</p>
 
 Entropy is a relational database engine written from scratch in C++20. It
 implements slotted-page storage, a latch-crabbing B+ tree, MVCC snapshot
@@ -31,6 +23,7 @@ crash simulator exercises the whole stack.
 - ACID transactions: MVCC snapshot isolation, WAL, ARIES recovery.
 - CRC-32 checksums catch torn writes and bit rot, on by default.
 - Deterministic crash simulator: seeded faults, invariant checks.
+- Optional terminal UI (boot, dashboard, console) in light and dark themes.
 - Unit and integration tests on CTest + GoogleTest.
 - Benchmarks vs SQLite with reproducible scripts.
 - CI across Linux/macOS/Windows, ASan/UBSan/TSan, `find_package` smoke.
