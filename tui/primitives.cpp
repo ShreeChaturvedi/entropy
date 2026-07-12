@@ -8,6 +8,8 @@
 
 #include <ftxui/dom/canvas.hpp>
 
+#include "theme.hpp"
+
 namespace entropy::tui {
 
 using namespace ftxui;  // Color, Canvas, and the dom element builders
@@ -25,8 +27,10 @@ struct Rgb {
   double r, g, b;
 };
 
-/// The galaxy's near-white core color, shared by the ramp and the sheen lift.
+/// Dark-mode sheen top: near-white. Light-mode sheen top: cool mid ink so the
+/// specular still reads without washing out on paper.
 constexpr Rgb kWhite{247.0, 248.0, 252.0};
+constexpr Rgb kLightSheen{72.0, 74.0, 82.0};
 
 /// Linear interpolation between two RGB triples, returning the triple.
 [[nodiscard]] Rgb lerp(const Rgb &a, const Rgb &b, double t) {
@@ -75,9 +79,25 @@ constexpr Rgb kWhite{247.0, 248.0, 252.0};
   return (static_cast<double>(kM[y & 3][x & 3]) + 0.5) / 16.0;
 }
 
-/// The galaxy brightness ramp: charcoal rim -> steel -> silver -> white core.
-/// Keyed on a luminance in [0,1] so the color encodes radial distance.
+/// The galaxy brightness ramp. Same structure keys in both modes; luminance
+/// direction flips so the mark stays a metallic disc on charcoal and an ink
+/// disc on paper.
 [[nodiscard]] Rgb galaxy_ramp(double lum) {
+  if (theme::is_light()) {
+    // Structural intensity → ink depth: faint rim -> graphite -> near-black core.
+    const Rgb edge{186.0, 186.0, 190.0};
+    const Rgb steel{110.0, 112.0, 120.0};
+    const Rgb deep{48.0, 50.0, 56.0};
+    const Rgb core{22.0, 22.0, 26.0};
+    if (lum < 0.34) {
+      return lerp(edge, steel, smoothstep(lum / 0.34));
+    }
+    if (lum < 0.70) {
+      return lerp(steel, deep, smoothstep((lum - 0.34) / 0.36));
+    }
+    return lerp(deep, core, smoothstep((lum - 0.70) / 0.30));
+  }
+  // Dark: charcoal rim -> steel -> silver -> white core.
   const Rgb edge{34.0, 36.0, 44.0};
   const Rgb steel{116.0, 122.0, 138.0};
   const Rgb silver{196.0, 200.0, 210.0};
@@ -88,6 +108,10 @@ constexpr Rgb kWhite{247.0, 248.0, 252.0};
     return lerp(steel, silver, smoothstep((lum - 0.34) / 0.36));
   }
   return lerp(silver, kWhite, smoothstep((lum - 0.70) / 0.30));
+}
+
+[[nodiscard]] Rgb sheen_top() {
+  return theme::is_light() ? kLightSheen : kWhite;
 }
 
 }  // namespace
@@ -220,12 +244,12 @@ Element GalaxyMark(int cell_cols, int cell_rows, double sweep_phase) {
         continue;
       }
 
-      // Charcoal -> steel -> silver -> white ramp, lifted toward white under
-      // the static sheen and (when present) the brighter moving sweep.
+      // Mode-aware ramp, lifted toward the sheen top under the static band and
+      // (when present) the moving sweep.
       Rgb rgb = galaxy_ramp(lum);
       const double shine = std::clamp(luster * 0.85 + sweep, 0.0, 1.0);
       if (shine > 0.12) {
-        rgb = lerp(rgb, kWhite, smoothstep((shine - 0.12) / 0.55) * 0.8);
+        rgb = lerp(rgb, sheen_top(), smoothstep((shine - 0.12) / 0.55) * 0.8);
       }
       canvas.DrawPoint(x, y, true, to_color(rgb));
     }
@@ -348,8 +372,12 @@ Decorator RowGlow(int distance) {
   }
   const double bright =
       static_cast<double>(kFalloff - distance) / static_cast<double>(kFalloff);
-  const Rgb glow{52.0, 49.0, 44.0};  // dim neutral gray, faintly warm
-  const Rgb base{14.0, 14.0, 16.0};  // kCanvas
+  // Endpoints mirror theme::kCanvas / a soft lift so light mode never paints
+  // charcoal ghosts under list rows. Keep numbers in lockstep with theme.hpp.
+  const Rgb base =
+      theme::is_light() ? Rgb{250.0, 249.0, 246.0} : Rgb{14.0, 14.0, 16.0};
+  const Rgb glow =
+      theme::is_light() ? Rgb{240.0, 239.0, 235.0} : Rgb{52.0, 49.0, 44.0};
   return bgcolor(mix(base, glow, smoothstep(bright)));
 }
 

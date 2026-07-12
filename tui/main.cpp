@@ -9,12 +9,14 @@
  *                                        boot | dashboard | console)
  *   entropy-tui --size <cols>x<rows>     frame size for --capture-frame
  *                                        (default 120x40)
+ *   entropy-tui --theme <dark|light>     palette mode (default dark)
  */
 
 #include <iostream>
 #include <string>
 
 #include "app_shell.hpp"
+#include "theme.hpp"
 
 namespace {
 
@@ -68,10 +70,21 @@ int main(int argc, char **argv) {
         std::cerr << "entropy-tui: invalid --step (expected an integer)\n";
         return 2;
       }
+    } else if (arg == "--theme" && i + 1 < argc) {
+      const std::string t = argv[++i];
+      if (t == "dark") {
+        entropy::tui::theme::set_mode(entropy::tui::theme::Mode::kDark);
+      } else if (t == "light") {
+        entropy::tui::theme::set_mode(entropy::tui::theme::Mode::kLight);
+      } else {
+        std::cerr << "entropy-tui: invalid --theme (expected dark|light)\n";
+        return 2;
+      }
     } else if (arg == "-h" || arg == "--help") {
       std::cout
           << "Usage: entropy-tui [--capture-frame <boot|dashboard|console>]"
-             " [--size <cols>x<rows>] [--phase <0..1>] [--step <n>]\n"
+             " [--size <cols>x<rows>] [--phase <0..1>] [--step <n>]"
+             " [--theme <dark|light>]\n"
              "       entropy-tui --demo-frames <dashboard|console>\n";
       return 0;
     } else {
