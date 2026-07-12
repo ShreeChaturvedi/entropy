@@ -23,12 +23,20 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 size="${1:-120x40}"
 
-BIN="${ENTROPY_TUI_BIN:-$here/../../build-integ/tui/entropy-tui}"
+BIN="${ENTROPY_TUI_BIN:-$here/../../build/tui/entropy-tui}"
+if [ ! -x "$BIN" ]; then
+  BIN="${ENTROPY_TUI_BIN:-$here/../../build-integ/tui/entropy-tui}"
+fi
 FREEZE="${FREEZE_BIN:-$(command -v freeze || echo "$HOME/go/bin/freeze")}"
 CHROME="${CHROME_BIN:-$(command -v google-chrome || command -v chromium || true)}"
 # Monospace fallback for braille cells (see header note).
 BRAILLE_FALLBACK="${BRAILLE_FALLBACK:-FreeMono, monospace}"
-BG="#0e0e10"
+THEME="${THEME:-dark}"
+case "$THEME" in
+  dark)  BG="#0e0e10"; BG_ARGB="0e0e10ff" ;;
+  light) BG="#faf9f6"; BG_ARGB="faf9f6ff" ;;
+  *) echo "capture: THEME must be dark or light" >&2; exit 2 ;;
+esac
 
 [ -x "$BIN" ] || { echo "capture: entropy-tui not found at $BIN" >&2; exit 1; }
 [ -x "$FREEZE" ] || { echo "capture: freeze not found (set FREEZE_BIN)" >&2; exit 1; }
@@ -58,15 +66,18 @@ render_png() {
     "$BG" "$wi" "$hi" "$svg" > "$wrap"
   "$CHROME" --headless=new --no-sandbox --hide-scrollbars --disable-gpu \
     --force-device-scale-factor="$scale" --window-size="$wi,$hi" \
-    --default-background-color=0e0e10ff \
+    --default-background-color="$BG_ARGB" \
     --screenshot="$png" "file://$wrap" >/dev/null 2>&1
   rm -f "$wrap"
 }
 
 # ── Still frames ──────────────────────────────────────────────────────────────
+suffix=""; [ "$THEME" = light ] && suffix="-light"
 for screen in boot dashboard console; do
-  "$BIN" --capture-frame "$screen" --size "$size" > "$here/$screen.ans"
-  render_svg "$here/$screen.ans" "$here/$screen.svg"
-  render_png "$here/$screen.svg" "$here/$screen.png"
-  echo "captured $screen"
+  out="${screen}${suffix}"
+  "$BIN" --capture-frame "$screen" --size "$size" --theme "$THEME" \
+    > "$here/$out.ans"
+  render_svg "$here/$out.ans" "$here/$out.svg"
+  render_png "$here/$out.svg" "$here/$out.png"
+  echo "captured $out (theme=$THEME)"
 done
