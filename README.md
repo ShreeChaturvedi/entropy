@@ -55,7 +55,7 @@ the storage engine.
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/tui/console.gif">
     <source media="(prefers-color-scheme: light)" srcset="docs/assets/tui/console-light.gif">
-    <img src="docs/assets/tui/console-light.gif" width="820" height="479" alt="A live SQL session in the Entropy console: CREATE, INSERT, a filtered SELECT, ORDER BY with LIMIT, and EXPLAIN">
+    <img src="docs/assets/tui/console-light.gif" width="820" height="445" alt="A live SQL session in the Entropy console: CREATE, INSERT, a filtered SELECT, ORDER BY with LIMIT, and EXPLAIN">
   </picture>
 </p>
 
