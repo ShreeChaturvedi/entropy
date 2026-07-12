@@ -52,7 +52,11 @@ the storage engine.
 - Binder resolves names and types, rejecting type errors at bind time.
 
 <p align="center">
-  <img src="docs/assets/tui/console.gif" width="820" alt="A live SQL session in the Entropy console: CREATE, INSERT, a filtered SELECT, ORDER BY with LIMIT, and EXPLAIN">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/tui/console.gif">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/tui/console-light.gif">
+    <img src="docs/assets/tui/console-light.gif" width="820" height="479" alt="A live SQL session in the Entropy console: CREATE, INSERT, a filtered SELECT, ORDER BY with LIMIT, and EXPLAIN">
+  </picture>
 </p>
 
 <p align="center">
@@ -97,7 +101,11 @@ seed. One 64-bit seed drives independent PRNG streams for the workload, the page
 device, and the log store, so a failing schedule replays byte for byte.
 
 <p align="center">
-  <img src="docs/assets/tui/dashboard.gif" width="820" alt="The Entropy crash-simulator dashboard streaming seed runs with their crash-to-recovery outcomes">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/tui/dashboard.gif">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/tui/dashboard-light.gif">
+    <img src="docs/assets/tui/dashboard-light.gif" width="820" height="479" alt="The Entropy crash-simulator dashboard streaming seed runs with their crash-to-recovery outcomes">
+  </picture>
 </p>
 
 <p align="center">
