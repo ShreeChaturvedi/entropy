@@ -3,11 +3,14 @@
 #
 # Each frame is produced deterministically by the real binary and rasterized
 # through the same freeze -> headless-Chrome path as the stills, so the GIFs
-# match the approved amber-on-charcoal look exactly:
+# match the approved amber-on-charcoal (or amber-on-paper) look exactly:
 #
 #   boot       entropy-tui --capture-frame boot      --phase p   (sheen sweep)
 #   dashboard  entropy-tui --capture-frame dashboard --step  i   (replay demo)
 #   console    entropy-tui --capture-frame console   --step  i   (replay demo)
+#
+# Theme: THEME=dark (default) or THEME=light. Light writes *-light.gif so both
+# palettes can live side by side. Must match theme.hpp canvas hex.
 #
 # The dashboard/console frame counts come from `--demo-frames`, so the demo
 # length lives in one place (the C++), never hardcoded here. Frames are
@@ -24,14 +27,36 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 size="${1:-120x40}"
 
-BIN="${ENTROPY_TUI_BIN:-$here/../../build-integ/tui/entropy-tui}"
+BIN="${ENTROPY_TUI_BIN:-$here/../../build/tui/entropy-tui}"
+# Prefer build/, then build-integ/ for older docs.
+if [ ! -x "$BIN" ]; then
+  BIN="${ENTROPY_TUI_BIN:-$here/../../build-integ/tui/entropy-tui}"
+fi
 FREEZE="${FREEZE_BIN:-$(command -v freeze || echo "$HOME/go/bin/freeze")}"
 CHROME="${CHROME_BIN:-$(command -v google-chrome || command -v chromium || true)}"
 FFMPEG="${FFMPEG_BIN:-$(command -v ffmpeg || true)}"
 GIFSICLE="${GIFSICLE_BIN:-$(command -v gifsicle || true)}"
 BRAILLE_FALLBACK="${BRAILLE_FALLBACK:-FreeMono, monospace}"
 JOBS="${JOBS:-$(nproc)}"
-BG="#0e0e10"
+
+# Theme: dark charcoal or light warm paper (must match theme.hpp).
+THEME="${THEME:-dark}"
+case "$THEME" in
+  dark)
+    BG="#0e0e10"
+    BG_ARGB="0e0e10ff"
+    OUT_SUFFIX=""
+    ;;
+  light)
+    BG="#faf9f6"
+    BG_ARGB="faf9f6ff"
+    OUT_SUFFIX="-light"
+    ;;
+  *)
+    echo "capture-anim: THEME must be dark or light (got '$THEME')" >&2
+    exit 2
+    ;;
+esac
 
 # Playback rate and boot sweep length.
 FPS="${FPS:-20}"
@@ -66,11 +91,11 @@ render_png() {
     "$BG" "$wi" "$hi" "$svg" > "$wrap"
   "$CHROME" --headless=new --no-sandbox --hide-scrollbars --disable-gpu \
     --force-device-scale-factor=1 --window-size="$wi,$hi" \
-    --default-background-color=0e0e10ff --screenshot="$png" "file://$wrap" >/dev/null 2>&1
+    --default-background-color="$BG_ARGB" --screenshot="$png" "file://$wrap" >/dev/null 2>&1
   rm -f "$wrap" "$svg"
 }
 export -f render_png
-export FREEZE CHROME BRAILLE_FALLBACK BG
+export FREEZE CHROME BRAILLE_FALLBACK BG BG_ARGB
 
 # Emit ANSI frames for a screen into $dir as f_%03d.ans, returning the count.
 emit_frames() {
@@ -81,12 +106,14 @@ emit_frames() {
       for ((i=0; i<n; i++)); do
         phase=$(awk "BEGIN{printf \"%.5f\", $i/$n}")
         "$BIN" --capture-frame boot --size "$size" --phase "$phase" \
+          --theme "$THEME" \
           > "$(printf '%s/f_%03d.ans' "$dir" "$i")"
       done ;;
     dashboard|console)
       n="$("$BIN" --demo-frames "$screen")"
       for ((i=0; i<n; i++)); do
         "$BIN" --capture-frame "$screen" --size "$size" --step "$i" \
+          --theme "$THEME" \
           > "$(printf '%s/f_%03d.ans' "$dir" "$i")"
       done ;;
   esac
@@ -95,6 +122,7 @@ emit_frames() {
 
 build_gif() {
   local screen="$1"
+  local out_name="${screen}${OUT_SUFFIX}.gif"
   local dir; dir="$(mktemp -d)"
   local n; n="$(emit_frames "$screen" "$dir")"
   # Rasterize every frame in parallel.
@@ -106,14 +134,14 @@ build_gif() {
     "$pal" >/dev/null 2>&1
   "$FFMPEG" -y -framerate "$FPS" -i "$dir/f_%03d.png" -i "$pal" \
     -lavfi "scale=${OUT_WIDTH}:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle" \
-    -loop 0 "$here/$screen.gif" >/dev/null 2>&1
+    -loop 0 "$here/$out_name" >/dev/null 2>&1
   rm -rf "$dir"
   if [ -n "$GIFSICLE" ]; then
     "$GIFSICLE" -O3 --lossy="$OPT_LOSSY" --colors "$OPT_COLORS" \
-      "$here/$screen.gif" -o "$here/$screen.gif" 2>/dev/null
+      "$here/$out_name" -o "$here/$out_name" 2>/dev/null
   fi
-  local bytes; bytes=$(stat -c%s "$here/$screen.gif")
-  echo "captured $screen.gif ($n frames @ ${FPS}fps, $((bytes/1024)) KB)"
+  local bytes; bytes=$(stat -c%s "$here/$out_name")
+  echo "captured $out_name ($n frames @ ${FPS}fps, $((bytes/1024)) KB, theme=$THEME)"
 }
 
 # Render all three by default, or only the screens named in $SCREENS.
