@@ -27,10 +27,7 @@ crash simulator exercises the whole stack.
 
 ## Architecture
 
-<p align="center">
-  <img src="docs/diagrams/architecture-light.svg#gh-light-mode-only" width="860" alt="Entropy architecture diagram">
-  <img src="docs/diagrams/architecture-dark.svg#gh-dark-mode-only" width="860" alt="Entropy architecture diagram">
-</p>
+<p align="center"><img src="docs/diagrams/architecture-light.svg#gh-light-mode-only" width="860" alt="Entropy architecture diagram"><img src="docs/diagrams/architecture-dark.svg#gh-dark-mode-only" width="860" alt="Entropy architecture diagram"></p>
 
 ## Architecture Details
 
