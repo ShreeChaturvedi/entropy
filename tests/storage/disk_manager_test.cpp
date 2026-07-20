@@ -186,5 +186,49 @@ TEST_F(DiskManagerTest, DeallocateThenAllocateReusesPageId) {
     EXPECT_EQ(grown, p2 + 1);
 }
 
+// A double deallocation must be rejected: the id may only enter the free
+// list once, so subsequent allocations return distinct ids.
+TEST_F(DiskManagerTest, DoubleDeallocateIsRejected) {
+    page_id_t p0 = disk_manager_->allocate_page();
+    page_id_t p1 = disk_manager_->allocate_page();
+
+    disk_manager_->deallocate_page(p0);
+    disk_manager_->deallocate_page(p0);  // Ignored: already on the free list.
+
+    page_id_t a = disk_manager_->allocate_page();
+    page_id_t b = disk_manager_->allocate_page();
+    EXPECT_NE(a, b);
+    EXPECT_EQ(a, p0);
+    EXPECT_EQ(b, p1 + 1);
+
+    // Out-of-range ids are rejected too and never enter the free list.
+    disk_manager_->deallocate_page(-1);
+    disk_manager_->deallocate_page(1000);
+    EXPECT_EQ(disk_manager_->allocate_page(), b + 1);
+}
+
+// A reused page id must read back zeroed, like a fresh page, not with the
+// stale bytes of its previous life.
+TEST_F(DiskManagerTest, ReusedPageIdReadsBackZeroed) {
+    char write_data[config::kDefaultPageSize];
+    std::memset(write_data, 'S', config::kDefaultPageSize);
+
+    page_id_t page_id = disk_manager_->allocate_page();
+    auto status = disk_manager_->write_page(page_id, write_data);
+    ASSERT_TRUE(status.ok()) << status.to_string();
+
+    disk_manager_->deallocate_page(page_id);
+
+    page_id_t reused = disk_manager_->allocate_page();
+    ASSERT_EQ(reused, page_id);
+
+    char read_data[config::kDefaultPageSize];
+    status = disk_manager_->read_page(reused, read_data);
+    ASSERT_TRUE(status.ok()) << status.to_string();
+    for (size_t i = 0; i < config::kDefaultPageSize; ++i) {
+        ASSERT_EQ(read_data[i], '\0') << "byte " << i;
+    }
+}
+
 }  // namespace
 }  // namespace entropy

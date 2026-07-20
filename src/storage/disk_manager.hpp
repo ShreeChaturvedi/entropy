@@ -61,6 +61,9 @@ public:
     /**
      * @brief Deallocate a page, making its id available for reuse
      * @param page_id The page to deallocate
+     *
+     * Out-of-range ids and double-frees are rejected (no-op). A reused id
+     * reads back zeroed, like a fresh page.
      */
     virtual void deallocate_page(page_id_t page_id) = 0;
 
@@ -93,8 +96,11 @@ protected:
 /**
  * @brief File-backed disk manager
  *
- * Stores pages in a single database file. Deallocated page ids are held in an
- * in-memory free list and reused by allocate_page before the file is grown.
+ * Stores pages in a single database file. Deallocated pages are zeroed on
+ * disk and their ids held in an in-memory free list, reused by allocate_page
+ * before the file is grown. The free list is not persisted: pages freed
+ * before a restart are leaked (safe, but never reclaimed) until a durable
+ * free-page map exists.
  */
 class FileDiskManager : public DiskManager {
 public:
@@ -134,6 +140,8 @@ private:
     std::string db_file_;
     std::fstream db_io_;
     page_id_t num_pages_ = 0;
+    /// Freed page ids awaiting reuse. In-memory only — lost on restart, so
+    /// pages freed before a crash/shutdown are leaked rather than reclaimed.
     std::vector<page_id_t> free_list_;
     mutable std::mutex mutex_;
 };
