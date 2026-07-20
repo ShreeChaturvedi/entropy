@@ -116,10 +116,28 @@ Status RecoveryManager::create_checkpoint(
     return Status::InvalidArgument("No WAL manager provided");
   }
 
-  // begin_lsn/next_txn_id are supplied by the caller in a fully-wired database;
-  // here we record the active set and default the anchor to "scan from start".
-  LogRecord checkpoint = LogRecord::make_checkpoint(active_txn_ids);
-  [[maybe_unused]] auto lsn = wal_->append_log(checkpoint);
+  // The redo anchor is only safe when every record older than it is durably
+  // reflected on disk pages. Capture the anchor candidate first: records
+  // appended concurrently after this point get LSN >= begin_lsn and stay
+  // inside the redo scan. Then flush the WAL (so all pre-anchor records are
+  // durable for analysis/undo) and flush all dirty pages (so all pre-anchor
+  // effects are durable). Without a buffer pool no pages can be flushed, so
+  // no anchor is recorded and recovery falls back to a full page-LSN-gated
+  // scan.
+  lsn_t begin_lsn = INVALID_LSN;
+  if (buffer_pool_) {
+    begin_lsn = wal_->next_lsn();
+    Status flush_status = wal_->flush();
+    if (!flush_status.ok()) {
+      return flush_status;
+    }
+    buffer_pool_->flush_all_pages();
+  }
+
+  LogRecord checkpoint = LogRecord::make_checkpoint(active_txn_ids, begin_lsn);
+  if (wal_->append_log(checkpoint) == INVALID_LSN) {
+    return Status::IOError("Failed to append CHECKPOINT record");
+  }
 
   return wal_->flush();
 }

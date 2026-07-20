@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -1928,6 +1929,77 @@ TEST_F(RecoveryTest, UndoSkipsSlotReusedByCommittedTransaction) {
   auto r = record_at(*pool, RID(0, 0));
   ASSERT_TRUE(r.has_value());
   EXPECT_EQ(*r, bytes("BBBB"));
+}
+
+TEST_F(RecoveryTest, CheckpointAnchorSkipsPreCheckpointRedo) {
+  // create_checkpoint flushes the WAL and all dirty pages, then records its
+  // own LSN as begin_lsn. Recovery must not re-apply records older than the
+  // anchor, while pre-checkpoint committed rows still survive (they are
+  // already durable on their pages).
+  auto pool = make_buffer_pool();
+  auto wal = std::make_shared<WALManager>(wal_file_.string());
+
+  // Committed txn 1, applied to page 0 (durable via the checkpoint's flush).
+  auto begin1 = LogRecord::make_begin(1);
+  [[maybe_unused]] lsn_t lsn = wal->append_log(begin1);
+  auto insert1 =
+      LogRecord::make_insert(1, begin1.lsn(), 10, RID(0, 0), bytes("pre"));
+  lsn = wal->append_log(insert1);
+  auto commit1 = LogRecord::make_commit(1, insert1.lsn());
+  lsn = wal->append_log(commit1);
+  {
+    Page *page = pool->fetch_page(0);
+    ASSERT_NE(page, nullptr);
+    TablePage table_page(page);
+    table_page.init();
+    const std::vector<char> row = bytes("pre");
+    auto slot =
+        table_page.insert_record(row.data(), static_cast<uint16_t>(row.size()));
+    ASSERT_TRUE(slot.has_value());
+    ASSERT_EQ(*slot, 0u);
+    page->set_lsn(insert1.lsn());
+    pool->unpin_page(0, true);
+  }
+
+  RecoveryManager checkpointer(pool, wal, disk_manager_);
+  ASSERT_TRUE(checkpointer.create_checkpoint({}).ok());
+
+  // Committed txn 2 after the checkpoint, never applied to any page (crash
+  // before its effects reached the buffer pool).
+  auto begin2 = LogRecord::make_begin(2);
+  lsn = wal->append_log(begin2);
+  auto insert2 =
+      LogRecord::make_insert(2, begin2.lsn(), 10, RID(1, 0), bytes("post"));
+  lsn = wal->append_log(insert2);
+  auto commit2 = LogRecord::make_commit(2, insert2.lsn());
+  lsn = wal->append_log(commit2);
+  ASSERT_TRUE(wal->flush().ok());
+
+  // Crash: recover through fresh managers over the same files.
+  auto pool2 = make_buffer_pool();
+  auto wal2 = std::make_shared<WALManager>(wal_file_.string());
+
+  // The persisted checkpoint carries a real anchor: its own LSN.
+  auto records = wal2->read_log();
+  auto checkpoint_it =
+      std::find_if(records.begin(), records.end(), [](const LogRecord &r) {
+        return r.type() == LogRecordType::CHECKPOINT;
+      });
+  ASSERT_NE(checkpoint_it, records.end());
+  EXPECT_EQ(checkpoint_it->begin_lsn(), checkpoint_it->lsn());
+
+  RecoveryManager recovery(pool2, wal2, disk_manager_);
+  ASSERT_TRUE(recovery.recover().ok());
+
+  // Only txn 2's insert is replayed; the pre-checkpoint insert is skipped by
+  // the anchor, yet its committed row survives from the checkpoint's flush.
+  EXPECT_EQ(recovery.redo_count(), 1u);
+  auto pre = record_at(*pool2, RID(0, 0));
+  ASSERT_TRUE(pre.has_value());
+  EXPECT_EQ(*pre, bytes("pre"));
+  auto post = record_at(*pool2, RID(1, 0));
+  ASSERT_TRUE(post.has_value());
+  EXPECT_EQ(*post, bytes("post"));
 }
 
 TEST_F(RecoveryTest, CheckpointRecovery) {
