@@ -36,7 +36,7 @@ public:
     LOG_INFO("Opening database: {}", path);
 
     // Initialize storage layer
-    disk_manager_ = std::make_shared<DiskManager>(path);
+    disk_manager_ = std::make_shared<FileDiskManager>(path);
     if (!disk_manager_->is_open()) {
       LOG_ERROR("Failed to open database file: {}", path);
       return;

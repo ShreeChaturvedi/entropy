@@ -17,7 +17,7 @@ class DiskManagerTest : public ::testing::Test {
 protected:
     void SetUp() override {
         temp_file_ = std::make_unique<test::TempFile>("dm_test_");
-        disk_manager_ = std::make_unique<DiskManager>(temp_file_->string());
+        disk_manager_ = std::make_unique<FileDiskManager>(temp_file_->string());
     }
 
     void TearDown() override {
@@ -98,7 +98,7 @@ TEST_F(DiskManagerTest, Persistence) {
 
     // Close and reopen
     disk_manager_.reset();
-    disk_manager_ = std::make_unique<DiskManager>(temp_file_->string());
+    disk_manager_ = std::make_unique<FileDiskManager>(temp_file_->string());
 
     char read_data[config::kDefaultPageSize];
     status = disk_manager_->read_page(page_id, read_data);

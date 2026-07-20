@@ -15,7 +15,7 @@ class BufferPoolTest : public ::testing::Test {
 protected:
     void SetUp() override {
         temp_file_ = std::make_unique<test::TempFile>("bp_test_");
-        disk_manager_ = std::make_shared<DiskManager>(temp_file_->string());
+        disk_manager_ = std::make_shared<FileDiskManager>(temp_file_->string());
         buffer_pool_ = std::make_unique<BufferPoolManager>(pool_size_, disk_manager_);
     }
 
