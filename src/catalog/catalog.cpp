@@ -59,7 +59,7 @@ void Catalog::load_from_manifest() {
   }
 
   // Recover next_oid, guarded by the max observed oid so ids never alias.
-  next_oid_ = std::max(manifest.next_oid, static_cast<oid_t>(max_oid + 1));
+  next_oid_ = std::max(manifest.next_oid, max_oid + 1);
 }
 
 CatalogManifest Catalog::snapshot() const {

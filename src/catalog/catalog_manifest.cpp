@@ -101,7 +101,7 @@ std::vector<char> CatalogManifest::serialize() const {
     for (const auto &col : t.schema.columns()) {
       put_str(b, col.name());
       put_u8(b, static_cast<uint8_t>(col.type()));
-      put_u64(b, static_cast<uint64_t>(col.length()));
+      put_u64(b, col.length());
       put_u8(b, col.is_nullable() ? 1 : 0);
     }
   }
