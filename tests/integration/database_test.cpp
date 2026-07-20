@@ -32,6 +32,39 @@ TEST_F(DatabaseTest, OpenClose) {
   EXPECT_FALSE(db.is_open());
 }
 
+// Regression (#17): if the on-disk file cannot be created/opened, the Database
+// must not report is_open() == true or accept execute() calls that would only
+// mutate an in-memory buffer pool with no persistent backing.
+TEST_F(DatabaseTest, OpenFailureLeavesDatabaseClosed) {
+  // Parent directory does not exist, so DiskManager cannot create the file.
+  const std::string bad_path =
+      temp_file_->string() + "/missing_parent/db.entropy";
+
+  Database db(bad_path);
+  EXPECT_FALSE(db.is_open());
+
+  auto result = db.execute("CREATE TABLE t (id INTEGER)");
+  EXPECT_FALSE(result.ok()) << result.status().to_string();
+}
+
+// Regression (#17): execute() after close() must error instead of mutating the
+// still-live buffer pool. Post-close writes used to succeed in memory, then be
+// silently lost because close()/destructor skip flush when is_open_ is false.
+TEST_F(DatabaseTest, ExecuteAfterCloseErrors) {
+  Database db(temp_file_->string());
+  ASSERT_TRUE(db.is_open());
+
+  auto result = db.execute("CREATE TABLE t (id INTEGER)");
+  ASSERT_TRUE(result.ok()) << result.status().to_string();
+
+  db.close();
+  EXPECT_FALSE(db.is_open());
+
+  result = db.execute("INSERT INTO t VALUES (1)");
+  EXPECT_FALSE(result.ok()) << result.status().to_string();
+  EXPECT_EQ(result.status().code(), StatusCode::kInvalidArgument);
+}
+
 TEST_F(DatabaseTest, Transaction) {
   Database db(temp_file_->string());
 
