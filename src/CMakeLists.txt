@@ -217,6 +217,15 @@ target_link_libraries(entropy
 # SQL Shell Executable
 # ─────────────────────────────────────────────────────────────────────────────
 
+add_library(entropy_shell_utils STATIC
+    api/shell_utils.cpp
+)
+
+target_include_directories(entropy_shell_utils
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
 add_executable(entropy_shell
     api/shell.cpp
 )
@@ -224,6 +233,7 @@ add_executable(entropy_shell
 target_link_libraries(entropy_shell
     PRIVATE
         entropy
+        entropy_shell_utils
 )
 
 set_target_properties(entropy_shell PROPERTIES

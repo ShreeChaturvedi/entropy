@@ -117,6 +117,23 @@ target_link_libraries(parser_tests
 gtest_discover_tests(parser_tests)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Shell utility tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+add_executable(shell_tests
+    api/shell_split_test.cpp
+)
+
+target_link_libraries(shell_tests
+    PRIVATE
+        entropy_shell_utils
+        GTest::gtest
+        GTest::gtest_main
+)
+
+gtest_discover_tests(shell_tests)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Execution Tests
 # ─────────────────────────────────────────────────────────────────────────────
 

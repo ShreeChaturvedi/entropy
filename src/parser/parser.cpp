@@ -25,6 +25,14 @@ Status Parser::parse(std::unique_ptr<Statement> *result) {
     return Status::InvalidArgument(error_.to_string());
   }
 
+  // Reject trailing tokens (second statements, unsupported clauses, junk).
+  // Statement parsers may consume one optional trailing semicolon.
+  if (!check(TokenType::END_OF_FILE)) {
+    set_error("Unexpected token after statement: " +
+              std::string(token_type_to_string(current_.type)));
+    return Status::InvalidArgument(error_.to_string());
+  }
+
   *result = std::move(stmt);
   return Status::Ok();
 }
@@ -167,8 +175,8 @@ std::unique_ptr<SelectStatement> Parser::parse_select() {
     if (check(TokenType::IDENTIFIER) && !check(TokenType::WHERE) &&
         !check(TokenType::JOIN) && !check(TokenType::INNER) &&
         !check(TokenType::LEFT) && !check(TokenType::RIGHT) &&
-        !check(TokenType::CROSS) && !check(TokenType::ORDER) &&
-        !check(TokenType::LIMIT)) {
+        !check(TokenType::CROSS) && !check(TokenType::GROUP) &&
+        !check(TokenType::ORDER) && !check(TokenType::LIMIT)) {
       stmt->table.alias = current_.value;
       advance();
     }
@@ -218,7 +226,8 @@ std::unique_ptr<SelectStatement> Parser::parse_select() {
       advance();
       // Optional alias
       if (check(TokenType::IDENTIFIER) && !check(TokenType::ON) &&
-          !check(TokenType::WHERE)) {
+          !check(TokenType::WHERE) && !check(TokenType::GROUP) &&
+          !check(TokenType::ORDER) && !check(TokenType::LIMIT)) {
         join.table.alias = current_.value;
         advance();
       }
@@ -239,6 +248,20 @@ std::unique_ptr<SelectStatement> Parser::parse_select() {
   // Parse optional WHERE clause
   if (match(TokenType::WHERE)) {
     stmt->where_clause = parse_expression();
+  }
+
+  // Parse optional GROUP BY clause (AST only; execution is issue #16)
+  if (match(TokenType::GROUP)) {
+    expect(TokenType::BY, "Expected BY after GROUP");
+    do {
+      if (check(TokenType::IDENTIFIER)) {
+        stmt->group_by.push_back(current_.value);
+        advance();
+      } else {
+        set_error("Expected column name in GROUP BY");
+        return nullptr;
+      }
+    } while (match(TokenType::COMMA));
   }
 
   // Parse optional ORDER BY clause
@@ -562,6 +585,10 @@ std::unique_ptr<Expression> Parser::parse_comparison() {
     auto right = parse_additive();
     left = std::make_unique<ComparisonExpression>(cmp, std::move(left),
                                                   std::move(right));
+  } else if (match(TokenType::IS)) {
+    bool negated = match(TokenType::NOT);
+    expect(TokenType::NULL_KEYWORD, "Expected NULL after IS [NOT]");
+    left = std::make_unique<IsNullExpression>(std::move(left), negated);
   }
 
   return left;
