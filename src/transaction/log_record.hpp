@@ -28,7 +28,7 @@
  *   - UPDATE: table_oid, rid, old_size, old_data, new_size, new_data
  *
  * System Records:
- *   - CHECKPOINT: active_txn_count, [txn_ids...]
+ *   - CHECKPOINT: begin_lsn (min recLSN), next_txn_id, active_txn_count, [txn_ids...]
  */
 
 #include <cstring>
@@ -227,12 +227,19 @@ public:
 
     /**
      * @brief Create a CHECKPOINT log record
+     * @param active_txns Transactions active at the checkpoint moment
+     * @param begin_lsn Minimum recLSN of dirty pages (redo start point)
+     * @param next_txn_id High-water transaction id to restore after recovery
      */
-    static LogRecord make_checkpoint(const std::vector<txn_id_t>& active_txns) {
+    static LogRecord make_checkpoint(const std::vector<txn_id_t>& active_txns,
+                                     lsn_t begin_lsn = INVALID_LSN,
+                                     txn_id_t next_txn_id = INVALID_TXN_ID) {
         LogRecord record;
         record.header_.type = LogRecordType::CHECKPOINT;
         record.header_.txn_id = INVALID_TXN_ID;
         record.active_txns_ = active_txns;
+        record.checkpoint_begin_lsn_ = begin_lsn;
+        record.checkpoint_next_txn_id_ = next_txn_id;
         record.header_.size = LOG_RECORD_HEADER_SIZE + record.payload_size();
         return record;
     }
@@ -260,6 +267,12 @@ public:
     // Checkpoint accessors
     [[nodiscard]] const std::vector<txn_id_t>& active_txns() const noexcept {
         return active_txns_;
+    }
+    /// Minimum recLSN recorded at the checkpoint (redo scan start point).
+    [[nodiscard]] lsn_t begin_lsn() const noexcept { return checkpoint_begin_lsn_; }
+    /// High-water next transaction id recorded at the checkpoint.
+    [[nodiscard]] txn_id_t next_txn_id() const noexcept {
+        return checkpoint_next_txn_id_;
     }
 
     /**
@@ -341,8 +354,9 @@ private:
                 return 4 + 8 + 4 + static_cast<uint32_t>(old_tuple_data_.size()) + 4 +
                        static_cast<uint32_t>(new_tuple_data_.size());
             case LogRecordType::CHECKPOINT:
-                // count(4) + txn_ids(8 * count)
-                return 4 + static_cast<uint32_t>(active_txns_.size() * sizeof(txn_id_t));
+                // begin_lsn(8) + next_txn_id(8) + count(4) + txn_ids(8 * count)
+                return 8 + 8 + 4 +
+                       static_cast<uint32_t>(active_txns_.size() * sizeof(txn_id_t));
             default:
                 return 0;
         }
@@ -487,6 +501,12 @@ private:
     }
 
     void serialize_checkpoint(char* ptr) const {
+        std::memcpy(ptr, &checkpoint_begin_lsn_, sizeof(checkpoint_begin_lsn_));
+        ptr += sizeof(checkpoint_begin_lsn_);
+
+        std::memcpy(ptr, &checkpoint_next_txn_id_, sizeof(checkpoint_next_txn_id_));
+        ptr += sizeof(checkpoint_next_txn_id_);
+
         uint32_t count = static_cast<uint32_t>(active_txns_.size());
         std::memcpy(ptr, &count, sizeof(count));
         ptr += sizeof(count);
@@ -498,14 +518,21 @@ private:
     }
 
     [[nodiscard]] bool deserialize_checkpoint(const char* ptr, uint32_t remaining) {
-        if (remaining < sizeof(uint32_t)) {
+        constexpr uint32_t kFixed = sizeof(lsn_t) + sizeof(txn_id_t) + sizeof(uint32_t);
+        if (remaining < kFixed) {
             return false;
         }
+
+        std::memcpy(&checkpoint_begin_lsn_, ptr, sizeof(checkpoint_begin_lsn_));
+        ptr += sizeof(checkpoint_begin_lsn_);
+
+        std::memcpy(&checkpoint_next_txn_id_, ptr, sizeof(checkpoint_next_txn_id_));
+        ptr += sizeof(checkpoint_next_txn_id_);
 
         uint32_t count;
         std::memcpy(&count, ptr, sizeof(count));
         ptr += sizeof(count);
-        remaining -= static_cast<uint32_t>(sizeof(uint32_t));
+        remaining -= kFixed;
 
         const uint64_t bytes_needed =
             static_cast<uint64_t>(count) * sizeof(txn_id_t);
@@ -532,6 +559,8 @@ private:
 
     // Checkpoint fields
     std::vector<txn_id_t> active_txns_;
+    lsn_t checkpoint_begin_lsn_ = INVALID_LSN;
+    txn_id_t checkpoint_next_txn_id_ = INVALID_TXN_ID;
 };
 
 }  // namespace entropy
