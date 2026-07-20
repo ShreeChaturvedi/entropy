@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -36,6 +37,9 @@ namespace entropy {
 // ─────────────────────────────────────────────────────────────────────────────
 
 static constexpr uint32_t WAL_BUFFER_SIZE = 64 * 1024;  // 64KB log buffer
+
+/// Maximum accepted on-disk log record size (guards against corrupt headers).
+static constexpr uint32_t WAL_MAX_RECORD_SIZE = 16 * 1024 * 1024;  // 16MB
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WAL Manager
@@ -70,7 +74,7 @@ public:
     /**
      * @brief Append a log record to the WAL
      * @param record The log record to append
-     * @return The LSN assigned to this record
+     * @return The LSN assigned to this record, or INVALID_LSN on I/O failure
      *
      * This method:
      * 1. Assigns an LSN to the record
@@ -80,10 +84,11 @@ public:
     [[nodiscard]] lsn_t append_log(LogRecord& record);
 
     /**
-     * @brief Flush all buffered log records to disk
+     * @brief Flush all buffered log records to durable storage
      * @return Status indicating success or failure
      *
-     * Uses fsync to ensure durability.
+     * Writes buffered records, flushes the stream, then fsyncs the file
+     * (or invokes the test sync hook when installed).
      */
     [[nodiscard]] Status flush();
 
@@ -93,6 +98,14 @@ public:
      * @return Status indicating success or failure
      */
     [[nodiscard]] Status flush_to_lsn(lsn_t lsn);
+
+    /**
+     * @brief Install a sync hook used instead of fsync (tests only)
+     *
+     * When set, flush durability is delegated to this callback so tests can
+     * assert that a durable sync was requested without relying on OS fsync.
+     */
+    void set_sync_hook_for_testing(std::function<Status()> hook);
 
     // ─────────────────────────────────────────────────────────────────────────
     // Accessors
@@ -140,6 +153,11 @@ private:
      */
     Status flush_internal();
 
+    /**
+     * @brief Durably sync the WAL file (fsync or test hook)
+     */
+    Status sync_file();
+
     std::string log_file_;
     std::fstream log_stream_;
 
@@ -147,9 +165,18 @@ private:
     std::vector<char> buffer_;
     uint32_t buffer_offset_ = 0;
 
+    // Highest LSN of a record currently sitting in buffer_ (0 when empty).
+    // flush_internal advances flushed_lsn_ only to this value, so a record that
+    // has merely been assigned an LSN (but not yet copied into the buffer) never
+    // counts as durable.
+    lsn_t buffered_max_lsn_ = INVALID_LSN;
+
     // LSN tracking
     std::atomic<lsn_t> next_lsn_{1};
     std::atomic<lsn_t> flushed_lsn_{0};
+
+    // Optional test hook replacing fsync
+    std::function<Status()> sync_hook_;
 
     // Thread safety
     mutable std::mutex mutex_;
