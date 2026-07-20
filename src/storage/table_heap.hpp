@@ -78,6 +78,17 @@ public:
   [[nodiscard]] Status delete_tuple(const RID &rid);
 
   /**
+   * @brief Restore a previously deleted tuple at its original RID
+   *
+   * Used by transaction abort to undo DELETE. The slot at rid must be empty.
+   *
+   * @param rid Original record ID to restore into
+   * @param tuple Tuple data to restore
+   * @return Status::Ok() on success
+   */
+  [[nodiscard]] Status restore_tuple(const RID &rid, const Tuple &tuple);
+
+  /**
    * @brief Update a tuple in the table
    * @param tuple New tuple data
    * @param rid Record ID of tuple to update

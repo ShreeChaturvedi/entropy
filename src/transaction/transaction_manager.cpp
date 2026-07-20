@@ -8,6 +8,9 @@
 #include <chrono>
 
 #include "common/logger.hpp"
+#include "storage/table_heap.hpp"
+#include "storage/tuple.hpp"
+#include "transaction/lock_manager.hpp"
 #include "transaction/log_record.hpp"
 #include "transaction/wal.hpp"
 
@@ -74,6 +77,11 @@ void TransactionManager::commit(Transaction* txn) {
     // Update state
     txn->set_state(TransactionState::COMMITTED);
 
+    // Release locks before dropping the transaction
+    if (lock_manager_ != nullptr) {
+        lock_manager_->release_all_locks(txn);
+    }
+
     // Clear write set (no longer needed)
     txn->clear_write_set();
 
@@ -97,9 +105,11 @@ void TransactionManager::abort(Transaction* txn) {
         return;
     }
 
-    // TODO: Undo all modifications in reverse order using write set
-    // For now, we just mark as aborted
-    // The recovery manager will handle actual undo
+    // Undo all modifications in reverse order using the write set
+    const auto& write_set = txn->write_set();
+    for (auto it = write_set.rbegin(); it != write_set.rend(); ++it) {
+        undo_write_record(*it);
+    }
 
     // Log ABORT record
     if (wal_manager_) {
@@ -114,10 +124,73 @@ void TransactionManager::abort(Transaction* txn) {
     // Update state
     txn->set_state(TransactionState::ABORTED);
 
+    // Release locks after undo so concurrent writers stay blocked during rollback
+    if (lock_manager_ != nullptr) {
+        lock_manager_->release_all_locks(txn);
+    }
+
+    txn->clear_write_set();
+
     LOG_DEBUG("Transaction {} aborted", txn->txn_id());
 
     // Remove from active transactions
     txn_map_.erase(txn->txn_id());
+}
+
+void TransactionManager::undo_write_record(const WriteRecord& record) {
+    if (!table_resolver_) {
+        LOG_WARN("Abort undo skipped for table {}: no table resolver configured",
+                 record.table_oid);
+        return;
+    }
+
+    TableHeap* heap = table_resolver_(record.table_oid);
+    if (heap == nullptr) {
+        LOG_WARN("Abort undo skipped: table {} not found", record.table_oid);
+        return;
+    }
+
+    switch (record.type) {
+        case WriteType::INSERT: {
+            // Undo INSERT = delete the inserted tuple
+            Status status = heap->delete_tuple(record.rid);
+            if (!status.ok()) {
+                LOG_WARN("Abort undo INSERT failed at ({},{}): {}", record.rid.page_id,
+                         record.rid.slot_id, status.message());
+            }
+            break;
+        }
+        case WriteType::DELETE: {
+            // Undo DELETE = restore old tuple data at the same RID when possible
+            if (record.old_data.empty()) {
+                LOG_WARN("Abort undo DELETE missing old_data for ({},{})",
+                         record.rid.page_id, record.rid.slot_id);
+                break;
+            }
+            Tuple restored(record.old_data, record.rid);
+            Status status = heap->restore_tuple(record.rid, restored);
+            if (!status.ok()) {
+                LOG_WARN("Abort undo DELETE failed at ({},{}): {}", record.rid.page_id,
+                         record.rid.slot_id, status.message());
+            }
+            break;
+        }
+        case WriteType::UPDATE: {
+            // Undo UPDATE = restore old tuple data
+            if (record.old_data.empty()) {
+                LOG_WARN("Abort undo UPDATE missing old_data for ({},{})",
+                         record.rid.page_id, record.rid.slot_id);
+                break;
+            }
+            Tuple old_tuple(record.old_data, record.rid);
+            Status status = heap->update_tuple(old_tuple, record.rid);
+            if (!status.ok()) {
+                LOG_WARN("Abort undo UPDATE failed at ({},{}): {}", record.rid.page_id,
+                         record.rid.slot_id, status.message());
+            }
+            break;
+        }
+    }
 }
 
 Transaction* TransactionManager::get_transaction(txn_id_t txn_id) {
@@ -143,16 +216,19 @@ size_t TransactionManager::active_transaction_count() const {
 
 lsn_t TransactionManager::log_insert(Transaction* txn, oid_t table_oid, RID rid,
                                      const std::vector<char>& tuple_data) {
-    if (!wal_manager_ || txn == nullptr) {
+    if (txn == nullptr) {
         return INVALID_LSN;
     }
 
-    LogRecord record =
-        LogRecord::make_insert(txn->txn_id(), txn->prev_lsn(), table_oid, rid, tuple_data);
-    lsn_t lsn = wal_manager_->append_log(record);
-    txn->set_prev_lsn(lsn);
+    lsn_t lsn = INVALID_LSN;
+    if (wal_manager_) {
+        LogRecord record =
+            LogRecord::make_insert(txn->txn_id(), txn->prev_lsn(), table_oid, rid, tuple_data);
+        lsn = wal_manager_->append_log(record);
+        txn->set_prev_lsn(lsn);
+    }
 
-    // Add to write set for potential rollback
+    // Always track write set for abort undo (even without WAL)
     txn->add_write_record(WriteRecord(WriteType::INSERT, table_oid, rid));
 
     return lsn;
@@ -160,16 +236,19 @@ lsn_t TransactionManager::log_insert(Transaction* txn, oid_t table_oid, RID rid,
 
 lsn_t TransactionManager::log_delete(Transaction* txn, oid_t table_oid, RID rid,
                                      const std::vector<char>& tuple_data) {
-    if (!wal_manager_ || txn == nullptr) {
+    if (txn == nullptr) {
         return INVALID_LSN;
     }
 
-    LogRecord record =
-        LogRecord::make_delete(txn->txn_id(), txn->prev_lsn(), table_oid, rid, tuple_data);
-    lsn_t lsn = wal_manager_->append_log(record);
-    txn->set_prev_lsn(lsn);
+    lsn_t lsn = INVALID_LSN;
+    if (wal_manager_) {
+        LogRecord record =
+            LogRecord::make_delete(txn->txn_id(), txn->prev_lsn(), table_oid, rid, tuple_data);
+        lsn = wal_manager_->append_log(record);
+        txn->set_prev_lsn(lsn);
+    }
 
-    // Add to write set with old data for rollback
+    // Always track write set with old data for abort undo
     txn->add_write_record(WriteRecord(WriteType::DELETE, table_oid, rid, tuple_data));
 
     return lsn;
@@ -178,16 +257,19 @@ lsn_t TransactionManager::log_delete(Transaction* txn, oid_t table_oid, RID rid,
 lsn_t TransactionManager::log_update(Transaction* txn, oid_t table_oid, RID rid,
                                      const std::vector<char>& old_data,
                                      const std::vector<char>& new_data) {
-    if (!wal_manager_ || txn == nullptr) {
+    if (txn == nullptr) {
         return INVALID_LSN;
     }
 
-    LogRecord record =
-        LogRecord::make_update(txn->txn_id(), txn->prev_lsn(), table_oid, rid, old_data, new_data);
-    lsn_t lsn = wal_manager_->append_log(record);
-    txn->set_prev_lsn(lsn);
+    lsn_t lsn = INVALID_LSN;
+    if (wal_manager_) {
+        LogRecord record = LogRecord::make_update(txn->txn_id(), txn->prev_lsn(), table_oid, rid,
+                                                  old_data, new_data);
+        lsn = wal_manager_->append_log(record);
+        txn->set_prev_lsn(lsn);
+    }
 
-    // Add to write set with old data for rollback
+    // Always track write set with old data for abort undo
     txn->add_write_record(WriteRecord(WriteType::UPDATE, table_oid, rid, old_data));
 
     return lsn;
