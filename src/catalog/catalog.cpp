@@ -192,6 +192,16 @@ const IndexInfo *Catalog::get_index(const std::string &index_name) const {
   return (idx_it != indexes_.end()) ? &idx_it->second : nullptr;
 }
 
+IndexInfo *Catalog::get_index_by_oid(oid_t index_oid) {
+  auto it = indexes_.find(index_oid);
+  return (it != indexes_.end()) ? &it->second : nullptr;
+}
+
+const IndexInfo *Catalog::get_index_by_oid(oid_t index_oid) const {
+  auto it = indexes_.find(index_oid);
+  return (it != indexes_.end()) ? &it->second : nullptr;
+}
+
 IndexInfo *Catalog::get_index_for_column(oid_t table_oid,
                                          column_id_t column_id) {
   for (auto &[oid, info] : indexes_) {
