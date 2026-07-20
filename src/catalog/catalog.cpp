@@ -22,6 +22,16 @@ Catalog::Catalog(std::shared_ptr<BufferPoolManager> buffer_pool,
   load_from_manifest();
 }
 
+Catalog::~Catalog() {
+  // Detach root-change listeners: an IndexInfo handle may outlive the
+  // catalog, and its tree must not call back into a destroyed object.
+  for (auto &[oid, info] : indexes_) {
+    if (info->index) {
+      info->index->set_root_change_callback(nullptr);
+    }
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Durability
 // ─────────────────────────────────────────────────────────────────────────────
@@ -50,9 +60,28 @@ void Catalog::load_from_manifest() {
   }
 
   for (auto &idx : manifest.indexes) {
-    auto tree = std::make_shared<BPlusTree>(buffer_pool_, idx.root_page_id);
+    // Guard against a manifest that references a root that never reached
+    // disk (crash between a root change and the page flush): a zeroed page
+    // is not a valid index node, so fall back to an empty tree instead of
+    // descending into garbage.
+    page_id_t root = idx.root_page_id;
+    if (root != INVALID_PAGE_ID) {
+      Page *page = buffer_pool_->fetch_page(root);
+      bool valid_root = false;
+      if (page != nullptr) {
+        BPTreePage node(page);
+        valid_root = node.is_leaf() || node.is_internal();
+        buffer_pool_->unpin_page(root, false);
+      }
+      if (!valid_root) {
+        root = INVALID_PAGE_ID;
+      }
+    }
+
+    auto tree = std::make_shared<BPlusTree>(buffer_pool_, root);
     auto info = std::make_shared<IndexInfo>(idx.oid, idx.name, idx.table_oid,
                                             idx.key_column, std::move(tree));
+    register_root_listener(info);
     index_names_[idx.name] = idx.oid;
     indexes_[idx.oid] = std::move(info);
     max_oid = std::max(max_oid, idx.oid);
@@ -94,7 +123,21 @@ Status Catalog::persist() const {
   if (manifest_path_.empty()) {
     return Status::Ok();
   }
+  // Called with the exclusive catalog lock held, so DDL serializes behind
+  // this fsync by design (durability over DDL throughput).
   return snapshot().save(manifest_path_);
+}
+
+void Catalog::register_root_listener(const std::shared_ptr<IndexInfo> &info) {
+  // Re-persist the manifest whenever the index root moves (first insert,
+  // root split, root collapse) so a reopened catalog finds the current root.
+  // Never invoked while the catalog already holds mutex_: listeners are
+  // registered only after create_index's build completes, and
+  // BPlusTree::reclaim_all_pages bypasses the callback.
+  info->index->set_root_change_callback([this](page_id_t) {
+    std::unique_lock lock(mutex_);
+    (void)persist(); // Best effort; the next DDL persists again.
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -155,6 +198,16 @@ Status Catalog::create_table(const std::string &table_name,
     return alloc;
   }
 
+  // Durability order: the page must be on disk before the manifest that
+  // references it is fsync'd, or a crash leaves the manifest pointing at a
+  // page that reads back zeroed.
+  if (!buffer_pool_->flush_page(table_heap->first_page_id())) {
+    (void)table_heap->reclaim_all_pages();
+    next_oid_--;
+    return Status::IOError("Failed to flush first heap page for " +
+                           table_name);
+  }
+
   auto info = std::make_shared<TableInfo>(oid, table_name, schema, table_heap);
 
   table_names_[table_name] = oid;
@@ -189,6 +242,18 @@ Status Catalog::drop_table(const std::string &table_name) {
   tables_.erase(oid);
   table_names_.erase(name_it);
 
+  // A table's indexes go with it.
+  std::vector<std::shared_ptr<IndexInfo>> dropped_indexes;
+  for (auto it = indexes_.begin(); it != indexes_.end();) {
+    if (it->second->table_oid == oid) {
+      dropped_indexes.push_back(it->second);
+      index_names_.erase(it->second->name);
+      it = indexes_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
   // Durably record the drop before reclaiming pages. If we crash after this
   // point but before reclamation, the pages simply leak (safe); the table is
   // gone. If persist fails, restore the entries so memory matches disk.
@@ -198,13 +263,25 @@ Status Catalog::drop_table(const std::string &table_name) {
       table_names_[table_name] = oid;
       tables_[oid] = std::move(info);
     }
+    for (auto &idx : dropped_indexes) {
+      index_names_[idx->name] = idx->oid;
+      indexes_[idx->oid] = idx;
+    }
     return persisted;
   }
 
-  // Reclaim the heap's pages through the buffer pool (DiskManager::
-  // deallocate_page) so they are not orphaned on disk.
+  // Reclaim the heap's and the indexes' pages through the buffer pool
+  // (DiskManager::deallocate_page) so they are not orphaned on disk.
   if (info && info->table_heap) {
     (void)info->table_heap->reclaim_all_pages();
+  }
+  for (auto &idx : dropped_indexes) {
+    if (idx->index) {
+      // Detach the listener first: a surviving handle must not rewrite the
+      // manifest for an index that no longer exists.
+      idx->index->set_root_change_callback(nullptr);
+      (void)idx->index->reclaim_all_pages();
+    }
   }
 
   return Status::Ok();
@@ -317,6 +394,10 @@ Status Catalog::create_index(const std::string &index_name,
     (void)index->insert(key, it.rid());
   }
 
+  // Durability order: flush the freshly built tree pages before persisting
+  // the manifest that references the tree's root.
+  buffer_pool_->flush_all_pages();
+
   // Store in catalog.
   index_names_[index_name] = oid;
   indexes_[oid] = info;
@@ -325,9 +406,14 @@ Status Catalog::create_index(const std::string &index_name,
   if (!persisted.ok()) {
     indexes_.erase(oid);
     index_names_.erase(index_name);
+    (void)index->reclaim_all_pages();
     next_oid_--;
     return persisted;
   }
+
+  // Register only after the build: root changes during the build would call
+  // back into the lock this thread already holds.
+  register_root_listener(info);
 
   return Status::Ok();
 }
