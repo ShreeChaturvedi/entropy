@@ -116,7 +116,17 @@ public:
   [[nodiscard]] const IndexInfo *get_index(const std::string &index_name) const;
 
   /**
+   * @brief Get index info by OID
+   *
+   * Index OIDs and column ids are distinct namespaces — never cast an
+   * index OID to column_id_t and pass it to get_index_for_column.
+   */
+  [[nodiscard]] IndexInfo *get_index_by_oid(oid_t index_oid);
+  [[nodiscard]] const IndexInfo *get_index_by_oid(oid_t index_oid) const;
+
+  /**
    * @brief Get index for a specific column
+   * @param column_id Column index within the table schema (not an index OID)
    * @return IndexInfo if column has an index, nullptr otherwise
    */
   [[nodiscard]] IndexInfo *get_index_for_column(oid_t table_oid,

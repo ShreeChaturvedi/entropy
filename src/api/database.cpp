@@ -31,12 +31,17 @@ namespace entropy {
 class DatabaseImpl {
 public:
   explicit DatabaseImpl(const std::string &path, const DatabaseOptions &options)
-      : path_(path), is_open_(true) {
+      : path_(path), is_open_(false) {
     Logger::init();
     LOG_INFO("Opening database: {}", path);
 
     // Initialize storage layer
     disk_manager_ = std::make_shared<DiskManager>(path);
+    if (!disk_manager_->is_open()) {
+      LOG_ERROR("Failed to open database file: {}", path);
+      return;
+    }
+
     buffer_pool_ = std::make_shared<BufferPoolManager>(options.buffer_pool_size,
                                                        disk_manager_);
 
@@ -49,11 +54,17 @@ public:
     cost_model_ = std::make_shared<CostModel>(statistics_);
     index_selector_ =
         std::make_unique<IndexSelector>(catalog_, statistics_, cost_model_);
+
+    is_open_ = true;
   }
 
   ~DatabaseImpl() { close(); }
 
   Result execute(std::string_view sql) {
+    if (!is_open_) {
+      return Result(Status::InvalidArgument("Database is not open"));
+    }
+
     // Parse SQL
     Parser parser(sql);
     std::unique_ptr<Statement> stmt;
@@ -89,6 +100,11 @@ public:
   // ─────────────────────────────────────────────────────────────────────────
 
   Result execute_select(SelectStatement *stmt) {
+    if (!stmt->group_by.empty()) {
+      return Result(Status::NotSupported(
+          "GROUP BY is not yet supported for execution"));
+    }
+
     BoundSelectContext ctx;
     Status status = binder_->bind_select(stmt, &ctx);
     if (!status.ok()) {
@@ -103,9 +119,8 @@ public:
                                                            ctx.predicate.get());
 
     if (selection.use_index) {
-      // Get index info
-      auto *index_info = catalog_->get_index_for_column(
-          ctx.table_info->oid, static_cast<column_id_t>(selection.index_oid));
+      // Resolve by index OID — never cast OID to column_id_t
+      auto *index_info = catalog_->get_index_by_oid(selection.index_oid);
 
       if (index_info && index_info->index) {
         // Use IndexScan
@@ -501,13 +516,18 @@ public:
   void close() {
     if (is_open_) {
       LOG_INFO("Closing database: {}", path_);
-      buffer_pool_->flush_all_pages();
+      if (buffer_pool_) {
+        buffer_pool_->flush_all_pages();
+      }
       is_open_ = false;
     }
   }
 
   bool is_open() const noexcept { return is_open_; }
   std::string_view path() const noexcept { return path_; }
+
+  // Test-only seam: hands out the internal Catalog pointer (see header).
+  Catalog *catalog_for_testing() noexcept { return catalog_.get(); }
 
 private:
   std::string path_;
@@ -553,5 +573,9 @@ void Database::close() { impl_->close(); }
 bool Database::is_open() const noexcept { return impl_->is_open(); }
 
 std::string_view Database::path() const noexcept { return impl_->path(); }
+
+Catalog *Database::catalog_for_testing() noexcept {
+  return impl_->catalog_for_testing();
+}
 
 } // namespace entropy

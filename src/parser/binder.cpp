@@ -109,11 +109,18 @@ Status Binder::bind_expression(Expression *expr, const TableInfo *table_info) {
                            table_info);
   }
 
-  case ExpressionType::IS_NULL:
+  case ExpressionType::IS_NULL: {
+    auto *is_null = dynamic_cast<IsNullExpression *>(expr);
+    if (is_null == nullptr) {
+      return Status::InvalidArgument("Invalid IS NULL expression");
+    }
+    return bind_expression(const_cast<Expression *>(is_null->operand()),
+                           table_info);
+  }
+
   case ExpressionType::UNARY:
-    // No concrete expression classes currently produce these node types
-    // (unary minus lowers to a BinaryOpExpression and NOT to a
-    // LogicalExpression), so there are no children to bind here.
+    // Unary minus lowers to a BinaryOpExpression and NOT to a
+    // LogicalExpression, so there are no children to bind here.
     return Status::Ok();
   }
 

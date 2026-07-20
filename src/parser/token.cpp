@@ -54,6 +54,7 @@ const std::unordered_map<std::string, TokenType> Lexer::keywords_ = {
     // Other
     {"AS", TokenType::AS},
     {"ORDER", TokenType::ORDER},
+    {"GROUP", TokenType::GROUP},
     {"BY", TokenType::BY},
     {"ASC", TokenType::ASC},
     {"DESC", TokenType::DESC},
@@ -139,6 +140,8 @@ const char *token_type_to_string(TokenType type) {
     return "AS";
   case TokenType::ORDER:
     return "ORDER";
+  case TokenType::GROUP:
+    return "GROUP";
   case TokenType::BY:
     return "BY";
   case TokenType::ASC:

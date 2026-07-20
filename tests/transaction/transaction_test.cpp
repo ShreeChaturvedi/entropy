@@ -13,6 +13,11 @@
 #include <thread>
 #include <vector>
 
+#include "catalog/schema.hpp"
+#include "storage/buffer_pool.hpp"
+#include "storage/disk_manager.hpp"
+#include "storage/table_heap.hpp"
+#include "storage/tuple.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/log_record.hpp"
 #include "transaction/mvcc.hpp"
@@ -830,6 +835,178 @@ TEST_F(TransactionManagerTest, FullTransactionWorkflow) {
   EXPECT_EQ(begin_count, 1);
   EXPECT_EQ(insert_count, 2);
   EXPECT_EQ(commit_count, 1);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Abort undo — atomicity (issue #13)
+// ─────────────────────────────────────────────────────────────────────────────
+
+class AbortUndoTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    test_dir_ = std::filesystem::temp_directory_path() /
+                ("entropy_abort_undo_" + std::to_string(rand()));
+    std::filesystem::create_directories(test_dir_);
+    db_file_ = test_dir_ / "data.db";
+    wal_file_ = test_dir_ / "test.wal";
+
+    disk_manager_ = std::make_shared<DiskManager>(db_file_.string());
+    buffer_pool_ = std::make_shared<BufferPoolManager>(16, disk_manager_);
+    table_heap_ = std::make_shared<TableHeap>(buffer_pool_);
+
+    std::vector<Column> columns = {
+        Column("id", TypeId::INTEGER),
+        Column("name", TypeId::VARCHAR, 64),
+    };
+    schema_ = Schema(std::move(columns));
+
+    wal_ = std::make_shared<WALManager>(wal_file_.string());
+    lock_mgr_ = std::make_unique<LockManager>(false, 100);
+    tm_ = std::make_unique<TransactionManager>(wal_);
+    tm_->set_lock_manager(lock_mgr_.get());
+    tm_->set_table_resolver([this](oid_t oid) -> TableHeap * {
+      return oid == kTableOid ? table_heap_.get() : nullptr;
+    });
+  }
+
+  void TearDown() override {
+    tm_.reset();
+    lock_mgr_.reset();
+    wal_.reset();
+    table_heap_.reset();
+    buffer_pool_.reset();
+    disk_manager_.reset();
+    std::filesystem::remove_all(test_dir_);
+  }
+
+  Tuple make_tuple(int32_t id, const std::string &name) {
+    return Tuple({TupleValue(id), TupleValue(name)}, schema_);
+  }
+
+  std::vector<char> tuple_bytes(const Tuple &t) {
+    return std::vector<char>(t.data(), t.data() + t.size());
+  }
+
+  bool tuple_exists(const RID &rid) {
+    Tuple out;
+    return table_heap_->get_tuple(rid, &out).ok();
+  }
+
+  static constexpr oid_t kTableOid = 1;
+
+  std::filesystem::path test_dir_;
+  std::filesystem::path db_file_;
+  std::filesystem::path wal_file_;
+  std::shared_ptr<DiskManager> disk_manager_;
+  std::shared_ptr<BufferPoolManager> buffer_pool_;
+  std::shared_ptr<TableHeap> table_heap_;
+  Schema schema_;
+  std::shared_ptr<WALManager> wal_;
+  std::unique_ptr<LockManager> lock_mgr_;
+  std::unique_ptr<TransactionManager> tm_;
+};
+
+TEST_F(AbortUndoTest, AbortUndoesInsert) {
+  auto *txn = tm_->begin();
+  ASSERT_NE(txn, nullptr);
+
+  Tuple inserted = make_tuple(1, "alice");
+  RID rid;
+  ASSERT_TRUE(table_heap_->insert_tuple(inserted, &rid).ok());
+  ASSERT_TRUE(tuple_exists(rid));
+
+  tm_->log_insert(txn, kTableOid, rid, tuple_bytes(inserted));
+  ASSERT_EQ(txn->write_set().size(), 1u);
+
+  tm_->abort(txn);
+
+  EXPECT_FALSE(tuple_exists(rid))
+      << "Aborted INSERT must remove the row (atomicity)";
+  EXPECT_EQ(tm_->active_transaction_count(), 0u);
+}
+
+TEST_F(AbortUndoTest, AbortUndoesUpdate) {
+  Tuple original = make_tuple(1, "alice");
+  RID rid;
+  ASSERT_TRUE(table_heap_->insert_tuple(original, &rid).ok());
+
+  auto *txn = tm_->begin();
+  Tuple updated = make_tuple(1, "bob");
+  ASSERT_TRUE(table_heap_->update_tuple(updated, rid).ok());
+
+  tm_->log_update(txn, kTableOid, rid, tuple_bytes(original),
+                  tuple_bytes(updated));
+
+  tm_->abort(txn);
+
+  Tuple restored;
+  ASSERT_TRUE(table_heap_->get_tuple(rid, &restored).ok());
+  EXPECT_EQ(restored.size(), original.size());
+  EXPECT_EQ(std::memcmp(restored.data(), original.data(), original.size()), 0)
+      << "Aborted UPDATE must restore old tuple data";
+}
+
+TEST_F(AbortUndoTest, AbortUndoesDelete) {
+  Tuple original = make_tuple(7, "carol");
+  RID rid;
+  ASSERT_TRUE(table_heap_->insert_tuple(original, &rid).ok());
+
+  auto *txn = tm_->begin();
+  ASSERT_TRUE(table_heap_->delete_tuple(rid).ok());
+  ASSERT_FALSE(tuple_exists(rid));
+
+  tm_->log_delete(txn, kTableOid, rid, tuple_bytes(original));
+
+  tm_->abort(txn);
+
+  Tuple restored;
+  ASSERT_TRUE(table_heap_->get_tuple(rid, &restored).ok())
+      << "Aborted DELETE must restore the row at the same RID";
+  EXPECT_EQ(std::memcmp(restored.data(), original.data(), original.size()), 0);
+  EXPECT_EQ(restored.rid(), rid);
+}
+
+TEST_F(AbortUndoTest, AbortUndoesWritesInReverseOrder) {
+  // Baseline row that survives; txn inserts then updates it, then aborts.
+  Tuple baseline = make_tuple(1, "keep");
+  RID keep_rid;
+  ASSERT_TRUE(table_heap_->insert_tuple(baseline, &keep_rid).ok());
+
+  auto *txn = tm_->begin();
+
+  Tuple inserted = make_tuple(2, "temp");
+  RID insert_rid;
+  ASSERT_TRUE(table_heap_->insert_tuple(inserted, &insert_rid).ok());
+  tm_->log_insert(txn, kTableOid, insert_rid, tuple_bytes(inserted));
+
+  Tuple updated = make_tuple(1, "changed");
+  ASSERT_TRUE(table_heap_->update_tuple(updated, keep_rid).ok());
+  tm_->log_update(txn, kTableOid, keep_rid, tuple_bytes(baseline),
+                  tuple_bytes(updated));
+
+  tm_->abort(txn);
+
+  EXPECT_FALSE(tuple_exists(insert_rid));
+  Tuple restored;
+  ASSERT_TRUE(table_heap_->get_tuple(keep_rid, &restored).ok());
+  EXPECT_EQ(std::memcmp(restored.data(), baseline.data(), baseline.size()), 0);
+}
+
+TEST_F(AbortUndoTest, AbortReleasesLocks) {
+  auto *txn = tm_->begin();
+  ASSERT_TRUE(lock_mgr_->lock_table(txn, kTableOid, LockMode::EXCLUSIVE).ok());
+  EXPECT_EQ(lock_mgr_->lock_table_size(), 1u);
+
+  Tuple inserted = make_tuple(3, "locked");
+  RID rid;
+  ASSERT_TRUE(table_heap_->insert_tuple(inserted, &rid).ok());
+  tm_->log_insert(txn, kTableOid, rid, tuple_bytes(inserted));
+
+  tm_->abort(txn);
+
+  EXPECT_EQ(lock_mgr_->lock_table_size(), 0u)
+      << "Abort must release all locks held by the transaction";
+  EXPECT_FALSE(tuple_exists(rid));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
