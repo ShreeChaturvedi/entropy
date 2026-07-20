@@ -18,10 +18,12 @@
  */
 
 #include <atomic>
+#include <cstdint>
 #include <fstream>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -42,6 +44,74 @@ static constexpr uint32_t WAL_BUFFER_SIZE = 64 * 1024;  // 64KB log buffer
 static constexpr uint32_t WAL_MAX_RECORD_SIZE = 16 * 1024 * 1024;  // 16MB
 
 // ─────────────────────────────────────────────────────────────────────────────
+// LogStore — durable byte-stream seam
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * @brief Append-only durable byte-stream the WAL is written through
+ *
+ * Abstracting the underlying medium lets the crash simulator supply a
+ * fault-injecting store (drop/reorder/tear at sync boundaries) without
+ * touching WAL record logic. The default production implementation is
+ * FileLogStore (fstream + fsync).
+ *
+ * Thread safety: implementations are self-synchronizing; WALManager also
+ * serializes its own access.
+ */
+class LogStore {
+public:
+    virtual ~LogStore() = default;
+
+    /// Append raw bytes to the end of the stream (atomic: on write failure the
+    /// stream is left unchanged).
+    [[nodiscard]] virtual Status append(std::span<const char> data) = 0;
+
+    /// Durably persist all appended bytes (fsync, or the installed test hook).
+    [[nodiscard]] virtual Status sync() = 0;
+
+    /// Read back the entire stream contents in append order.
+    [[nodiscard]] virtual std::vector<char> read_all() = 0;
+
+    /// Current number of bytes held by the stream.
+    [[nodiscard]] virtual uint64_t size() const = 0;
+
+    /// Install a callback used instead of the real durable sync (tests only).
+    virtual void set_sync_hook_for_testing(std::function<Status()> hook) = 0;
+};
+
+/**
+ * @brief File-backed LogStore wrapping an fstream plus a portable fsync
+ *
+ * Preserves the Windows-portable durable-sync path (FlushFileBuffers) and the
+ * POSIX fsync path, and hosts the test sync hook.
+ */
+class FileLogStore : public LogStore {
+public:
+    explicit FileLogStore(std::string path);
+    ~FileLogStore() override;
+
+    // Non-copyable
+    FileLogStore(const FileLogStore&) = delete;
+    FileLogStore& operator=(const FileLogStore&) = delete;
+
+    [[nodiscard]] Status append(std::span<const char> data) override;
+    [[nodiscard]] Status sync() override;
+    [[nodiscard]] std::vector<char> read_all() override;
+    [[nodiscard]] uint64_t size() const override { return size_; }
+    void set_sync_hook_for_testing(std::function<Status()> hook) override;
+
+    /// Path of the backing file.
+    [[nodiscard]] const std::string& path() const noexcept { return path_; }
+
+private:
+    std::string path_;
+    std::fstream stream_;
+    uint64_t size_ = 0;
+    std::function<Status()> sync_hook_;
+    mutable std::mutex mutex_;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // WAL Manager
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -53,10 +123,18 @@ static constexpr uint32_t WAL_MAX_RECORD_SIZE = 16 * 1024 * 1024;  // 16MB
 class WALManager {
 public:
     /**
-     * @brief Create a new WAL manager
+     * @brief Create a new WAL manager backed by a file
      * @param log_file Path to the WAL file
+     *
+     * Builds a FileLogStore internally so existing callers compile unchanged.
      */
     explicit WALManager(const std::string& log_file);
+
+    /**
+     * @brief Create a WAL manager writing through a caller-supplied LogStore
+     * @param log_store Durable byte-stream (e.g. FileLogStore or a simulator)
+     */
+    explicit WALManager(std::shared_ptr<LogStore> log_store);
 
     /**
      * @brief Destructor - flushes any remaining log records
@@ -154,12 +232,12 @@ private:
     Status flush_internal();
 
     /**
-     * @brief Durably sync the WAL file (fsync or test hook)
+     * @brief Shared post-open initialization (buffer + LSN recovery)
      */
-    Status sync_file();
+    void init_after_open();
 
     std::string log_file_;
-    std::fstream log_stream_;
+    std::shared_ptr<LogStore> log_store_;
 
     // Log buffer
     std::vector<char> buffer_;
@@ -174,9 +252,6 @@ private:
     // LSN tracking
     std::atomic<lsn_t> next_lsn_{1};
     std::atomic<lsn_t> flushed_lsn_{0};
-
-    // Optional test hook replacing fsync
-    std::function<Status()> sync_hook_;
 
     // Thread safety
     mutable std::mutex mutex_;

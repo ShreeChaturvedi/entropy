@@ -27,29 +27,160 @@
 
 namespace entropy {
 
-WALManager::WALManager(const std::string& log_file) : log_file_(log_file) {
+// ─────────────────────────────────────────────────────────────────────────────
+// FileLogStore
+// ─────────────────────────────────────────────────────────────────────────────
+
+FileLogStore::FileLogStore(std::string path) : path_(std::move(path)) {
+    // Open the file for reading and writing, creating it if it does not exist.
+    stream_.open(path_, std::ios::in | std::ios::out | std::ios::binary);
+    if (!stream_.is_open()) {
+        stream_.clear();
+        stream_.open(path_, std::ios::out | std::ios::binary);
+        stream_.close();
+        stream_.open(path_, std::ios::in | std::ios::out | std::ios::binary);
+    }
+
+    if (!stream_.is_open()) {
+        LOG_ERROR("Failed to open WAL file: {}", path_);
+        throw std::runtime_error("Failed to open WAL file: " + path_);
+    }
+
+    // Determine current size and seek to end for appending.
+    stream_.seekp(0, std::ios::end);
+    const auto end_pos = stream_.tellp();
+    size_ = (end_pos > 0) ? static_cast<uint64_t>(end_pos) : 0;
+}
+
+FileLogStore::~FileLogStore() {
+    if (stream_.is_open()) {
+        stream_.close();
+    }
+}
+
+void FileLogStore::set_sync_hook_for_testing(std::function<Status()> hook) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    sync_hook_ = std::move(hook);
+}
+
+Status FileLogStore::append(std::span<const char> data) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (data.empty()) {
+        return Status::Ok();
+    }
+
+    const auto write_pos = stream_.tellp();
+    stream_.write(data.data(), static_cast<std::streamsize>(data.size()));
+    if (stream_.fail()) {
+        // Leave the stream unchanged so a retry re-appends the same bytes.
+        stream_.clear();
+        if (write_pos != std::streampos(-1)) {
+            stream_.seekp(write_pos);
+        }
+        return Status::IOError("Failed to write to WAL file");
+    }
+
+    size_ += data.size();
+    return Status::Ok();
+}
+
+Status FileLogStore::sync() {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // Ensure iostream buffers are pushed to the OS before durable sync.
+    stream_.flush();
+    if (stream_.fail()) {
+        return Status::IOError("Failed to flush WAL stream before fsync");
+    }
+
+    if (sync_hook_) {
+        return sync_hook_();
+    }
+
+#ifdef _WIN32
+    // Re-open by path to obtain a HANDLE and flush its buffers to disk. This
+    // mirrors the POSIX path below without relying on the stream's descriptor.
+    const HANDLE handle =
+        ::CreateFileA(path_.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                      nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return Status::IOError("Failed to open WAL file for flush: " + path_);
+    }
+
+    const BOOL ok = ::FlushFileBuffers(handle);
+    const DWORD err = ::GetLastError();
+    ::CloseHandle(handle);
+
+    if (!ok) {
+        return Status::IOError("FlushFileBuffers failed on WAL file: " + path_ +
+                               " (error=" + std::to_string(err) + ")");
+    }
+
+    return Status::Ok();
+#else
+    // Re-open by path to obtain a file descriptor for fsync. This is portable
+    // across standard library implementations that do not expose fileno().
+    const int fd = ::open(path_.c_str(), O_RDWR);
+    if (fd < 0) {
+        return Status::IOError("Failed to open WAL file for fsync: " + path_);
+    }
+
+    const int rc = ::fsync(fd);
+    const int err = errno;
+    ::close(fd);
+
+    if (rc != 0) {
+        return Status::IOError("fsync failed on WAL file: " + path_ +
+                               " (errno=" + std::to_string(err) + ")");
+    }
+
+    return Status::Ok();
+#endif
+}
+
+std::vector<char> FileLogStore::read_all() {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // Push any pending writes so a fresh reader observes the latest bytes.
+    stream_.flush();
+
+    std::ifstream read_stream(path_, std::ios::binary);
+    if (!read_stream.is_open()) {
+        return {};
+    }
+
+    read_stream.seekg(0, std::ios::end);
+    const auto end_pos = read_stream.tellg();
+    if (end_pos <= 0) {
+        return {};
+    }
+    read_stream.seekg(0, std::ios::beg);
+
+    std::vector<char> bytes(static_cast<size_t>(end_pos));
+    read_stream.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    bytes.resize(static_cast<size_t>(read_stream.gcount()));
+    return bytes;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WALManager
+// ─────────────────────────────────────────────────────────────────────────────
+
+WALManager::WALManager(const std::string& log_file)
+    : log_file_(log_file),
+      log_store_(std::make_shared<FileLogStore>(log_file)) {
+    init_after_open();
+}
+
+WALManager::WALManager(std::shared_ptr<LogStore> log_store)
+    : log_store_(std::move(log_store)) {
+    init_after_open();
+}
+
+void WALManager::init_after_open() {
     buffer_.resize(WAL_BUFFER_SIZE);
 
-    // Open log file for reading and writing
-    // Create if it doesn't exist
-    log_stream_.open(log_file_, std::ios::in | std::ios::out | std::ios::binary);
-    if (!log_stream_.is_open()) {
-        // File doesn't exist, create it
-        log_stream_.clear();
-        log_stream_.open(log_file_, std::ios::out | std::ios::binary);
-        log_stream_.close();
-        log_stream_.open(log_file_, std::ios::in | std::ios::out | std::ios::binary);
-    }
-
-    if (!log_stream_.is_open()) {
-        LOG_ERROR("Failed to open WAL file: {}", log_file_);
-        throw std::runtime_error("Failed to open WAL file: " + log_file_);
-    }
-
-    // Seek to end for appending
-    log_stream_.seekp(0, std::ios::end);
-
-    // Determine next LSN based on existing records
+    // Determine next LSN based on existing records.
     auto existing_records = read_log();
     if (!existing_records.empty()) {
         next_lsn_ = existing_records.back().lsn() + 1;
@@ -65,64 +196,13 @@ WALManager::~WALManager() {
     if (buffer_offset_ > 0) {
         (void)flush();
     }
-    log_stream_.close();
 }
 
 void WALManager::set_sync_hook_for_testing(std::function<Status()> hook) {
     std::lock_guard<std::mutex> lock(mutex_);
-    sync_hook_ = std::move(hook);
-}
-
-Status WALManager::sync_file() {
-    // Ensure iostream buffers are pushed to the OS before durable sync.
-    log_stream_.flush();
-    if (log_stream_.fail()) {
-        return Status::IOError("Failed to flush WAL stream before fsync");
+    if (log_store_) {
+        log_store_->set_sync_hook_for_testing(std::move(hook));
     }
-
-    if (sync_hook_) {
-        return sync_hook_();
-    }
-
-#ifdef _WIN32
-    // Re-open by path to obtain a HANDLE and flush its buffers to disk. This
-    // mirrors the POSIX path below without relying on the stream's descriptor.
-    const HANDLE handle =
-        ::CreateFileA(log_file_.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                      nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (handle == INVALID_HANDLE_VALUE) {
-        return Status::IOError("Failed to open WAL file for flush: " + log_file_);
-    }
-
-    const BOOL ok = ::FlushFileBuffers(handle);
-    const DWORD err = ::GetLastError();
-    ::CloseHandle(handle);
-
-    if (!ok) {
-        return Status::IOError("FlushFileBuffers failed on WAL file: " + log_file_ +
-                               " (error=" + std::to_string(err) + ")");
-    }
-
-    return Status::Ok();
-#else
-    // Re-open by path to obtain a file descriptor for fsync. This is portable
-    // across standard library implementations that do not expose fileno().
-    const int fd = ::open(log_file_.c_str(), O_RDWR);
-    if (fd < 0) {
-        return Status::IOError("Failed to open WAL file for fsync: " + log_file_);
-    }
-
-    const int rc = ::fsync(fd);
-    const int err = errno;
-    ::close(fd);
-
-    if (rc != 0) {
-        return Status::IOError("fsync failed on WAL file: " + log_file_ +
-                               " (errno=" + std::to_string(err) + ")");
-    }
-
-    return Status::Ok();
-#endif
 }
 
 lsn_t WALManager::append_log(LogRecord& record) {
@@ -148,7 +228,7 @@ lsn_t WALManager::append_log(LogRecord& record) {
         }
     }
 
-    // If single record is larger than buffer, write directly to file
+    // If single record is larger than buffer, write directly to the store
     if (record_size > WAL_BUFFER_SIZE) {
         // Flush any existing buffer content first
         if (buffer_offset_ > 0) {
@@ -162,15 +242,16 @@ lsn_t WALManager::append_log(LogRecord& record) {
         }
 
         // Write large record directly
-        log_stream_.write(serialized.data(), static_cast<std::streamsize>(record_size));
-        if (log_stream_.fail()) {
-            LOG_ERROR("Failed to write large WAL record");
+        Status write_status =
+            log_store_->append(std::span<const char>(serialized.data(), record_size));
+        if (!write_status.ok()) {
+            LOG_ERROR("Failed to write large WAL record: {}", write_status.message());
             next_lsn_.store(lsn);
             record.set_lsn(INVALID_LSN);
             return INVALID_LSN;
         }
 
-        Status status = sync_file();
+        Status status = log_store_->sync();
         if (!status.ok()) {
             LOG_ERROR("Failed to sync large WAL record: {}", status.message());
             next_lsn_.store(lsn);
@@ -200,26 +281,19 @@ Status WALManager::flush_internal() {
         return Status::Ok();
     }
 
-    const auto write_pos = log_stream_.tellp();
-
-    // Write buffer to file
-    log_stream_.write(buffer_.data(), static_cast<std::streamsize>(buffer_offset_));
-
-    if (log_stream_.fail()) {
-        log_stream_.clear();
-        if (write_pos != std::streampos(-1)) {
-            log_stream_.seekp(write_pos);
-        }
-        return Status::IOError("Failed to write to WAL file");
+    // append() is atomic on write failure: it leaves the store unchanged and we
+    // keep the buffer so a retry rewrites the same bytes.
+    Status write_status =
+        log_store_->append(std::span<const char>(buffer_.data(), buffer_offset_));
+    if (!write_status.ok()) {
+        return write_status;
     }
 
-    Status sync_status = sync_file();
+    Status sync_status = log_store_->sync();
     if (!sync_status.ok()) {
-        // Keep buffer contents and rewind so a retry rewrites the same bytes.
-        log_stream_.clear();
-        if (write_pos != std::streampos(-1)) {
-            log_stream_.seekp(write_pos);
-        }
+        // Bytes were appended but are not durable; keep the buffer so a retry
+        // re-drives the sync (a duplicate re-append is harmless: same LSNs,
+        // page-LSN-gated redo is idempotent).
         return sync_status;
     }
 
@@ -250,50 +324,34 @@ Status WALManager::flush_to_lsn(lsn_t lsn) {
 
 std::vector<LogRecord> WALManager::read_log() {
     std::vector<LogRecord> records;
-
-    // Create a separate stream for reading to avoid messing with write position
-    std::ifstream read_stream(log_file_, std::ios::binary);
-    if (!read_stream.is_open()) {
+    if (!log_store_) {
         return records;
     }
 
-    // Read all records
-    while (read_stream.good()) {
-        // Read header first to get size
-        LogRecordHeader header;
-        read_stream.read(reinterpret_cast<char*>(&header), LOG_RECORD_HEADER_SIZE);
+    const std::vector<char> bytes = log_store_->read_all();
+    size_t pos = 0;
 
-        if (read_stream.gcount() < static_cast<std::streamsize>(LOG_RECORD_HEADER_SIZE)) {
-            break;  // End of file or incomplete record
-        }
+    while (pos + LOG_RECORD_HEADER_SIZE <= bytes.size()) {
+        LogRecordHeader header;
+        std::memcpy(&header, bytes.data() + pos, LOG_RECORD_HEADER_SIZE);
 
         if (header.size < LOG_RECORD_HEADER_SIZE || header.size > WAL_MAX_RECORD_SIZE) {
             LOG_WARN("Invalid log record size: {}", header.size);
             break;
         }
 
-        // Read full record
-        std::vector<char> buffer(header.size);
-        std::memcpy(buffer.data(), &header, LOG_RECORD_HEADER_SIZE);
-
-        if (header.size > LOG_RECORD_HEADER_SIZE) {
-            read_stream.read(buffer.data() + LOG_RECORD_HEADER_SIZE,
-                             static_cast<std::streamsize>(header.size - LOG_RECORD_HEADER_SIZE));
-
-            if (read_stream.gcount() <
-                static_cast<std::streamsize>(header.size - LOG_RECORD_HEADER_SIZE)) {
-                LOG_WARN("Incomplete log record, truncated WAL");
-                break;
-            }
+        if (pos + header.size > bytes.size()) {
+            LOG_WARN("Incomplete log record, truncated WAL");
+            break;
         }
 
-        // Deserialize and add to results
         LogRecord record;
-        if (!LogRecord::try_deserialize(buffer.data(), header.size, record)) {
+        if (!LogRecord::try_deserialize(bytes.data() + pos, header.size, record)) {
             LOG_WARN("Corrupt log record at LSN {}, stopping WAL read", header.lsn);
             break;
         }
         records.push_back(std::move(record));
+        pos += header.size;
     }
 
     return records;
