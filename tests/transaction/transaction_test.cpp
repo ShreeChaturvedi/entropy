@@ -641,6 +641,41 @@ TEST(LogRecordTest, DeserializeInsertRejectsOversizedTuple) {
   EXPECT_FALSE(LogRecord::try_deserialize(buffer.data(), kSize, out));
 }
 
+TEST(LogRecordTest, DeserializeLegacyCheckpointPayload) {
+  // A pre-existing WAL may hold CHECKPOINT records written before begin_lsn /
+  // next_txn_id existed (payload = count + ids only). Those must still parse,
+  // with the new fields defaulted.
+  const std::vector<txn_id_t> active_txns = {7, 9};
+  const uint32_t payload =
+      sizeof(uint32_t) + static_cast<uint32_t>(active_txns.size() * sizeof(txn_id_t));
+  const uint32_t size = LOG_RECORD_HEADER_SIZE + payload;
+  std::vector<char> buffer(size, 0);
+
+  LogRecordHeader header{};
+  header.lsn = 5;
+  header.txn_id = INVALID_TXN_ID;
+  header.prev_lsn = INVALID_LSN;
+  header.size = size;
+  header.type = LogRecordType::CHECKPOINT;
+  std::memcpy(buffer.data(), &header, LOG_RECORD_HEADER_SIZE);
+
+  char* ptr = buffer.data() + LOG_RECORD_HEADER_SIZE;
+  const uint32_t count = static_cast<uint32_t>(active_txns.size());
+  std::memcpy(ptr, &count, sizeof(count));
+  ptr += sizeof(count);
+  for (txn_id_t txn_id : active_txns) {
+    std::memcpy(ptr, &txn_id, sizeof(txn_id));
+    ptr += sizeof(txn_id);
+  }
+
+  LogRecord out;
+  ASSERT_TRUE(LogRecord::try_deserialize(buffer.data(), size, out));
+  EXPECT_EQ(out.type(), LogRecordType::CHECKPOINT);
+  EXPECT_EQ(out.active_txns(), active_txns);
+  EXPECT_EQ(out.begin_lsn(), INVALID_LSN);
+  EXPECT_EQ(out.next_txn_id(), INVALID_TXN_ID);
+}
+
 TEST(LogRecordTest, DeserializeCheckpointRejectsOversizedCount) {
   constexpr uint32_t kClaimedCount = 0x0FFFFFFFu;
   constexpr uint32_t kPayload = 4;  // count only, no txn ids
