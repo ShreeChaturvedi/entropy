@@ -1804,7 +1804,7 @@ TEST_F(MVCCTest, VisibleAfterCommit) {
 
   // txn1 commits at timestamp 100
   txn1.set_commit_ts(100);
-  mvcc_.finalize_commit(version, 100);
+  mvcc_.finalize_commit(version, &txn1, 100);
 
   // txn2 starts after txn1 committed (start_ts > version.begin_ts)
   Transaction txn2(2);
@@ -1824,11 +1824,11 @@ TEST_F(MVCCTest, DeletedVersionNotVisible) {
 
   // Create and commit version
   mvcc_.init_version(version, &creator);
-  mvcc_.finalize_commit(version, 10); // Committed at ts 10
+  mvcc_.finalize_commit(version, &creator, 10); // Committed at ts 10
 
   // Delete and commit deletion
   mvcc_.mark_deleted(version, &deleter);
-  mvcc_.finalize_commit(version, 20); // Deletion committed at ts 20
+  mvcc_.finalize_commit(version, &deleter, 20); // Deletion committed at ts 20
 
   EXPECT_EQ(version.begin_ts, 10);
   EXPECT_EQ(version.end_ts, 20);
@@ -1840,7 +1840,7 @@ TEST_F(MVCCTest, RollbackVersion) {
   VersionInfo version;
 
   mvcc_.init_version(version, &txn);
-  mvcc_.rollback_version(version);
+  mvcc_.rollback_version(version, &txn);
 
   // After rollback, begin_ts is MAX, end_ts is 0
   // This makes the version invisible to all transactions
