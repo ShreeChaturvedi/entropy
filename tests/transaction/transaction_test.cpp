@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -419,6 +420,203 @@ TEST_F(WALTest, ReopenExistingWAL) {
     EXPECT_EQ(wal.next_lsn(), last_lsn + 1);
     EXPECT_EQ(wal.flushed_lsn(), last_lsn);
   }
+}
+
+TEST_F(WALTest, FlushInvokesDurableSync) {
+  int sync_count = 0;
+  WALManager wal(wal_file_.string());
+  wal.set_sync_hook_for_testing([&]() -> Status {
+    ++sync_count;
+    return Status::Ok();
+  });
+
+  auto record = LogRecord::make_begin(1);
+  ASSERT_NE(wal.append_log(record), INVALID_LSN);
+  ASSERT_TRUE(wal.flush().ok());
+
+  EXPECT_GE(sync_count, 1);
+}
+
+TEST_F(WALTest, FlushPropagatesSyncFailure) {
+  WALManager wal(wal_file_.string());
+  wal.set_sync_hook_for_testing(
+      []() -> Status { return Status::IOError("injected sync failure"); });
+
+  auto record = LogRecord::make_begin(1);
+  ASSERT_NE(wal.append_log(record), INVALID_LSN);
+
+  Status status = wal.flush();
+  EXPECT_FALSE(status.ok());
+  EXPECT_TRUE(status.is_io_error());
+}
+
+TEST_F(WALTest, AppendLogReturnsInvalidLsnWhenFlushFails) {
+  WALManager wal(wal_file_.string());
+  wal.set_sync_hook_for_testing(
+      []() -> Status { return Status::IOError("injected sync failure"); });
+
+  // Fill the buffer so the next append must flush first.
+  std::vector<char> big_tuple(WAL_BUFFER_SIZE / 2, 'x');
+  auto first = LogRecord::make_insert(1, INVALID_LSN, 1, RID(1, 0), big_tuple);
+  ASSERT_NE(wal.append_log(first), INVALID_LSN);
+
+  auto second = LogRecord::make_insert(1, 1, 1, RID(1, 1), big_tuple);
+  EXPECT_EQ(wal.append_log(second), INVALID_LSN);
+}
+
+TEST_F(WALTest, BufferBoundaryCommitIsDurable) {
+  // Regression for the flushed_lsn accounting bug: when a COMMIT append
+  // overflows the buffer, the overflow flush writes only the *prior* records
+  // but must NOT mark the (not-yet-buffered) COMMIT as durable. Otherwise the
+  // subsequent flush_to_lsn(commit) short-circuits and never fsyncs the commit,
+  // silently losing a committed transaction on crash.
+  int sync_count = 0;
+  lsn_t commit_lsn = INVALID_LSN;
+  {
+    WALManager wal(wal_file_.string());
+    wal.set_sync_hook_for_testing([&]() -> Status {
+      ++sync_count;
+      return Status::Ok();
+    });
+
+    // COMMIT records carry no payload, so their on-disk size is just the header.
+    const uint32_t commit_size = LOG_RECORD_HEADER_SIZE;
+    ASSERT_LT(commit_size, WAL_BUFFER_SIZE);
+
+    // Fill the buffer to within less than a commit record of full using a single
+    // INSERT, so appending the COMMIT triggers an overflow flush.
+    const uint32_t insert_overhead =
+        LOG_RECORD_HEADER_SIZE + sizeof(oid_t) + sizeof(RID) + sizeof(uint32_t);
+    const uint32_t target_offset = WAL_BUFFER_SIZE - (commit_size / 2);
+    ASSERT_GT(target_offset, insert_overhead);
+    std::vector<char> tuple(target_offset - insert_overhead, 'x');
+    auto insert = LogRecord::make_insert(1, INVALID_LSN, 1, RID(1, 0), tuple);
+    ASSERT_NE(wal.append_log(insert), INVALID_LSN);
+    ASSERT_EQ(wal.buffer_offset(), target_offset);
+    // Appending the commit must overflow the buffer.
+    ASSERT_GT(wal.buffer_offset() + commit_size, WAL_BUFFER_SIZE);
+
+    auto commit = LogRecord::make_commit(1, insert.lsn());
+    commit_lsn = wal.append_log(commit);
+    ASSERT_NE(commit_lsn, INVALID_LSN);
+
+    // The overflow flush persisted only the INSERT, so the COMMIT must not yet
+    // count as durable.
+    ASSERT_LT(wal.flushed_lsn(), commit_lsn);
+    const int syncs_before = sync_count;
+
+    // Forcing the commit durable must actually perform a sync and advance the
+    // flushed LSN past the commit.
+    ASSERT_TRUE(wal.flush_to_lsn(commit_lsn).ok());
+    EXPECT_GT(sync_count, syncs_before);
+    EXPECT_GE(wal.flushed_lsn(), commit_lsn);
+  }
+
+  // And the commit record must actually be on disk after reopen.
+  WALManager wal(wal_file_.string());
+  auto records = wal.read_log();
+  ASSERT_FALSE(records.empty());
+  EXPECT_EQ(records.back().type(), LogRecordType::COMMIT);
+}
+
+TEST_F(WALTest, ReadLogRejectsOversizedHeaderSize) {
+  // Craft an INSERT record that is fully self-consistent (its embedded
+  // tuple_size exactly matches the declared payload), so try_deserialize would
+  // ACCEPT it if handed the bytes. Its only defect is a declared size just past
+  // WAL_MAX_RECORD_SIZE. The record is written to the file in full, so the sole
+  // thing that can reject it in read_log is the size upper-bound guard --
+  // deleting `header.size > WAL_MAX_RECORD_SIZE` must make this test fail.
+  const uint32_t corrupt_size = WAL_MAX_RECORD_SIZE + 1;
+  const uint32_t payload = corrupt_size - LOG_RECORD_HEADER_SIZE;
+  const uint32_t fixed = sizeof(oid_t) + sizeof(RID) + sizeof(uint32_t);
+  ASSERT_GT(payload, fixed);
+  const uint32_t tuple_size = payload - fixed;
+
+  std::vector<char> buffer(corrupt_size, 0);
+  LogRecordHeader header{};
+  header.lsn = 1;
+  header.txn_id = 1;
+  header.prev_lsn = INVALID_LSN;
+  header.size = corrupt_size;
+  header.type = LogRecordType::INSERT;
+  std::memcpy(buffer.data(), &header, LOG_RECORD_HEADER_SIZE);
+
+  char* ptr = buffer.data() + LOG_RECORD_HEADER_SIZE;
+  oid_t table_oid = 7;
+  RID rid(3, 1);
+  std::memcpy(ptr, &table_oid, sizeof(table_oid));
+  ptr += sizeof(table_oid);
+  std::memcpy(ptr, &rid, sizeof(rid));
+  ptr += sizeof(rid);
+  std::memcpy(ptr, &tuple_size, sizeof(tuple_size));
+  // Remaining tuple bytes stay zero-filled; they are valid payload.
+
+  // Guard against the record being rejected for any reason other than size:
+  // handed the full buffer, try_deserialize must accept it.
+  {
+    LogRecord probe;
+    ASSERT_TRUE(LogRecord::try_deserialize(buffer.data(), corrupt_size, probe));
+    EXPECT_EQ(probe.type(), LogRecordType::INSERT);
+  }
+
+  {
+    std::ofstream out(wal_file_, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(out.is_open());
+    out.write(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+    ASSERT_TRUE(out.good());
+  }
+
+  WALManager wal(wal_file_.string());
+  auto records = wal.read_log();
+  // Only the size upper bound rejects this otherwise-valid record.
+  EXPECT_TRUE(records.empty());
+}
+
+TEST(LogRecordTest, DeserializeInsertRejectsOversizedTuple) {
+  // Minimal INSERT payload with a huge embedded tuple_size.
+  constexpr uint32_t kClaimedTupleSize = 0x0FFFFFFFu;
+  constexpr uint32_t kPayload = 4 + 8 + 4;  // oid + rid + tuple_size (no data)
+  constexpr uint32_t kSize = LOG_RECORD_HEADER_SIZE + kPayload;
+  std::vector<char> buffer(kSize, 0);
+
+  LogRecordHeader header{};
+  header.lsn = 1;
+  header.txn_id = 1;
+  header.prev_lsn = INVALID_LSN;
+  header.size = kSize;
+  header.type = LogRecordType::INSERT;
+  std::memcpy(buffer.data(), &header, LOG_RECORD_HEADER_SIZE);
+
+  char* ptr = buffer.data() + LOG_RECORD_HEADER_SIZE;
+  oid_t table_oid = 10;
+  RID rid(1, 0);
+  std::memcpy(ptr, &table_oid, sizeof(table_oid));
+  ptr += sizeof(table_oid);
+  std::memcpy(ptr, &rid, sizeof(rid));
+  ptr += sizeof(rid);
+  std::memcpy(ptr, &kClaimedTupleSize, sizeof(kClaimedTupleSize));
+
+  LogRecord out;
+  EXPECT_FALSE(LogRecord::try_deserialize(buffer.data(), kSize, out));
+}
+
+TEST(LogRecordTest, DeserializeCheckpointRejectsOversizedCount) {
+  constexpr uint32_t kClaimedCount = 0x0FFFFFFFu;
+  constexpr uint32_t kPayload = 4;  // count only, no txn ids
+  constexpr uint32_t kSize = LOG_RECORD_HEADER_SIZE + kPayload;
+  std::vector<char> buffer(kSize, 0);
+
+  LogRecordHeader header{};
+  header.lsn = 1;
+  header.txn_id = INVALID_TXN_ID;
+  header.prev_lsn = INVALID_LSN;
+  header.size = kSize;
+  header.type = LogRecordType::CHECKPOINT;
+  std::memcpy(buffer.data(), &header, LOG_RECORD_HEADER_SIZE);
+  std::memcpy(buffer.data() + LOG_RECORD_HEADER_SIZE, &kClaimedCount, sizeof(kClaimedCount));
+
+  LogRecord out;
+  EXPECT_FALSE(LogRecord::try_deserialize(buffer.data(), kSize, out));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
