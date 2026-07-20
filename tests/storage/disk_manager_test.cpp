@@ -174,6 +174,7 @@ TEST_F(DiskManagerTest, DeallocateThenAllocateReusesPageId) {
     page_id_t p0 = disk_manager_->allocate_page();
     page_id_t p1 = disk_manager_->allocate_page();
     page_id_t p2 = disk_manager_->allocate_page();
+    EXPECT_NE(p0, p1);
 
     disk_manager_->deallocate_page(p1);
 
