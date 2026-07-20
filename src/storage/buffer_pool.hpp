@@ -87,6 +87,14 @@ public:
      */
     [[nodiscard]] size_t pool_size() const noexcept { return pool_size_; }
 
+    /**
+     * @brief Number of free frames currently available
+     *
+     * Increases when delete_page reclaims a buffered page. Useful for
+     * detecting page leaks after B+ tree merges.
+     */
+    [[nodiscard]] size_t free_list_size() const;
+
 private:
     /// Find a frame to use (evict if necessary)
     [[nodiscard]] frame_id_t find_victim_frame();
@@ -97,7 +105,7 @@ private:
     std::unique_ptr<LRUReplacer> replacer_;
     std::unordered_map<page_id_t, frame_id_t> page_table_;
     std::vector<frame_id_t> free_list_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
 };
 
 }  // namespace entropy

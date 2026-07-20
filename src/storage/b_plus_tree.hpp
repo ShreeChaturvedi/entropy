@@ -53,6 +53,15 @@ public:
   explicit BPlusTree(std::shared_ptr<BufferPoolManager> buffer_pool,
                      page_id_t root_page_id = INVALID_PAGE_ID);
 
+  /**
+   * @brief Construct a B+ Tree with explicit node capacities
+   *
+   * Used by tests to force splits/merges with a small fanout.
+   */
+  BPlusTree(std::shared_ptr<BufferPoolManager> buffer_pool,
+            page_id_t root_page_id, uint32_t leaf_max_size,
+            uint32_t internal_max_size);
+
   ~BPlusTree() = default;
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -188,8 +197,24 @@ private:
    * @brief Handle underflow in a leaf node after deletion
    *
    * Tries to borrow from siblings first, then merges if necessary.
+   * @param leaf_page The underfull leaf (still pinned by caller)
+   * @param page_to_delete_out If non-null, set to a page the caller must
+   *        delete_page after unpinning (the merged-away leaf on left-merge)
    */
-  [[nodiscard]] Status handle_leaf_underflow(Page *leaf_page);
+  [[nodiscard]] Status handle_leaf_underflow(Page *leaf_page,
+                                             page_id_t *page_to_delete_out);
+
+  /**
+   * @brief Handle underflow in an internal node after a child merge
+   *
+   * Tries to borrow from siblings first, then merges if necessary.
+   * @param internal_page The underfull internal node (still pinned by caller)
+   * @param page_to_delete_out If non-null, set to a page the caller must
+   *        delete_page after unpinning (the merged-away node on left-merge)
+   */
+  [[nodiscard]] Status
+  handle_internal_underflow(Page *internal_page,
+                            page_id_t *page_to_delete_out);
 
   std::shared_ptr<BufferPoolManager> buffer_pool_;
   page_id_t root_page_id_;
