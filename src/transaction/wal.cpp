@@ -182,6 +182,9 @@ lsn_t WALManager::append_log(LogRecord& record) {
         // Copy to buffer
         std::memcpy(buffer_.data() + buffer_offset_, serialized.data(), record_size);
         buffer_offset_ += record_size;
+        // This record is now the highest LSN held (but not yet flushed) in the
+        // buffer. flush_internal uses this to advance flushed_lsn_ truthfully.
+        buffered_max_lsn_ = lsn;
     }
 
     return lsn;
@@ -220,11 +223,18 @@ Status WALManager::flush_internal() {
         return sync_status;
     }
 
-    // Update flushed LSN
-    flushed_lsn_.store(next_lsn_.load() - 1);
+    // Advance flushed LSN only to the highest LSN that was actually contained
+    // in the bytes we just wrote and synced. Using next_lsn_ - 1 here would
+    // wrongly mark a record that append_log has assigned an LSN to but not yet
+    // copied into the buffer (e.g. the record that triggered this overflow
+    // flush) as durable, silently skipping its later fsync.
+    if (buffered_max_lsn_ > flushed_lsn_.load()) {
+        flushed_lsn_.store(buffered_max_lsn_);
+    }
 
     // Reset buffer
     buffer_offset_ = 0;
+    buffered_max_lsn_ = INVALID_LSN;
 
     return Status::Ok();
 }

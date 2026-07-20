@@ -165,6 +165,12 @@ private:
     std::vector<char> buffer_;
     uint32_t buffer_offset_ = 0;
 
+    // Highest LSN of a record currently sitting in buffer_ (0 when empty).
+    // flush_internal advances flushed_lsn_ only to this value, so a record that
+    // has merely been assigned an LSN (but not yet copied into the buffer) never
+    // counts as durable.
+    lsn_t buffered_max_lsn_ = INVALID_LSN;
+
     // LSN tracking
     std::atomic<lsn_t> next_lsn_{1};
     std::atomic<lsn_t> flushed_lsn_{0};

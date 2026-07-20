@@ -459,6 +459,61 @@ TEST_F(WALTest, AppendLogReturnsInvalidLsnWhenFlushFails) {
   EXPECT_EQ(wal.append_log(second), INVALID_LSN);
 }
 
+TEST_F(WALTest, BufferBoundaryCommitIsDurable) {
+  // Regression for the flushed_lsn accounting bug: when a COMMIT append
+  // overflows the buffer, the overflow flush writes only the *prior* records
+  // but must NOT mark the (not-yet-buffered) COMMIT as durable. Otherwise the
+  // subsequent flush_to_lsn(commit) short-circuits and never fsyncs the commit,
+  // silently losing a committed transaction on crash.
+  int sync_count = 0;
+  lsn_t commit_lsn = INVALID_LSN;
+  {
+    WALManager wal(wal_file_.string());
+    wal.set_sync_hook_for_testing([&]() -> Status {
+      ++sync_count;
+      return Status::Ok();
+    });
+
+    // COMMIT records carry no payload, so their on-disk size is just the header.
+    const uint32_t commit_size = LOG_RECORD_HEADER_SIZE;
+    ASSERT_LT(commit_size, WAL_BUFFER_SIZE);
+
+    // Fill the buffer to within less than a commit record of full using a single
+    // INSERT, so appending the COMMIT triggers an overflow flush.
+    const uint32_t insert_overhead =
+        LOG_RECORD_HEADER_SIZE + sizeof(oid_t) + sizeof(RID) + sizeof(uint32_t);
+    const uint32_t target_offset = WAL_BUFFER_SIZE - (commit_size / 2);
+    ASSERT_GT(target_offset, insert_overhead);
+    std::vector<char> tuple(target_offset - insert_overhead, 'x');
+    auto insert = LogRecord::make_insert(1, INVALID_LSN, 1, RID(1, 0), tuple);
+    ASSERT_NE(wal.append_log(insert), INVALID_LSN);
+    ASSERT_EQ(wal.buffer_offset(), target_offset);
+    // Appending the commit must overflow the buffer.
+    ASSERT_GT(wal.buffer_offset() + commit_size, WAL_BUFFER_SIZE);
+
+    auto commit = LogRecord::make_commit(1, insert.lsn());
+    commit_lsn = wal.append_log(commit);
+    ASSERT_NE(commit_lsn, INVALID_LSN);
+
+    // The overflow flush persisted only the INSERT, so the COMMIT must not yet
+    // count as durable.
+    ASSERT_LT(wal.flushed_lsn(), commit_lsn);
+    const int syncs_before = sync_count;
+
+    // Forcing the commit durable must actually perform a sync and advance the
+    // flushed LSN past the commit.
+    ASSERT_TRUE(wal.flush_to_lsn(commit_lsn).ok());
+    EXPECT_GT(sync_count, syncs_before);
+    EXPECT_GE(wal.flushed_lsn(), commit_lsn);
+  }
+
+  // And the commit record must actually be on disk after reopen.
+  WALManager wal(wal_file_.string());
+  auto records = wal.read_log();
+  ASSERT_FALSE(records.empty());
+  EXPECT_EQ(records.back().type(), LogRecordType::COMMIT);
+}
+
 TEST_F(WALTest, ReadLogRejectsOversizedHeaderSize) {
   {
     WALManager wal(wal_file_.string());
