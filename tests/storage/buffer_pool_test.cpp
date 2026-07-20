@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <string>
@@ -155,8 +156,10 @@ TEST_F(BufferPoolTest, PoolEviction) {
 TEST(BufferPoolWalHookTest, HookRunsWithPageLsnBeforeFlushWrite) {
     auto dm = std::make_shared<RecordingDiskManager>();
     BufferPoolManager bpm(4, dm);
-    bpm.set_wal_flush_hook(
-        [rec = dm.get()](lsn_t lsn) { rec->note_hook(lsn); });
+    bpm.set_wal_flush_hook([rec = dm.get()](lsn_t lsn) {
+        rec->note_hook(lsn);
+        return Status::Ok();
+    });
 
     page_id_t page_id;
     Page* page = bpm.new_page(&page_id);
@@ -178,8 +181,10 @@ TEST(BufferPoolWalHookTest, HookRunsWithPageLsnBeforeFlushWrite) {
 TEST(BufferPoolWalHookTest, HookRunsBeforeWriteOnEviction) {
     auto dm = std::make_shared<RecordingDiskManager>();
     BufferPoolManager bpm(/*pool_size=*/1, dm);
-    bpm.set_wal_flush_hook(
-        [rec = dm.get()](lsn_t lsn) { rec->note_hook(lsn); });
+    bpm.set_wal_flush_hook([rec = dm.get()](lsn_t lsn) {
+        rec->note_hook(lsn);
+        return Status::Ok();
+    });
 
     page_id_t p0;
     Page* page0 = bpm.new_page(&p0);
@@ -197,6 +202,75 @@ TEST(BufferPoolWalHookTest, HookRunsBeforeWriteOnEviction) {
     EXPECT_EQ(dm->events[0].lsn, 7u);
     EXPECT_EQ(dm->events[1].kind, "write");
     EXPECT_EQ(dm->events[1].lsn, 7u);
+}
+
+// A failing hook (log flush error) must veto the page write entirely:
+// no disk write may follow a failed WAL flush.
+TEST(BufferPoolWalHookTest, HookErrorVetoesPageWrite) {
+    auto dm = std::make_shared<RecordingDiskManager>();
+    BufferPoolManager bpm(4, dm);
+    bpm.set_wal_flush_hook([rec = dm.get()](lsn_t lsn) {
+        rec->note_hook(lsn);
+        return Status::IOError("log flush failed");
+    });
+
+    page_id_t page_id;
+    Page* page = bpm.new_page(&page_id);
+    ASSERT_NE(page, nullptr);
+    page->set_lsn(99);
+    bpm.unpin_page(page_id, /*is_dirty=*/true);
+
+    EXPECT_FALSE(bpm.flush_page(page_id));
+
+    // The hook ran, but the page write was skipped.
+    ASSERT_EQ(dm->events.size(), 1u);
+    EXPECT_EQ(dm->events[0].kind, "hook");
+    EXPECT_EQ(dm->events[0].lsn, 99u);
+
+    // Once the log flush succeeds, the (still dirty) page can be written.
+    bpm.set_wal_flush_hook([rec = dm.get()](lsn_t lsn) {
+        rec->note_hook(lsn);
+        return Status::Ok();
+    });
+    EXPECT_TRUE(bpm.flush_page(page_id));
+    ASSERT_EQ(dm->events.size(), 3u);
+    EXPECT_EQ(dm->events[1].kind, "hook");
+    EXPECT_EQ(dm->events[2].kind, "write");
+    EXPECT_EQ(dm->events[2].lsn, 99u);
+}
+
+// The hook must also fire (before each write) on the flush_all_pages path.
+TEST(BufferPoolWalHookTest, HookRunsBeforeWritesOnFlushAllPages) {
+    auto dm = std::make_shared<RecordingDiskManager>();
+    BufferPoolManager bpm(4, dm);
+    bpm.set_wal_flush_hook([rec = dm.get()](lsn_t lsn) {
+        rec->note_hook(lsn);
+        return Status::Ok();
+    });
+
+    const std::array<lsn_t, 2> lsns = {11, 22};
+    for (size_t i = 0; i < lsns.size(); ++i) {
+        page_id_t page_id;
+        Page* page = bpm.new_page(&page_id);
+        ASSERT_NE(page, nullptr);
+        page->set_lsn(lsns[i]);
+        bpm.unpin_page(page_id, /*is_dirty=*/true);
+    }
+
+    bpm.flush_all_pages();
+
+    // Each dirty page produces a hook immediately followed by its write,
+    // with matching LSNs (page-table iteration order is unspecified).
+    ASSERT_EQ(dm->events.size(), 4u);
+    std::vector<lsn_t> flushed;
+    for (size_t i = 0; i < dm->events.size(); i += 2) {
+        EXPECT_EQ(dm->events[i].kind, "hook");
+        EXPECT_EQ(dm->events[i + 1].kind, "write");
+        EXPECT_EQ(dm->events[i].lsn, dm->events[i + 1].lsn);
+        flushed.push_back(dm->events[i].lsn);
+    }
+    std::sort(flushed.begin(), flushed.end());
+    EXPECT_EQ(flushed, std::vector<lsn_t>({11, 22}));
 }
 
 }  // namespace

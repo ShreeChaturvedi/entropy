@@ -232,7 +232,7 @@ size_t BufferPoolManager::free_list_size() const {
     return free_list_.size();
 }
 
-void BufferPoolManager::set_wal_flush_hook(std::function<void(lsn_t)> hook) {
+void BufferPoolManager::set_wal_flush_hook(std::function<Status(lsn_t)> hook) {
     std::lock_guard<std::mutex> lock(mutex_);
     wal_flush_hook_ = std::move(hook);
 }
@@ -260,9 +260,13 @@ void BufferPoolManager::flush_all_pages() {
 
 Status BufferPoolManager::write_page_to_disk(Page* page) {
     // WAL-before-page (steal): the log must be durable up to this page's LSN
-    // before the page itself reaches disk.
+    // before the page itself reaches disk. If the log flush fails, the page
+    // write must not happen at all.
     if (wal_flush_hook_) {
-        wal_flush_hook_(page->lsn());
+        auto status = wal_flush_hook_(page->lsn());
+        if (!status.ok()) {
+            return status;
+        }
     }
     return disk_manager_->write_page(page->page_id(), page->data());
 }
