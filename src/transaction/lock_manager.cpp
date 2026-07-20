@@ -81,13 +81,28 @@ Status LockManager::upgrade_lock(Transaction* txn, oid_t table_oid, const RID& r
         return Status::InvalidArgument("Cannot upgrade a waiting lock request");
     }
 
-    // Check if another transaction is already upgrading
-    if (queue->upgrading) {
-        // Two transactions trying to upgrade = deadlock
-        LOG_DEBUG("Deadlock detected: multiple upgrade requests for txn {} and {}",
-                  txn->txn_id(), queue->upgrading_txn_id);
+    // Another transaction already owns the single upgrade slot on this queue.
+    // Two transactions upgrading the same resource deadlock (each holds S and
+    // waits for the other's S to drop). Resolve with wait-die.
+    if (queue->upgrading && queue->upgrading_txn_id != txn->txn_id()) {
         deadlock_count_.fetch_add(1, std::memory_order_relaxed);
-        return Status::Aborted("Deadlock: multiple upgrade requests");
+        if (txn->txn_id() > queue->upgrading_txn_id) {
+            // Younger requester loses.
+            LOG_DEBUG("Deadlock: txn {} loses upgrade race with {} (wait-die)",
+                      txn->txn_id(), queue->upgrading_txn_id);
+            txn->set_state(TransactionState::ABORTED);
+            release_all_locks_locked(txn);
+            return Status::Aborted(
+                "Deadlock detected during lock upgrade (wait-die victim)");
+        }
+        // Older requester wins: abort the younger upgrader and take the slot.
+        LOG_DEBUG("Deadlock: txn {} aborts younger upgrader {} (wait-die)",
+                  txn->txn_id(), queue->upgrading_txn_id);
+        if (Transaction* other = find_transaction_locked(queue->upgrading_txn_id)) {
+            abort_victim_locked(other);
+        }
+        queue->upgrading = false;
+        queue->upgrading_txn_id = INVALID_TXN_ID;
     }
 
     // Check if we can upgrade immediately
@@ -111,16 +126,8 @@ Status LockManager::upgrade_lock(Transaction* txn, oid_t table_oid, const RID& r
     queue->upgrading = true;
     queue->upgrading_txn_id = txn->txn_id();
 
-    // Check for deadlock before waiting
-    if (enable_deadlock_detection_ && would_cause_deadlock(txn->txn_id(), queue)) {
-        queue->upgrading = false;
-        queue->upgrading_txn_id = INVALID_TXN_ID;
-        deadlock_count_.fetch_add(1, std::memory_order_relaxed);
-        LOG_DEBUG("Deadlock detected during upgrade for txn {}", txn->txn_id());
-        return Status::Aborted("Deadlock detected during lock upgrade");
-    }
-
-    // Wait for upgrade
+    // Wait for the other holders to release, re-checking for deadlock on every
+    // wake so a cycle that forms while we sit in the upgrade slot is resolved.
     auto deadline = std::chrono::steady_clock::now() + lock_timeout_;
     while (true) {
         // Check if we can upgrade
@@ -140,6 +147,26 @@ Status LockManager::upgrade_lock(Transaction* txn, oid_t table_oid, const RID& r
             return Status::Ok();
         }
 
+        // Deadlock re-check for the queued upgrade (wait-die victim selection).
+        if (enable_deadlock_detection_) {
+            txn_id_t victim = select_deadlock_victim(txn->txn_id());
+            if (victim != INVALID_TXN_ID) {
+                deadlock_count_.fetch_add(1, std::memory_order_relaxed);
+                if (victim == txn->txn_id()) {
+                    queue->upgrading = false;
+                    queue->upgrading_txn_id = INVALID_TXN_ID;
+                    txn->set_state(TransactionState::ABORTED);
+                    release_all_locks_locked(txn);
+                    return Status::Aborted(
+                        "Deadlock detected during lock upgrade (wait-die victim)");
+                }
+                if (Transaction* victim_txn = find_transaction_locked(victim)) {
+                    abort_victim_locked(victim_txn);
+                }
+                // Fall through to wait so the victim can run and release.
+            }
+        }
+
         // Wait with timeout
         if (queue->cv.wait_until(lock, deadline) == std::cv_status::timeout) {
             queue->upgrading = false;
@@ -148,10 +175,12 @@ Status LockManager::upgrade_lock(Transaction* txn, oid_t table_oid, const RID& r
             return Status::Timeout("Lock upgrade timed out");
         }
 
-        // Check if transaction was aborted
+        // Aborted by another thread as a deadlock victim: release everything so
+        // the transactions blocked on us proceed immediately.
         if (!txn->is_active()) {
             queue->upgrading = false;
             queue->upgrading_txn_id = INVALID_TXN_ID;
+            release_all_locks_locked(txn);
             return Status::Aborted("Transaction was aborted");
         }
     }
@@ -167,7 +196,10 @@ void LockManager::release_all_locks(Transaction* txn) {
     }
 
     std::lock_guard<std::mutex> lock(latch_);
+    release_all_locks_locked(txn);
+}
 
+void LockManager::release_all_locks_locked(Transaction* txn) {
     // Find all locks held by this transaction and remove them
     std::vector<LockTarget> targets_to_remove;
 
@@ -202,6 +234,27 @@ void LockManager::release_all_locks(Transaction* txn) {
     }
 
     LOG_DEBUG("Released all locks for txn {}", txn->txn_id());
+}
+
+void LockManager::abort_victim_locked(Transaction* victim) {
+    // A deadlock-cycle victim is, by definition, blocked inside one of its own
+    // wait loops (lock_internal or upgrade_lock). We do NOT touch its requests
+    // from here: those loops retain list iterators into the queues, so erasing
+    // cross-thread would be undefined behaviour. Instead we mark it ABORTED and
+    // wake every queue it participates in. Its own thread then observes the
+    // aborted state, releases all of its locks (release_all_locks_locked, on its
+    // own thread), and the survivors it was blocking are granted immediately —
+    // no 5s timeout stall.
+    victim->set_state(TransactionState::ABORTED);
+
+    const txn_id_t victim_id = victim->txn_id();
+    for (auto& [target, queue] : lock_table_) {
+        if (queue->find_request(victim_id) != queue->request_queue.end()) {
+            queue->cv.notify_all();
+        }
+    }
+
+    LOG_DEBUG("Signalled deadlock victim txn {} to self-abort", victim_id);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -261,7 +314,7 @@ Status LockManager::lock_internal(Transaction* txn, const LockTarget& target,
     }
 
     // Create new lock request
-    queue->request_queue.emplace_back(txn->txn_id(), mode);
+    queue->request_queue.emplace_back(txn->txn_id(), mode, txn);
     auto new_req_it = std::prev(queue->request_queue.end());
 
     // Can we grant immediately?
@@ -309,15 +362,31 @@ Status LockManager::lock_internal(Transaction* txn, const LockTarget& target,
         return Status::Ok();
     }
 
-    // Need to wait - check for deadlock first
-    if (enable_deadlock_detection_ && would_cause_deadlock(txn->txn_id(), queue)) {
-        queue->request_queue.erase(new_req_it);
-        if (queue->request_queue.empty()) {
-            lock_table_.erase(target);
+    // Need to wait - check for deadlock first. The request is already queued as
+    // a (not-yet-granted) waiter, so the wait-for graph reflects this new edge.
+    if (enable_deadlock_detection_) {
+        txn_id_t victim = select_deadlock_victim(txn->txn_id());
+        if (victim != INVALID_TXN_ID) {
+            deadlock_count_.fetch_add(1, std::memory_order_relaxed);
+            if (victim == txn->txn_id()) {
+                // Wait-die: this (younger) requester loses. Abort ourselves,
+                // releasing every lock we hold so the survivors proceed.
+                LOG_DEBUG("Deadlock: txn {} aborts itself (wait-die victim)",
+                          txn->txn_id());
+                txn->set_state(TransactionState::ABORTED);
+                release_all_locks_locked(txn);  // erases new_req_it too
+                return Status::Aborted("Deadlock detected (wait-die victim)");
+            }
+            // Wait-die: an older transaction wins over a younger holder in the
+            // cycle. Abort the younger victim, freeing the lock we need.
+            LOG_DEBUG("Deadlock: txn {} aborts younger holder {} (wait-die)",
+                      txn->txn_id(), victim);
+            if (Transaction* victim_txn = find_transaction_locked(victim)) {
+                abort_victim_locked(victim_txn);
+            }
+            // The victim's release may have granted us the lock already; fall
+            // through to the wait loop, which returns immediately if so.
         }
-        deadlock_count_.fetch_add(1, std::memory_order_relaxed);
-        LOG_DEBUG("Deadlock detected for txn {}", txn->txn_id());
-        return Status::Aborted("Deadlock detected");
     }
 
     // Wait for lock
@@ -337,12 +406,11 @@ Status LockManager::lock_internal(Transaction* txn, const LockTarget& target,
             return Status::Timeout("Lock acquisition timed out");
         }
 
-        // Check if transaction was aborted while waiting
+        // Check if transaction was aborted while waiting (e.g. selected as a
+        // deadlock victim by another thread). Release everything we hold so the
+        // transactions blocked on us proceed immediately.
         if (!txn->is_active()) {
-            queue->request_queue.erase(new_req_it);
-            if (queue->request_queue.empty()) {
-                lock_table_.erase(target);
-            }
+            release_all_locks_locked(txn);  // erases new_req_it too
             return Status::Aborted("Transaction was aborted");
         }
     }
@@ -461,93 +529,129 @@ void LockManager::grant_waiting_locks(LockRequestQueue* queue) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Deadlock Detection
+//
+// Victim selection uses the WAIT-DIE policy. Transaction age is its id: a
+// smaller txn_id is older and always wins. When a wait-for cycle is detected,
+// the YOUNGEST transaction in the cycle (largest txn_id) is aborted. Because the
+// oldest transaction in any cycle is never chosen, a transaction that keeps
+// getting victimized eventually becomes the oldest live transaction and is then
+// guaranteed to make progress — starvation (repeated victimization) is bounded.
 // ─────────────────────────────────────────────────────────────────────────────
 
-bool LockManager::would_cause_deadlock(txn_id_t waiting_txn_id,
-                                        const LockRequestQueue* queue) {
-    // Build a wait-for graph by looking at all lock queues
-    // Then check if adding this edge would create a cycle
+std::unordered_map<txn_id_t, std::vector<txn_id_t>>
+LockManager::build_wait_for_graph() const {
+    std::unordered_map<txn_id_t, std::vector<txn_id_t>> graph;
 
-    std::unordered_map<txn_id_t, std::vector<txn_id_t>> wait_for_graph;
+    // A holder blocks only while it is still active; a transaction already
+    // marked ABORTED (a victim mid self-release) is about to drop its locks, so
+    // excluding it prevents re-detecting the same, already-resolved cycle.
+    const auto is_active_holder = [](const LockRequest& r) {
+        return r.txn == nullptr || r.txn->is_active();
+    };
 
-    // Get transactions that waiting_txn would wait for
-    auto blocking = get_blocking_txns(waiting_txn_id, queue);
-    if (!blocking.empty()) {
-        wait_for_graph[waiting_txn_id] = blocking;
-    }
-
-    // Build wait-for edges for all other waiting transactions
     for (const auto& [target, q] : lock_table_) {
         for (const auto& req : q->request_queue) {
-            if (!req.granted && req.txn_id != waiting_txn_id) {
-                auto others = get_blocking_txns(req.txn_id, q.get());
-                if (!others.empty()) {
-                    wait_for_graph[req.txn_id] = others;
+            // Skip aborted transactions entirely (neither block nor wait).
+            if (req.txn != nullptr && !req.txn->is_active()) {
+                continue;
+            }
+
+            std::vector<txn_id_t> blockers;
+
+            if (!req.granted) {
+                // A waiting request waits for every incompatible granted holder.
+                for (const auto& other : q->request_queue) {
+                    if (other.granted && other.txn_id != req.txn_id &&
+                        is_active_holder(other) &&
+                        !are_lock_modes_compatible(other.mode, req.mode)) {
+                        blockers.push_back(other.txn_id);
+                    }
                 }
+            } else if (q->upgrading && q->upgrading_txn_id == req.txn_id) {
+                // An upgrading holder (has S, wants X) waits for every other
+                // granted holder in the queue.
+                for (const auto& other : q->request_queue) {
+                    if (other.granted && other.txn_id != req.txn_id &&
+                        is_active_holder(other)) {
+                        blockers.push_back(other.txn_id);
+                    }
+                }
+            }
+
+            if (!blockers.empty()) {
+                auto& edges = graph[req.txn_id];
+                edges.insert(edges.end(), blockers.begin(), blockers.end());
             }
         }
     }
 
-    // DFS to find cycle starting from waiting_txn_id
-    std::unordered_set<txn_id_t> visited;
-    std::unordered_set<txn_id_t> rec_stack;
-
-    return has_cycle(waiting_txn_id, wait_for_graph, visited, rec_stack);
+    return graph;
 }
 
-std::vector<txn_id_t> LockManager::get_blocking_txns(
-    txn_id_t waiting_txn_id, const LockRequestQueue* queue) const {
-    std::vector<txn_id_t> blocking;
-
-    // Find the waiting transaction's request
-    const LockRequest* waiting_req = nullptr;
-    for (const auto& req : queue->request_queue) {
-        if (req.txn_id == waiting_txn_id) {
-            waiting_req = &req;
-            break;
-        }
-    }
-
-    if (waiting_req == nullptr || waiting_req->granted) {
-        return blocking;  // Not waiting
-    }
-
-    // Find all granted transactions that are blocking this one
-    for (const auto& req : queue->request_queue) {
-        if (req.granted && !are_lock_modes_compatible(req.mode, waiting_req->mode)) {
-            blocking.push_back(req.txn_id);
-        }
-    }
-
-    return blocking;
-}
-
-bool LockManager::has_cycle(
-    txn_id_t start_txn_id,
-    const std::unordered_map<txn_id_t, std::vector<txn_id_t>>& wait_for_graph,
+bool LockManager::find_cycle(
+    txn_id_t node,
+    const std::unordered_map<txn_id_t, std::vector<txn_id_t>>& graph,
+    std::vector<txn_id_t>& path, std::unordered_set<txn_id_t>& in_path,
     std::unordered_set<txn_id_t>& visited,
-    std::unordered_set<txn_id_t>& rec_stack) const {
+    std::vector<txn_id_t>& cycle_out) const {
 
-    visited.insert(start_txn_id);
-    rec_stack.insert(start_txn_id);
+    visited.insert(node);
+    path.push_back(node);
+    in_path.insert(node);
 
-    auto it = wait_for_graph.find(start_txn_id);
-    if (it != wait_for_graph.end()) {
+    auto it = graph.find(node);
+    if (it != graph.end()) {
         for (txn_id_t next : it->second) {
-            if (rec_stack.count(next) > 0) {
-                // Found cycle
+            if (in_path.count(next) > 0) {
+                // Back-edge: the cycle is the path suffix starting at `next`.
+                auto pos = std::find(path.begin(), path.end(), next);
+                cycle_out.assign(pos, path.end());
                 return true;
             }
-            if (visited.count(next) == 0) {
-                if (has_cycle(next, wait_for_graph, visited, rec_stack)) {
-                    return true;
-                }
+            if (visited.count(next) == 0 &&
+                find_cycle(next, graph, path, in_path, visited, cycle_out)) {
+                return true;
             }
         }
     }
 
-    rec_stack.erase(start_txn_id);
+    path.pop_back();
+    in_path.erase(node);
     return false;
+}
+
+txn_id_t LockManager::select_deadlock_victim(txn_id_t start_txn_id) const {
+    auto graph = build_wait_for_graph();
+
+    std::vector<txn_id_t> path;
+    std::unordered_set<txn_id_t> in_path;
+    std::unordered_set<txn_id_t> visited;
+    std::vector<txn_id_t> cycle;
+
+    if (!find_cycle(start_txn_id, graph, path, in_path, visited, cycle) ||
+        cycle.empty()) {
+        return INVALID_TXN_ID;
+    }
+
+    // Wait-die: youngest (largest id) transaction in the cycle is the victim.
+    txn_id_t victim = cycle.front();
+    for (txn_id_t id : cycle) {
+        if (id > victim) {
+            victim = id;
+        }
+    }
+    return victim;
+}
+
+Transaction* LockManager::find_transaction_locked(txn_id_t txn_id) const {
+    for (const auto& [target, q] : lock_table_) {
+        for (const auto& req : q->request_queue) {
+            if (req.txn_id == txn_id && req.txn != nullptr) {
+                return req.txn;
+            }
+        }
+    }
+    return nullptr;
 }
 
 }  // namespace entropy
