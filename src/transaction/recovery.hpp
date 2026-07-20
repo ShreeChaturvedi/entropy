@@ -74,9 +74,12 @@ public:
   /**
    * @brief Create a checkpoint
    *
-   * A checkpoint reduces recovery time by recording:
-   * - Currently active transactions
-   * - Dirty pages in the buffer pool
+   * Flushes the WAL, then flushes all dirty pages, and only then appends a
+   * CHECKPOINT record whose begin_lsn anchors the redo scan: every record
+   * older than the anchor is durably reflected on disk pages at that point,
+   * so recovery may safely skip it. Without a buffer pool (analysis-only
+   * setups) no pages can be flushed and the record carries no anchor,
+   * which makes recovery fall back to a full page-LSN-gated scan.
    *
    * @param active_txn_ids List of currently active transaction IDs
    * @return Status indicating success or failure
@@ -149,7 +152,14 @@ private:
 
   /**
    * @brief Undo phase: Rollback uncommitted transactions
-   * @param records All log records for building prevLSN chains
+   *
+   * Applies inverse operations for all loser transactions in one merged
+   * descending-LSN scan, flushes every page the undo mutated, and only then
+   * appends (and flushes) an ABORT record per loser. That ordering makes the
+   * ABORT a durable promise that its compensation is already on disk; a crash
+   * at any point re-runs a state-checked, idempotent undo.
+   *
+   * @param records All log records from WAL (in LSN order)
    * @return Status indicating success or failure
    */
   Status undo_phase(const std::vector<LogRecord> &records);
@@ -162,19 +172,19 @@ private:
   Status redo_record(const LogRecord &record);
 
   /**
-   * @brief Undo a single log record
+   * @brief Undo a single log record (state-checked, idempotent)
    * @param record The log record to undo
+   * @param[out] applied Set to true iff the page was actually mutated
    * @return Status indicating success or failure
+   *
+   * Each inverse op verifies the slot still reflects the logged operation
+   * before touching it: undo-INSERT deletes only if the slot holds the
+   * inserted bytes, undo-UPDATE restores only if the slot holds the
+   * after-image, undo-DELETE re-inserts only into an empty slot. Slots
+   * already undone (recovery re-run) or reused by a committed transaction
+   * are left untouched.
    */
-  Status undo_record(const LogRecord &record);
-
-  /**
-   * @brief Build a map from LSN to log record for efficient lookup
-   * @param records All log records from WAL
-   * @return Map from LSN to log record pointer
-   */
-  std::unordered_map<lsn_t, const LogRecord *>
-  build_lsn_map(const std::vector<LogRecord> &records);
+  Status undo_record(const LogRecord &record, bool *applied);
 
   // ─────────────────────────────────────────────────────────────────────────
   // Member Variables

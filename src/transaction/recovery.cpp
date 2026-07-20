@@ -7,6 +7,7 @@
 #include "transaction/recovery.hpp"
 
 #include <algorithm>
+#include <cstring>
 
 #include "common/logger.hpp"
 #include "storage/buffer_pool.hpp"
@@ -28,6 +29,22 @@ namespace {
   }
   *out = static_cast<uint16_t>(n);
   return true;
+}
+
+/// Whether the record describes a page mutation (redo/undo candidate).
+[[nodiscard]] bool is_data_record(LogRecordType type) {
+  return type == LogRecordType::INSERT || type == LogRecordType::DELETE ||
+         type == LogRecordType::UPDATE;
+}
+
+/// True when the slot currently holds `image`. Prefix comparison: an in-place
+/// shrink keeps the slot's original length, so the stored record may carry
+/// stale trailing bytes beyond the logged image.
+[[nodiscard]] bool slot_holds(const TablePage &page, slot_id_t slot_id,
+                              const std::vector<char> &image) {
+  std::span<const char> rec = page.get_record(slot_id);
+  return !rec.empty() && !image.empty() && rec.size() >= image.size() &&
+         std::memcmp(rec.data(), image.data(), image.size()) == 0;
 }
 
 } // namespace
@@ -193,22 +210,13 @@ Status RecoveryManager::redo_phase(const std::vector<LogRecord> &records) {
   // Repeat history from the redo anchor forward. Page-LSN gating in
   // redo_record makes each application idempotent.
   for (const LogRecord &record : records) {
-    if (record.lsn() < redo_start_lsn_) {
+    if (record.lsn() < redo_start_lsn_ || !is_data_record(record.type())) {
       continue;
     }
 
-    switch (record.type()) {
-    case LogRecordType::INSERT:
-    case LogRecordType::UPDATE:
-    case LogRecordType::DELETE: {
-      Status status = redo_record(record);
-      if (!status.ok()) {
-        LOG_WARN("Redo failed for LSN {}: {}", record.lsn(), status.message());
-      }
-      break;
-    }
-    default:
-      break;
+    Status status = redo_record(record);
+    if (!status.ok()) {
+      LOG_WARN("Redo failed for LSN {}: {}", record.lsn(), status.message());
     }
   }
 
@@ -304,46 +312,61 @@ Status RecoveryManager::undo_phase(const std::vector<LogRecord> &records) {
     return Status::Ok();
   }
 
-  auto lsn_map = build_lsn_map(records);
-
-  for (const auto &[txn_id, last_lsn] : active_txn_table_) {
-    LOG_DEBUG("Undoing transaction {} from LSN {}", txn_id, last_lsn);
-
-    // Walk the transaction's prev_lsn chain latest-first, applying inverse ops.
-    lsn_t current_lsn = last_lsn;
-    while (current_lsn != INVALID_LSN) {
-      auto it = lsn_map.find(current_lsn);
-      if (it == lsn_map.end()) {
-        LOG_WARN("Could not find log record for LSN {}", current_lsn);
-        break;
-      }
-
-      const LogRecord *record = it->second;
-      if (record->type() == LogRecordType::INSERT ||
-          record->type() == LogRecordType::DELETE ||
-          record->type() == LogRecordType::UPDATE) {
-        Status status = undo_record(*record);
-        if (!status.ok()) {
-          LOG_WARN("Undo failed for LSN {}: {}", current_lsn, status.message());
-        }
-      }
-
-      current_lsn = record->prev_lsn();
+  // Undo every loser operation in one merged scan in global reverse-LSN order
+  // (not per-transaction chains), so interleaved losers unwind in the exact
+  // inverse of the order their effects were applied.
+  std::unordered_set<page_id_t> touched_pages;
+  for (auto it = records.rbegin(); it != records.rend(); ++it) {
+    const LogRecord &record = *it;
+    if (!is_data_record(record.type()) ||
+        active_txn_table_.count(record.txn_id()) == 0) {
+      continue;
     }
 
-    // Log an ABORT so a subsequent recovery treats this transaction as already
-    // rolled back (undo becomes idempotent across repeated recover() calls).
-    if (wal_) {
-      LogRecord abort_record = LogRecord::make_abort(txn_id, last_lsn);
-      [[maybe_unused]] lsn_t abort_lsn = wal_->append_log(abort_record);
-      (void)wal_->flush();
+    bool applied = false;
+    Status status = undo_record(record, &applied);
+    if (!status.ok()) {
+      LOG_WARN("Undo failed for LSN {}: {}", record.lsn(), status.message());
+    }
+    if (applied) {
+      touched_pages.insert(record.rid().page_id);
     }
   }
 
-  return Status::Ok();
+  // Durability ordering: every compensation must be on disk BEFORE any ABORT
+  // becomes durable. Once an ABORT is durable, a later recovery no longer
+  // treats the transaction as a loser, so an unflushed compensation would be
+  // lost forever if we crashed here with the ABORT already in the log.
+  for (page_id_t page_id : touched_pages) {
+    // fetch_page pins the page (re-reading it if it was evicted, in which case
+    // its state is already on disk), so a false from flush_page can only mean
+    // a real write failure.
+    Page *page = buffer_pool_->fetch_page(page_id);
+    if (page == nullptr) {
+      return Status::IOError("Failed to pin undone page for flush");
+    }
+    const bool flushed = buffer_pool_->flush_page(page_id);
+    buffer_pool_->unpin_page(page_id, false);
+    if (!flushed) {
+      return Status::IOError("Failed to flush undone page before ABORT");
+    }
+  }
+
+  // Log an ABORT per loser so a subsequent recovery treats it as already
+  // rolled back; state-checked undo keeps a re-run (crash before this flush)
+  // harmless.
+  for (const auto &[txn_id, last_lsn] : active_txn_table_) {
+    LogRecord abort_record = LogRecord::make_abort(txn_id, last_lsn);
+    if (wal_->append_log(abort_record) == INVALID_LSN) {
+      return Status::IOError("Failed to append ABORT record during recovery");
+    }
+  }
+  return wal_->flush();
 }
 
-Status RecoveryManager::undo_record(const LogRecord &record) {
+Status RecoveryManager::undo_record(const LogRecord &record, bool *applied) {
+  *applied = false;
+
   const RID rid = record.rid();
   if (rid.page_id < 0) {
     return Status::InvalidArgument("Undo record has invalid page id");
@@ -355,30 +378,40 @@ Status RecoveryManager::undo_record(const LogRecord &record) {
   }
 
   TablePage table_page(page);
-  bool applied = false;
 
   switch (record.type()) {
   case LogRecordType::INSERT:
-    // Undo INSERT: remove the inserted tuple.
-    applied = table_page.delete_record(rid.slot_id);
+    // Undo INSERT: remove the row, but only while the slot still holds this
+    // insert's bytes. A mismatch means the insert was already undone (re-run
+    // after a crash) or the slot was legitimately reused by a committed
+    // transaction; blindly deleting would destroy committed data.
+    if (slot_holds(table_page, rid.slot_id, record.new_tuple_data())) {
+      *applied = table_page.delete_record(rid.slot_id);
+    }
     break;
 
   case LogRecordType::DELETE: {
-    // Undo DELETE: restore the removed tuple at its original slot.
+    // Undo DELETE: restore the removed row, but only into a still-empty slot.
+    // An occupied slot means the row was already restored or the slot was
+    // reused by a committed transaction.
     uint16_t size = 0;
-    if (to_record_size(record.old_tuple_data().size(), &size)) {
-      applied =
-          table_page.insert_record_at(rid.slot_id, record.old_tuple_data().data(), size);
+    if (table_page.get_record(rid.slot_id).empty() &&
+        to_record_size(record.old_tuple_data().size(), &size)) {
+      *applied = table_page.insert_record_at(rid.slot_id,
+                                             record.old_tuple_data().data(), size);
     }
     break;
   }
 
   case LogRecordType::UPDATE: {
-    // Undo UPDATE: restore the before-image.
+    // Undo UPDATE: restore the before-image, but only while the slot holds
+    // the after-image. A slot already holding the before-image (re-run after
+    // a crash) or holding a committed successor is left untouched.
     uint16_t size = 0;
-    if (to_record_size(record.old_tuple_data().size(), &size)) {
-      applied =
-          table_page.update_record(rid.slot_id, record.old_tuple_data().data(), size);
+    if (slot_holds(table_page, rid.slot_id, record.new_tuple_data()) &&
+        to_record_size(record.old_tuple_data().size(), &size)) {
+      *applied = table_page.update_record(rid.slot_id,
+                                          record.old_tuple_data().data(), size);
     }
     break;
   }
@@ -387,26 +420,17 @@ Status RecoveryManager::undo_record(const LogRecord &record) {
     break;
   }
 
-  if (applied) {
+  if (*applied) {
     ++undo_count_;
   } else {
-    LOG_WARN("Undo could not apply inverse of {} at ({},{})",
-             log_record_type_to_string(record.type()), rid.page_id,
-             rid.slot_id);
+    LOG_DEBUG("Undo skipped {} at ({},{}): slot no longer reflects the "
+              "operation (already undone or reused)",
+              log_record_type_to_string(record.type()), rid.page_id,
+              rid.slot_id);
   }
 
-  buffer_pool_->unpin_page(rid.page_id, applied);
+  buffer_pool_->unpin_page(rid.page_id, *applied);
   return Status::Ok();
-}
-
-std::unordered_map<lsn_t, const LogRecord *>
-RecoveryManager::build_lsn_map(const std::vector<LogRecord> &records) {
-
-  std::unordered_map<lsn_t, const LogRecord *> lsn_map;
-  for (const LogRecord &record : records) {
-    lsn_map[record.lsn()] = &record;
-  }
-  return lsn_map;
 }
 
 } // namespace entropy
