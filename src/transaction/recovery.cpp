@@ -1,16 +1,36 @@
 /**
  * @file recovery.cpp
- * @brief ARIES-style Crash Recovery implementation
+ * @brief ARIES-lite crash recovery: checkpoint-anchored redo with page-LSN
+ *        gating, plus physical undo of loser transactions.
  */
 
 #include "transaction/recovery.hpp"
 
+#include <algorithm>
+
 #include "common/logger.hpp"
 #include "storage/buffer_pool.hpp"
 #include "storage/disk_manager.hpp"
+#include "storage/page.hpp"
+#include "storage/table_page.hpp"
 #include "transaction/wal.hpp"
 
 namespace entropy {
+
+namespace {
+
+/// Convert a log record's stored bytes to a uint16_t record size, clamping to
+/// the slotted-page limit. Recovery only replays records the engine itself
+/// wrote, so this is a defensive guard, not a functional path.
+[[nodiscard]] bool to_record_size(size_t n, uint16_t *out) {
+  if (n == 0 || n > Page::kPageSize) {
+    return false;
+  }
+  *out = static_cast<uint16_t>(n);
+  return true;
+}
+
+} // namespace
 
 RecoveryManager::RecoveryManager(std::shared_ptr<BufferPoolManager> buffer_pool,
                                  std::shared_ptr<WALManager> wal,
@@ -21,13 +41,21 @@ RecoveryManager::RecoveryManager(std::shared_ptr<BufferPoolManager> buffer_pool,
 Status RecoveryManager::recover() {
   LOG_INFO("Starting crash recovery...");
 
-  // Read all log records from WAL
   if (!wal_) {
     LOG_WARN("No WAL manager provided, skipping recovery");
     return Status::Ok();
   }
 
   std::vector<LogRecord> records = wal_->read_log();
+
+  // Reset per-run state.
+  active_txn_table_.clear();
+  committed_txns_.clear();
+  redo_start_lsn_ = INVALID_LSN;
+  recovered_next_txn_id_ = 1;
+  redo_count_ = 0;
+  undo_count_ = 0;
+
   if (records.empty()) {
     LOG_INFO("WAL is empty, nothing to recover");
     return Status::Ok();
@@ -35,17 +63,13 @@ Status RecoveryManager::recover() {
 
   LOG_INFO("Read {} log records from WAL", records.size());
 
-  // Reset state
-  active_txn_table_.clear();
-  committed_txns_.clear();
-  redo_count_ = 0;
-  undo_count_ = 0;
-
   // Phase 1: Analysis
   LOG_INFO("=== ANALYSIS PHASE ===");
   analysis_phase(records);
-  LOG_INFO("Analysis complete: {} active txns, {} committed txns",
-           active_txn_table_.size(), committed_txns_.size());
+  LOG_INFO("Analysis complete: {} active txns, {} committed txns, "
+           "redo_start_lsn={}, next_txn_id={}",
+           active_txn_table_.size(), committed_txns_.size(), redo_start_lsn_,
+           recovered_next_txn_id_);
 
   // Phase 2: Redo
   LOG_INFO("=== REDO PHASE ===");
@@ -54,7 +78,7 @@ Status RecoveryManager::recover() {
     LOG_ERROR("Redo phase failed: {}", redo_status.message());
     return redo_status;
   }
-  LOG_INFO("Redo complete: {} operations replayed", redo_count_);
+  LOG_INFO("Redo complete: {} operations applied", redo_count_);
 
   // Phase 3: Undo
   LOG_INFO("=== UNDO PHASE ===");
@@ -75,11 +99,11 @@ Status RecoveryManager::create_checkpoint(
     return Status::InvalidArgument("No WAL manager provided");
   }
 
-  // Create and append checkpoint record
+  // begin_lsn/next_txn_id are supplied by the caller in a fully-wired database;
+  // here we record the active set and default the anchor to "scan from start".
   LogRecord checkpoint = LogRecord::make_checkpoint(active_txn_ids);
   [[maybe_unused]] auto lsn = wal_->append_log(checkpoint);
 
-  // Force flush to ensure checkpoint is durable
   return wal_->flush();
 }
 
@@ -88,56 +112,69 @@ Status RecoveryManager::create_checkpoint(
 // ─────────────────────────────────────────────────────────────────────────────
 
 void RecoveryManager::analysis_phase(const std::vector<LogRecord> &records) {
-  // We process all records from the beginning because we need to track
-  // which transactions committed (even before the checkpoint) for the
-  // committed_txns_ set. The checkpoint only helps us identify which
-  // transactions were active at the checkpoint moment.
-
-  // First, find the last checkpoint to get initial ATT state
+  // Locate the last checkpoint. It supplies the redo anchor (begin_lsn) and a
+  // high-water next_txn_id, and seeds the set of transactions known to be
+  // active at the checkpoint moment.
+  const LogRecord *checkpoint = nullptr;
   for (size_t i = records.size(); i > 0; --i) {
     if (records[i - 1].type() == LogRecordType::CHECKPOINT) {
-      // Initialize ATT from checkpoint's active transactions
-      for (txn_id_t txn_id : records[i - 1].active_txns()) {
-        active_txn_table_[txn_id] = INVALID_LSN;
-      }
-      LOG_DEBUG("Found checkpoint at index {}", i - 1);
+      checkpoint = &records[i - 1];
       break;
     }
   }
 
-  // Scan all records to build committed set and update ATT
-  for (size_t i = 0; i < records.size(); ++i) {
-    const LogRecord &record = records[i];
-    txn_id_t txn_id = record.txn_id();
+  if (checkpoint != nullptr) {
+    // A valid begin_lsn anchors redo; without one, redo scans from the start
+    // and relies purely on page-LSN gating (always correct, just less optimal).
+    if (checkpoint->begin_lsn() != INVALID_LSN) {
+      redo_start_lsn_ = checkpoint->begin_lsn();
+    }
+    if (checkpoint->next_txn_id() != INVALID_TXN_ID) {
+      recovered_next_txn_id_ =
+          std::max(recovered_next_txn_id_, checkpoint->next_txn_id());
+    }
+    for (txn_id_t txn_id : checkpoint->active_txns()) {
+      active_txn_table_[txn_id] = INVALID_LSN;
+    }
+  }
+
+  // Scan the (in-memory) log to reconstruct the exact set of loser transactions
+  // and the committed set, and to find the highest transaction id observed.
+  txn_id_t max_txn_id = 0;
+  for (const LogRecord &record : records) {
+    const txn_id_t txn_id = record.txn_id();
 
     switch (record.type()) {
     case LogRecordType::BEGIN:
-      // New transaction started
       active_txn_table_[txn_id] = record.lsn();
       break;
 
     case LogRecordType::COMMIT:
-      // Transaction committed - remove from ATT, add to committed set
       active_txn_table_.erase(txn_id);
       committed_txns_.insert(txn_id);
       break;
 
     case LogRecordType::ABORT:
-      // Transaction aborted - remove from ATT (already rolled back)
+      // Already rolled back during normal operation (or a prior recovery).
       active_txn_table_.erase(txn_id);
       break;
 
     case LogRecordType::INSERT:
     case LogRecordType::DELETE:
     case LogRecordType::UPDATE:
-      // Update last LSN for this transaction
       active_txn_table_[txn_id] = record.lsn();
       break;
 
     default:
       break;
     }
+
+    if (txn_id != INVALID_TXN_ID) {
+      max_txn_id = std::max(max_txn_id, txn_id);
+    }
   }
+
+  recovered_next_txn_id_ = std::max(recovered_next_txn_id_, max_txn_id + 1);
 
   LOG_DEBUG("After analysis: {} uncommitted transactions need undo",
             active_txn_table_.size());
@@ -148,40 +185,29 @@ void RecoveryManager::analysis_phase(const std::vector<LogRecord> &records) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 Status RecoveryManager::redo_phase(const std::vector<LogRecord> &records) {
-  // Redo all data modification operations in log order
-  // In a full ARIES implementation, we would check page LSN vs log LSN
-  // to avoid redundant redos. For simplicity, we redo all operations.
+  if (!buffer_pool_) {
+    // Analysis-only mode (no page store wired): nothing to replay.
+    return Status::Ok();
+  }
 
+  // Repeat history from the redo anchor forward. Page-LSN gating in
+  // redo_record makes each application idempotent.
   for (const LogRecord &record : records) {
+    if (record.lsn() < redo_start_lsn_) {
+      continue;
+    }
+
     switch (record.type()) {
     case LogRecordType::INSERT:
     case LogRecordType::UPDATE:
-      // Redo these operations
-      // Note: In a full implementation, we'd check if the page
-      // already has this change applied (page_lsn >= record.lsn)
-      {
-        Status status = redo_record(record);
-        if (!status.ok()) {
-          // Log warning but continue - page may not exist
-          LOG_WARN("Redo failed for LSN {}: {}", record.lsn(),
-                   status.message());
-        }
+    case LogRecordType::DELETE: {
+      Status status = redo_record(record);
+      if (!status.ok()) {
+        LOG_WARN("Redo failed for LSN {}: {}", record.lsn(), status.message());
       }
       break;
-
-    case LogRecordType::DELETE:
-      // For delete, we mark the tuple as deleted
-      {
-        Status status = redo_record(record);
-        if (!status.ok()) {
-          LOG_WARN("Redo delete failed for LSN {}: {}", record.lsn(),
-                   status.message());
-        }
-      }
-      break;
-
+    }
     default:
-      // BEGIN, COMMIT, ABORT, CHECKPOINT don't need redo
       break;
     }
   }
@@ -190,31 +216,77 @@ Status RecoveryManager::redo_phase(const std::vector<LogRecord> &records) {
 }
 
 Status RecoveryManager::redo_record(const LogRecord &record) {
-  // In a minimal implementation without full TableHeap integration,
-  // we track the redo count for testing purposes.
-  // A complete implementation would apply changes to pages via buffer pool.
+  const RID rid = record.rid();
+  if (rid.page_id < 0) {
+    return Status::InvalidArgument("Redo record has invalid page id");
+  }
 
-  ++redo_count_;
+  Page *page = buffer_pool_->fetch_page(rid.page_id);
+  if (page == nullptr) {
+    return Status::NotFound("Page not available for redo");
+  }
 
-  // If no buffer pool or disk manager, just track the operation
-  if (!buffer_pool_) {
+  // Page-LSN gate: skip if this change is already reflected on the page.
+  if (page->lsn() >= record.lsn()) {
+    buffer_pool_->unpin_page(rid.page_id, false);
     return Status::Ok();
   }
 
-  // Get the page containing the tuple
-  page_id_t page_id = record.rid().page_id;
-  Page *page = buffer_pool_->fetch_page(page_id);
-  if (page == nullptr) {
-    // Page doesn't exist (might be new page not yet created)
-    return Status::NotFound("Page not found for redo");
+  // A page that has never held table data (freshly created or never flushed)
+  // must be initialized before we can place records into it.
+  TablePage table_page(page);
+  if (page->page_type() != PageType::TABLE_PAGE) {
+    table_page.init();
   }
 
-  // Apply the operation to the page
-  // The actual implementation would deserialize and apply tuple changes
-  // For now, we just mark the page as dirty to indicate recovery touched it
+  bool applied = false;
+  switch (record.type()) {
+  case LogRecordType::INSERT: {
+    uint16_t size = 0;
+    if (!to_record_size(record.new_tuple_data().size(), &size)) {
+      break;
+    }
+    const char *data = record.new_tuple_data().data();
+    const slot_id_t slot = rid.slot_id;
+    const uint16_t slot_count = table_page.get_slot_count();
+    if (slot < slot_count) {
+      // Reused (previously deleted) slot: place the record back at that slot.
+      applied = table_page.insert_record_at(slot, data, size);
+    } else if (slot == slot_count) {
+      // Append: repeating history from the matching page state reproduces the
+      // same slot id the original insert obtained.
+      auto placed = table_page.insert_record(data, size);
+      applied = placed.has_value() && *placed == slot;
+    }
+    break;
+  }
+  case LogRecordType::UPDATE: {
+    uint16_t size = 0;
+    if (!to_record_size(record.new_tuple_data().size(), &size)) {
+      break;
+    }
+    applied =
+        table_page.update_record(rid.slot_id, record.new_tuple_data().data(), size);
+    break;
+  }
+  case LogRecordType::DELETE: {
+    applied = table_page.delete_record(rid.slot_id);
+    break;
+  }
+  default:
+    break;
+  }
 
-  buffer_pool_->unpin_page(page_id, false); // Mark as touched but not dirty yet
+  if (applied) {
+    page->set_lsn(record.lsn());
+    ++redo_count_;
+  } else {
+    LOG_WARN("Redo could not apply {} at ({},{}) LSN {}",
+             log_record_type_to_string(record.type()), rid.page_id, rid.slot_id,
+             record.lsn());
+  }
 
+  buffer_pool_->unpin_page(rid.page_id, applied);
   return Status::Ok();
 }
 
@@ -227,15 +299,17 @@ Status RecoveryManager::undo_phase(const std::vector<LogRecord> &records) {
     LOG_DEBUG("No uncommitted transactions to undo");
     return Status::Ok();
   }
+  if (!buffer_pool_) {
+    // Cannot physically undo without a page store; leave the ATT as reported.
+    return Status::Ok();
+  }
 
-  // Build LSN -> record map for following prevLSN chains
   auto lsn_map = build_lsn_map(records);
 
-  // For each uncommitted transaction, undo its operations in reverse order
-  // by following the prevLSN chain
   for (const auto &[txn_id, last_lsn] : active_txn_table_) {
     LOG_DEBUG("Undoing transaction {} from LSN {}", txn_id, last_lsn);
 
+    // Walk the transaction's prev_lsn chain latest-first, applying inverse ops.
     lsn_t current_lsn = last_lsn;
     while (current_lsn != INVALID_LSN) {
       auto it = lsn_map.find(current_lsn);
@@ -245,20 +319,24 @@ Status RecoveryManager::undo_phase(const std::vector<LogRecord> &records) {
       }
 
       const LogRecord *record = it->second;
-
-      // Only undo data modification operations
       if (record->type() == LogRecordType::INSERT ||
           record->type() == LogRecordType::DELETE ||
           record->type() == LogRecordType::UPDATE) {
-
         Status status = undo_record(*record);
         if (!status.ok()) {
           LOG_WARN("Undo failed for LSN {}: {}", current_lsn, status.message());
         }
       }
 
-      // Move to previous operation in this transaction
       current_lsn = record->prev_lsn();
+    }
+
+    // Log an ABORT so a subsequent recovery treats this transaction as already
+    // rolled back (undo becomes idempotent across repeated recover() calls).
+    if (wal_) {
+      LogRecord abort_record = LogRecord::make_abort(txn_id, last_lsn);
+      [[maybe_unused]] lsn_t abort_lsn = wal_->append_log(abort_record);
+      (void)wal_->flush();
     }
   }
 
@@ -266,31 +344,58 @@ Status RecoveryManager::undo_phase(const std::vector<LogRecord> &records) {
 }
 
 Status RecoveryManager::undo_record(const LogRecord &record) {
-  // Increment undo counter for testing
-  ++undo_count_;
-
-  // In a complete implementation, we would apply the inverse operation:
-  // - INSERT -> delete the inserted tuple
-  // - DELETE -> re-insert the old tuple
-  // - UPDATE -> restore the old tuple data
-  //
-  // For now, we just track undos without buffer pool integration
-
-  if (!buffer_pool_) {
-    return Status::Ok();
+  const RID rid = record.rid();
+  if (rid.page_id < 0) {
+    return Status::InvalidArgument("Undo record has invalid page id");
   }
 
-  page_id_t page_id = record.rid().page_id;
-  Page *page = buffer_pool_->fetch_page(page_id);
+  Page *page = buffer_pool_->fetch_page(rid.page_id);
   if (page == nullptr) {
-    return Status::NotFound("Page not found for undo");
+    return Status::NotFound("Page not available for undo");
   }
 
-  // Apply the inverse operation
-  // A complete implementation would use old_tuple_data for DELETE/UPDATE
+  TablePage table_page(page);
+  bool applied = false;
 
-  buffer_pool_->unpin_page(page_id, false);
+  switch (record.type()) {
+  case LogRecordType::INSERT:
+    // Undo INSERT: remove the inserted tuple.
+    applied = table_page.delete_record(rid.slot_id);
+    break;
 
+  case LogRecordType::DELETE: {
+    // Undo DELETE: restore the removed tuple at its original slot.
+    uint16_t size = 0;
+    if (to_record_size(record.old_tuple_data().size(), &size)) {
+      applied =
+          table_page.insert_record_at(rid.slot_id, record.old_tuple_data().data(), size);
+    }
+    break;
+  }
+
+  case LogRecordType::UPDATE: {
+    // Undo UPDATE: restore the before-image.
+    uint16_t size = 0;
+    if (to_record_size(record.old_tuple_data().size(), &size)) {
+      applied =
+          table_page.update_record(rid.slot_id, record.old_tuple_data().data(), size);
+    }
+    break;
+  }
+
+  default:
+    break;
+  }
+
+  if (applied) {
+    ++undo_count_;
+  } else {
+    LOG_WARN("Undo could not apply inverse of {} at ({},{})",
+             log_record_type_to_string(record.type()), rid.page_id,
+             rid.slot_id);
+  }
+
+  buffer_pool_->unpin_page(rid.page_id, applied);
   return Status::Ok();
 }
 
