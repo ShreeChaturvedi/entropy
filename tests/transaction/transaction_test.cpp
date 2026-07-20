@@ -515,36 +515,55 @@ TEST_F(WALTest, BufferBoundaryCommitIsDurable) {
 }
 
 TEST_F(WALTest, ReadLogRejectsOversizedHeaderSize) {
+  // Craft an INSERT record that is fully self-consistent (its embedded
+  // tuple_size exactly matches the declared payload), so try_deserialize would
+  // ACCEPT it if handed the bytes. Its only defect is a declared size just past
+  // WAL_MAX_RECORD_SIZE. The record is written to the file in full, so the sole
+  // thing that can reject it in read_log is the size upper-bound guard --
+  // deleting `header.size > WAL_MAX_RECORD_SIZE` must make this test fail.
+  const uint32_t corrupt_size = WAL_MAX_RECORD_SIZE + 1;
+  const uint32_t payload = corrupt_size - LOG_RECORD_HEADER_SIZE;
+  const uint32_t fixed = sizeof(oid_t) + sizeof(RID) + sizeof(uint32_t);
+  ASSERT_GT(payload, fixed);
+  const uint32_t tuple_size = payload - fixed;
+
+  std::vector<char> buffer(corrupt_size, 0);
+  LogRecordHeader header{};
+  header.lsn = 1;
+  header.txn_id = 1;
+  header.prev_lsn = INVALID_LSN;
+  header.size = corrupt_size;
+  header.type = LogRecordType::INSERT;
+  std::memcpy(buffer.data(), &header, LOG_RECORD_HEADER_SIZE);
+
+  char* ptr = buffer.data() + LOG_RECORD_HEADER_SIZE;
+  oid_t table_oid = 7;
+  RID rid(3, 1);
+  std::memcpy(ptr, &table_oid, sizeof(table_oid));
+  ptr += sizeof(table_oid);
+  std::memcpy(ptr, &rid, sizeof(rid));
+  ptr += sizeof(rid);
+  std::memcpy(ptr, &tuple_size, sizeof(tuple_size));
+  // Remaining tuple bytes stay zero-filled; they are valid payload.
+
+  // Guard against the record being rejected for any reason other than size:
+  // handed the full buffer, try_deserialize must accept it.
   {
-    WALManager wal(wal_file_.string());
-    auto record = LogRecord::make_begin(1);
-    ASSERT_NE(wal.append_log(record), INVALID_LSN);
-    ASSERT_TRUE(wal.flush().ok());
+    LogRecord probe;
+    ASSERT_TRUE(LogRecord::try_deserialize(buffer.data(), corrupt_size, probe));
+    EXPECT_EQ(probe.type(), LogRecordType::INSERT);
   }
 
-  // Corrupt size just above the max and pad the file so a missing upper-bound
-  // check would allocate and successfully read a full (bogus) record.
-  const uint32_t corrupt_size = WAL_MAX_RECORD_SIZE + 1024;
   {
-    std::fstream file(wal_file_, std::ios::in | std::ios::out | std::ios::binary);
-    ASSERT_TRUE(file.is_open());
-    LogRecordHeader header{};
-    file.read(reinterpret_cast<char*>(&header), LOG_RECORD_HEADER_SIZE);
-    ASSERT_EQ(file.gcount(), static_cast<std::streamsize>(LOG_RECORD_HEADER_SIZE));
-    header.size = corrupt_size;
-    file.seekp(0);
-    file.write(reinterpret_cast<const char*>(&header), LOG_RECORD_HEADER_SIZE);
-    file.seekp(0, std::ios::end);
-    const auto current = static_cast<uint32_t>(file.tellp());
-    ASSERT_LT(current, corrupt_size);
-    std::vector<char> pad(corrupt_size - current, 0);
-    file.write(pad.data(), static_cast<std::streamsize>(pad.size()));
-    ASSERT_TRUE(file.good());
+    std::ofstream out(wal_file_, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(out.is_open());
+    out.write(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+    ASSERT_TRUE(out.good());
   }
 
   WALManager wal(wal_file_.string());
   auto records = wal.read_log();
-  // Without an upper bound, read_log would accept the padded bogus record.
+  // Only the size upper bound rejects this otherwise-valid record.
   EXPECT_TRUE(records.empty());
 }
 
