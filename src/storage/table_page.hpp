@@ -97,6 +97,19 @@ public:
     [[nodiscard]] std::optional<slot_id_t> insert_record(const char* data, uint16_t size);
 
     /**
+     * @brief Restore a record into a specific (empty) slot
+     *
+     * Used by transaction abort to undo a DELETE at the original RID.
+     * The slot must already exist and be empty (deleted).
+     *
+     * @param slot_id Target empty slot
+     * @param data Pointer to record data
+     * @param size Size of record in bytes
+     * @return true if restored, false if slot invalid/occupied or no space
+     */
+    [[nodiscard]] bool insert_record_at(slot_id_t slot_id, const char* data, uint16_t size);
+
+    /**
      * @brief Delete a record by slot ID
      * @param slot_id The slot to delete
      * @return true if deleted, false if slot was invalid/empty

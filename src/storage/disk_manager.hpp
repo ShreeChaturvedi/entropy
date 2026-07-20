@@ -71,6 +71,11 @@ public:
     [[nodiscard]] page_id_t num_pages() const noexcept { return num_pages_; }
 
     /**
+     * @brief Whether the underlying database file is open
+     */
+    [[nodiscard]] bool is_open() const noexcept { return db_io_.is_open(); }
+
+    /**
      * @brief Flush all writes to disk
      */
     void flush();
