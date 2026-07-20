@@ -19,6 +19,9 @@ namespace entropy {
  *
  * Uses a child executor (typically SeqScan with predicate) to find
  * tuples to update, then applies the SET expressions.
+ *
+ * Matching rows are materialized before any heap mutation so a grow-update
+ * that relocates a tuple cannot be re-visited by the same scan (Halloween).
  */
 class UpdateExecutor : public Executor {
 public:

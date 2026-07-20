@@ -18,6 +18,14 @@ BPlusTree::BPlusTree(std::shared_ptr<BufferPoolManager> buffer_pool,
     , leaf_max_size_(BPTreeLeafPage::compute_max_size())
     , internal_max_size_(BPTreeInternalPage::compute_max_size()) {}
 
+BPlusTree::BPlusTree(std::shared_ptr<BufferPoolManager> buffer_pool,
+                     page_id_t root_page_id, uint32_t leaf_max_size,
+                     uint32_t internal_max_size)
+    : buffer_pool_(std::move(buffer_pool))
+    , root_page_id_(root_page_id)
+    , leaf_max_size_(leaf_max_size)
+    , internal_max_size_(internal_max_size) {}
+
 bool BPlusTree::is_empty() const {
     if (root_page_id_ == INVALID_PAGE_ID) {
         return true;
@@ -396,9 +404,14 @@ Status BPlusTree::remove(KeyType key) {
 
     // Check for underflow (only if not root)
     if (!leaf.is_root() && leaf.is_underflow()) {
-        // Handle underflow by borrowing or merging
-        Status rebalance_status = handle_leaf_underflow(page);
+        page_id_t page_to_delete = INVALID_PAGE_ID;
+        Status rebalance_status =
+            handle_leaf_underflow(page, &page_to_delete);
         buffer_pool_->unpin_page(leaf_page_id, true);
+        // Left-merge leaves the underfull leaf empty; reclaim after unpin.
+        if (page_to_delete != INVALID_PAGE_ID) {
+            buffer_pool_->delete_page(page_to_delete);
+        }
         return rebalance_status;
     }
 
@@ -414,10 +427,15 @@ Status BPlusTree::remove(KeyType key) {
     return Status::Ok();
 }
 
-Status BPlusTree::handle_leaf_underflow(Page* leaf_page) {
+Status BPlusTree::handle_leaf_underflow(Page* leaf_page,
+                                        page_id_t* page_to_delete_out) {
+    if (page_to_delete_out != nullptr) {
+        *page_to_delete_out = INVALID_PAGE_ID;
+    }
+
     BPTreeLeafPage leaf(leaf_page);
     page_id_t parent_id = leaf.parent_page_id();
-    
+
     if (parent_id == INVALID_PAGE_ID) {
         return Status::Ok();  // Root can't underflow
     }
@@ -428,7 +446,7 @@ Status BPlusTree::handle_leaf_underflow(Page* leaf_page) {
     }
 
     BPTreeInternalPage parent(parent_page);
-    
+
     // Find this leaf's position in parent
     uint32_t child_idx = 0;
     for (uint32_t i = 0; i <= parent.num_keys(); ++i) {
@@ -444,7 +462,7 @@ Status BPlusTree::handle_leaf_underflow(Page* leaf_page) {
         Page* right_page = buffer_pool_->fetch_page(right_sibling_id);
         if (right_page != nullptr) {
             BPTreeLeafPage right_sibling(right_page);
-            
+
             if (right_sibling.num_keys() > right_sibling.min_size()) {
                 // Borrow from right
                 BPTreeKey new_key = leaf.borrow_from_right(&right_sibling);
@@ -463,7 +481,7 @@ Status BPlusTree::handle_leaf_underflow(Page* leaf_page) {
         Page* left_page = buffer_pool_->fetch_page(left_sibling_id);
         if (left_page != nullptr) {
             BPTreeLeafPage left_sibling(left_page);
-            
+
             if (left_sibling.num_keys() > left_sibling.min_size()) {
                 // Borrow from left
                 BPTreeKey new_key = leaf.borrow_from_left(&left_sibling);
@@ -482,13 +500,13 @@ Status BPlusTree::handle_leaf_underflow(Page* leaf_page) {
         Page* right_page = buffer_pool_->fetch_page(right_sibling_id);
         if (right_page != nullptr) {
             BPTreeLeafPage right_sibling(right_page);
-            
+
             // Merge right into this leaf
             leaf.merge_from_right(&right_sibling);
-            
+
             // Remove parent key and right child
             parent.remove_at(child_idx);
-            
+
             // Update next leaf pointer of far right neighbor if exists
             page_id_t far_right_id = right_sibling.next_leaf_id();
             if (far_right_id != INVALID_PAGE_ID) {
@@ -499,7 +517,179 @@ Status BPlusTree::handle_leaf_underflow(Page* leaf_page) {
                     buffer_pool_->unpin_page(far_right_id, true);
                 }
             }
-            
+
+            buffer_pool_->unpin_page(right_sibling_id, true);
+            buffer_pool_->delete_page(right_sibling_id);
+        }
+    } else if (child_idx > 0) {
+        // Merge into left sibling (rightmost leaf has no right sibling)
+        page_id_t left_sibling_id = parent.child_at(child_idx - 1);
+        Page* left_page = buffer_pool_->fetch_page(left_sibling_id);
+        if (left_page != nullptr) {
+            BPTreeLeafPage left_sibling(left_page);
+
+            // Merge this leaf into left sibling
+            left_sibling.merge_from_right(&leaf);
+
+            // Remove parent key and this child
+            parent.remove_at(child_idx - 1);
+
+            // Update far-right neighbor's prev pointer (was pointing at us)
+            page_id_t far_right_id = left_sibling.next_leaf_id();
+            if (far_right_id != INVALID_PAGE_ID) {
+                Page* far_right_page = buffer_pool_->fetch_page(far_right_id);
+                if (far_right_page != nullptr) {
+                    BPTreeLeafPage far_right(far_right_page);
+                    far_right.set_prev_leaf_id(left_sibling.page_id());
+                    buffer_pool_->unpin_page(far_right_id, true);
+                }
+            }
+
+            buffer_pool_->unpin_page(left_sibling_id, true);
+            // Caller still holds a pin on this leaf; reclaim after unpin.
+            if (page_to_delete_out != nullptr) {
+                *page_to_delete_out = leaf.page_id();
+            }
+        }
+    }
+
+    // Check if parent now underflows (non-root)
+    if (!parent.is_root() && parent.is_underflow()) {
+        page_id_t parent_to_delete = INVALID_PAGE_ID;
+        Status status =
+            handle_internal_underflow(parent_page, &parent_to_delete);
+        buffer_pool_->unpin_page(parent_id, true);
+        if (parent_to_delete != INVALID_PAGE_ID) {
+            buffer_pool_->delete_page(parent_to_delete);
+        }
+        return status;
+    }
+
+    // Special case: parent is root and now empty
+    if (parent.is_root() && parent.num_keys() == 0) {
+        // The single remaining child becomes new root
+        page_id_t new_root = parent.child_at(0);
+        Page* new_root_page = buffer_pool_->fetch_page(new_root);
+        if (new_root_page != nullptr) {
+            BPTreePage new_root_node(new_root_page);
+            new_root_node.set_parent_page_id(INVALID_PAGE_ID);
+            buffer_pool_->unpin_page(new_root, true);
+        }
+        buffer_pool_->unpin_page(parent_id, true);
+        buffer_pool_->delete_page(parent_id);
+        root_page_id_ = new_root;
+        return Status::Ok();
+    }
+
+    buffer_pool_->unpin_page(parent_id, true);
+    return Status::Ok();
+}
+
+Status BPlusTree::handle_internal_underflow(Page* internal_page,
+                                            page_id_t* page_to_delete_out) {
+    if (page_to_delete_out != nullptr) {
+        *page_to_delete_out = INVALID_PAGE_ID;
+    }
+
+    BPTreeInternalPage node(internal_page);
+    page_id_t parent_id = node.parent_page_id();
+
+    if (parent_id == INVALID_PAGE_ID) {
+        return Status::Ok();  // Root handled by caller
+    }
+
+    Page* parent_page = buffer_pool_->fetch_page(parent_id);
+    if (parent_page == nullptr) {
+        return Status::IOError("Failed to fetch parent page");
+    }
+
+    BPTreeInternalPage parent(parent_page);
+
+    uint32_t child_idx = 0;
+    for (uint32_t i = 0; i <= parent.num_keys(); ++i) {
+        if (parent.child_at(i) == node.page_id()) {
+            child_idx = i;
+            break;
+        }
+    }
+
+    auto reparent_children = [this](page_id_t new_parent_id,
+                                    BPTreeInternalPage* internal) {
+        update_children_parent(new_parent_id, internal);
+    };
+
+    // Borrow from right sibling
+    if (child_idx < parent.num_keys()) {
+        page_id_t right_sibling_id = parent.child_at(child_idx + 1);
+        Page* right_page = buffer_pool_->fetch_page(right_sibling_id);
+        if (right_page != nullptr) {
+            BPTreeInternalPage right_sibling(right_page);
+
+            if (right_sibling.num_keys() > right_sibling.min_size()) {
+                BPTreeKey separator = parent.key_at(child_idx);
+                BPTreeKey new_sep =
+                    node.borrow_from_right(&right_sibling, separator);
+                parent.set_key_at(child_idx, new_sep);
+
+                // Reparent the child that moved into this node
+                page_id_t moved_child = node.child_at(node.num_keys());
+                Page* moved_page = buffer_pool_->fetch_page(moved_child);
+                if (moved_page != nullptr) {
+                    BPTreePage moved(moved_page);
+                    moved.set_parent_page_id(node.page_id());
+                    buffer_pool_->unpin_page(moved_child, true);
+                }
+
+                buffer_pool_->unpin_page(right_sibling_id, true);
+                buffer_pool_->unpin_page(parent_id, true);
+                return Status::Ok();
+            }
+            buffer_pool_->unpin_page(right_sibling_id, false);
+        }
+    }
+
+    // Borrow from left sibling
+    if (child_idx > 0) {
+        page_id_t left_sibling_id = parent.child_at(child_idx - 1);
+        Page* left_page = buffer_pool_->fetch_page(left_sibling_id);
+        if (left_page != nullptr) {
+            BPTreeInternalPage left_sibling(left_page);
+
+            if (left_sibling.num_keys() > left_sibling.min_size()) {
+                BPTreeKey separator = parent.key_at(child_idx - 1);
+                BPTreeKey new_sep =
+                    node.borrow_from_left(&left_sibling, separator);
+                parent.set_key_at(child_idx - 1, new_sep);
+
+                // Reparent the child that moved into this node
+                page_id_t moved_child = node.child_at(0);
+                Page* moved_page = buffer_pool_->fetch_page(moved_child);
+                if (moved_page != nullptr) {
+                    BPTreePage moved(moved_page);
+                    moved.set_parent_page_id(node.page_id());
+                    buffer_pool_->unpin_page(moved_child, true);
+                }
+
+                buffer_pool_->unpin_page(left_sibling_id, true);
+                buffer_pool_->unpin_page(parent_id, true);
+                return Status::Ok();
+            }
+            buffer_pool_->unpin_page(left_sibling_id, false);
+        }
+    }
+
+    // Merge with right sibling
+    if (child_idx < parent.num_keys()) {
+        page_id_t right_sibling_id = parent.child_at(child_idx + 1);
+        Page* right_page = buffer_pool_->fetch_page(right_sibling_id);
+        if (right_page != nullptr) {
+            BPTreeInternalPage right_sibling(right_page);
+            BPTreeKey separator = parent.key_at(child_idx);
+
+            node.merge_from_right(&right_sibling, separator);
+            reparent_children(node.page_id(), &node);
+            parent.remove_at(child_idx);
+
             buffer_pool_->unpin_page(right_sibling_id, true);
             buffer_pool_->delete_page(right_sibling_id);
         }
@@ -508,28 +698,33 @@ Status BPlusTree::handle_leaf_underflow(Page* leaf_page) {
         page_id_t left_sibling_id = parent.child_at(child_idx - 1);
         Page* left_page = buffer_pool_->fetch_page(left_sibling_id);
         if (left_page != nullptr) {
-            BPTreeLeafPage left_sibling(left_page);
-            
-            // Merge this leaf into left sibling
-            left_sibling.merge_from_right(&leaf);
-            
-            // Remove parent key and this child  
+            BPTreeInternalPage left_sibling(left_page);
+            BPTreeKey separator = parent.key_at(child_idx - 1);
+
+            left_sibling.merge_from_right(&node, separator);
+            reparent_children(left_sibling.page_id(), &left_sibling);
             parent.remove_at(child_idx - 1);
-            
+
             buffer_pool_->unpin_page(left_sibling_id, true);
-            // Current leaf will be deleted by caller
+            if (page_to_delete_out != nullptr) {
+                *page_to_delete_out = node.page_id();
+            }
         }
     }
 
-    // Check if parent now underflows
-    if (parent.is_underflow()) {
-        // For simplicity, handle parent underflow recursively
-        // A complete implementation would properly handle internal node merging
+    // Propagate underflow up the tree
+    if (!parent.is_root() && parent.is_underflow()) {
+        page_id_t parent_to_delete = INVALID_PAGE_ID;
+        Status status =
+            handle_internal_underflow(parent_page, &parent_to_delete);
+        buffer_pool_->unpin_page(parent_id, true);
+        if (parent_to_delete != INVALID_PAGE_ID) {
+            buffer_pool_->delete_page(parent_to_delete);
+        }
+        return status;
     }
-    
-    // Special case: parent is root and now empty
+
     if (parent.is_root() && parent.num_keys() == 0) {
-        // The single remaining child becomes new root
         page_id_t new_root = parent.child_at(0);
         Page* new_root_page = buffer_pool_->fetch_page(new_root);
         if (new_root_page != nullptr) {

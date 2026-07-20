@@ -375,6 +375,86 @@ public:
     decrement_num_keys();
   }
 
+  /**
+   * @brief Merge right sibling into this node using parent separator key
+   *
+   * Layout after merge: [...our keys..., separator, ...right keys...]
+   * Children: [...our children..., ...right children...]
+   * Caller must delete the right sibling page afterwards.
+   */
+  void merge_from_right(BPTreeInternalPage *right_sibling,
+                        BPTreeKey separator) {
+    uint32_t my_keys = num_keys();
+    uint32_t sibling_keys = right_sibling->num_keys();
+
+    set_key_at(my_keys, separator);
+    set_child_at(my_keys + 1, right_sibling->child_at(0));
+    increment_num_keys();
+
+    for (uint32_t i = 0; i < sibling_keys; ++i) {
+      set_key_at(my_keys + 1 + i, right_sibling->key_at(i));
+      set_child_at(my_keys + 2 + i, right_sibling->child_at(i + 1));
+      increment_num_keys();
+    }
+  }
+
+  /**
+   * @brief Borrow the leftmost entry from the right sibling
+   *
+   * @param right_sibling Sibling to borrow from
+   * @param separator Current parent separator between this and right
+   * @return New separator key for the parent
+   */
+  BPTreeKey borrow_from_right(BPTreeInternalPage *right_sibling,
+                              BPTreeKey separator) {
+    uint32_t my_keys = num_keys();
+
+    set_key_at(my_keys, separator);
+    set_child_at(my_keys + 1, right_sibling->child_at(0));
+    increment_num_keys();
+
+    BPTreeKey new_separator = right_sibling->key_at(0);
+
+    uint32_t sibling_keys = right_sibling->num_keys();
+    for (uint32_t i = 0; i < sibling_keys - 1; ++i) {
+      right_sibling->set_key_at(i, right_sibling->key_at(i + 1));
+      right_sibling->set_child_at(i, right_sibling->child_at(i + 1));
+    }
+    right_sibling->set_child_at(sibling_keys - 1,
+                                right_sibling->child_at(sibling_keys));
+    right_sibling->decrement_num_keys();
+
+    return new_separator;
+  }
+
+  /**
+   * @brief Borrow the rightmost entry from the left sibling
+   *
+   * @param left_sibling Sibling to borrow from
+   * @param separator Current parent separator between left and this
+   * @return New separator key for the parent
+   */
+  BPTreeKey borrow_from_left(BPTreeInternalPage *left_sibling,
+                             BPTreeKey separator) {
+    uint32_t my_keys = num_keys();
+    uint32_t sibling_keys = left_sibling->num_keys();
+
+    // Shift our keys/children right to make room at the front
+    set_child_at(my_keys + 1, child_at(my_keys));
+    for (uint32_t i = my_keys; i > 0; --i) {
+      set_key_at(i, key_at(i - 1));
+      set_child_at(i, child_at(i - 1));
+    }
+
+    BPTreeKey new_separator = left_sibling->key_at(sibling_keys - 1);
+    set_key_at(0, separator);
+    set_child_at(0, left_sibling->child_at(sibling_keys));
+    increment_num_keys();
+
+    left_sibling->decrement_num_keys();
+    return new_separator;
+  }
+
 private:
   // Layout: child_0 | key_0 | child_1 | key_1 | ...
   // First child is at offset 0
