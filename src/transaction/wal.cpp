@@ -300,7 +300,7 @@ Status WALManager::flush_internal() {
     }
 
     // Stage 2: make appended bytes durable. On sync failure the bytes stay in
-    // the store and a retry only re-drives the sync — never a second append —
+    // the store and a retry only re-drives the sync (never a second append),
     // so a transient sync failure cannot duplicate records or LSNs in the log.
     if (appended_max_lsn_ > flushed_lsn_.load()) {
         Status sync_status = log_store_->sync();
