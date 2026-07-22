@@ -128,6 +128,32 @@ public:
   [[nodiscard]] TableIterator end();
 
   // ─────────────────────────────────────────────────────────────────────────
+  // Lifecycle
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * @brief Ensure the heap has its first page allocated
+   *
+   * Idempotent. Allocating the first page eagerly (at table creation) makes
+   * the heap's first_page_id deterministic and recordable in the catalog
+   * manifest, so the heap can be rebuilt after a restart.
+   *
+   * @return Status::Ok() on success (including when a first page already
+   *         exists), an error otherwise.
+   */
+  [[nodiscard]] Status ensure_first_page();
+
+  /**
+   * @brief Deallocate every page owned by the heap
+   *
+   * Walks the page chain and reclaims each page through the buffer pool
+   * (which forwards to DiskManager::deallocate_page). Used by drop_table so
+   * a dropped table's heap pages are not orphaned. After this call the heap
+   * is empty (first_page_id() == INVALID_PAGE_ID).
+   */
+  [[nodiscard]] Status reclaim_all_pages();
+
+  // ─────────────────────────────────────────────────────────────────────────
   // Accessors
   // ─────────────────────────────────────────────────────────────────────────
 

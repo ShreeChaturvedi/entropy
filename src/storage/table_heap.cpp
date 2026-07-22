@@ -6,6 +6,7 @@
 #include "storage/table_heap.hpp"
 
 #include <cstring>
+#include <unordered_set>
 #include <utility>
 
 #include "common/config.hpp"
@@ -23,23 +24,110 @@ TableHeap::TableHeap(std::shared_ptr<BufferPoolManager> buffer_pool)
 TableHeap::TableHeap(std::shared_ptr<BufferPoolManager> buffer_pool,
                      page_id_t first_page_id)
     : buffer_pool_(std::move(buffer_pool)), first_page_id_(first_page_id) {
-  // Find the last page by traversing the linked list
-  if (first_page_id_ != INVALID_PAGE_ID) {
-    page_id_t current_id = first_page_id_;
-    while (current_id != INVALID_PAGE_ID) {
-      Page *page = buffer_pool_->fetch_page(current_id);
-      if (page == nullptr) {
-        break;
-      }
-      TablePage table_page(page);
-      page_id_t next_id = table_page.get_next_page_id();
-      if (next_id == INVALID_PAGE_ID) {
-        last_page_id_ = current_id;
-      }
-      buffer_pool_->unpin_page(current_id, false);
-      current_id = next_id;
-    }
+  if (first_page_id_ == INVALID_PAGE_ID) {
+    return;
   }
+
+  // Find the last page by traversing the linked list. The chain may be
+  // damaged if the process crashed after the catalog manifest was persisted
+  // but before every referenced page reached disk: a never-written page reads
+  // back zeroed (PageType::INVALID, next link 0), so a naive walk would loop
+  // forever. Stop on non-table pages and on any cycle, and self-heal what we
+  // can.
+  std::unordered_set<page_id_t> visited;
+  page_id_t prev_id = INVALID_PAGE_ID;
+  page_id_t current_id = first_page_id_;
+  while (current_id != INVALID_PAGE_ID) {
+    Page *page = buffer_pool_->fetch_page(current_id);
+    if (page == nullptr) {
+      break;
+    }
+    TablePage table_page(page);
+
+    if (page->page_type() != PageType::TABLE_PAGE) {
+      if (current_id == first_page_id_) {
+        // The eagerly allocated first page never reached disk. Re-initialize
+        // it as an empty table page and flush it so the db file covers this
+        // page id (otherwise a later allocate_page could hand it out again).
+        table_page.init();
+        buffer_pool_->unpin_page(current_id, true);
+        buffer_pool_->flush_page(current_id);
+        last_page_id_ = current_id;
+      } else {
+        // Truncate the chain at the last intact page.
+        buffer_pool_->unpin_page(current_id, false);
+        Page *prev_page = buffer_pool_->fetch_page(prev_id);
+        if (prev_page != nullptr) {
+          TablePage(prev_page).set_next_page_id(INVALID_PAGE_ID);
+          buffer_pool_->unpin_page(prev_id, true);
+        }
+        last_page_id_ = prev_id;
+      }
+      return;
+    }
+
+    visited.insert(current_id);
+    page_id_t next_id = table_page.get_next_page_id();
+    if (next_id == current_id || visited.contains(next_id)) {
+      next_id = INVALID_PAGE_ID; // Cycle — treat as end of chain.
+    }
+    if (next_id == INVALID_PAGE_ID) {
+      last_page_id_ = current_id;
+    }
+    buffer_pool_->unpin_page(current_id, false);
+    prev_id = current_id;
+    current_id = next_id;
+  }
+}
+
+Status TableHeap::ensure_first_page() {
+  std::unique_lock lock(mutex_); // Exclusive lock for write
+
+  if (first_page_id_ != INVALID_PAGE_ID) {
+    return Status::Ok();
+  }
+
+  page_id_t page_id = create_new_page();
+  if (page_id == INVALID_PAGE_ID) {
+    return Status::OutOfMemory("Failed to allocate first heap page");
+  }
+
+  return Status::Ok();
+}
+
+Status TableHeap::reclaim_all_pages() {
+  std::unique_lock lock(mutex_); // Exclusive lock for write
+
+  std::unordered_set<page_id_t> visited;
+  page_id_t current_id = first_page_id_;
+  while (current_id != INVALID_PAGE_ID && !visited.contains(current_id)) {
+    visited.insert(current_id);
+
+    // Fetch to read the forward link before we free the page.
+    Page *page = buffer_pool_->fetch_page(current_id);
+    if (page == nullptr) {
+      break;
+    }
+    // Never free a page that is not an intact table page: a damaged chain
+    // (crash before the page reached disk) must not walk into foreign or
+    // uninitialized pages.
+    if (page->page_type() != PageType::TABLE_PAGE) {
+      buffer_pool_->unpin_page(current_id, false);
+      break;
+    }
+    page_id_t next_id = TablePage(page).get_next_page_id();
+    buffer_pool_->unpin_page(current_id, false);
+    // delete_page forwards to DiskManager::deallocate_page so the page can
+    // be reused by a later allocation.
+    buffer_pool_->delete_page(current_id);
+
+    current_id = next_id;
+  }
+
+  first_page_id_ = INVALID_PAGE_ID;
+  last_page_id_ = INVALID_PAGE_ID;
+
+  return Status::Ok();
 }
 
 Status TableHeap::insert_tuple(const Tuple &tuple, RID *rid) {
@@ -315,11 +403,18 @@ page_id_t TableHeap::find_page_with_space(uint32_t size) {
 
   // Fallback: linear scan through all pages to reuse free space.
   // A more sophisticated implementation would use a free space map.
+  std::unordered_set<page_id_t> visited;
   page_id_t current_id = first_page_id_;
 
-  while (current_id != INVALID_PAGE_ID) {
+  while (current_id != INVALID_PAGE_ID && !visited.contains(current_id)) {
+    visited.insert(current_id);
     Page *page = buffer_pool_->fetch_page(current_id);
     if (page == nullptr) {
+      break;
+    }
+    if (page->page_type() != PageType::TABLE_PAGE) {
+      // Damaged chain (see the corruption-tolerant walk in the constructor).
+      buffer_pool_->unpin_page(current_id, false);
       break;
     }
 
@@ -458,6 +553,13 @@ void TableIterator::advance_to_next_valid() {
       return;
     }
 
+    if (pinned_page_->page_type() != PageType::TABLE_PAGE) {
+      // Damaged chain — stop the scan rather than read garbage slots.
+      release_page();
+      rid_ = RID();
+      return;
+    }
+
     TablePage table_page(pinned_page_);
     uint16_t slot_count = table_page.get_slot_count();
 
@@ -477,8 +579,8 @@ void TableIterator::advance_to_next_valid() {
     page_id_t next_page_id = table_page.get_next_page_id();
     release_page();
 
-    if (next_page_id == INVALID_PAGE_ID) {
-      // End of table
+    if (next_page_id == INVALID_PAGE_ID || next_page_id == rid_.page_id) {
+      // End of table (a self-link means a damaged chain)
       rid_ = RID();
       return;
     }
