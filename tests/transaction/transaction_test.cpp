@@ -1552,7 +1552,13 @@ protected:
     std::filesystem::remove(db_file_);
   }
 
-  void TearDown() override { std::filesystem::remove_all(test_dir_); }
+  void TearDown() override {
+    // Close the database file before removing the directory: Windows refuses
+    // to delete files with open handles.
+    disk_manager_.reset();
+    std::error_code ec;
+    std::filesystem::remove_all(test_dir_, ec);
+  }
 
   // Build a page store backed by this test's database file.
   std::shared_ptr<BufferPoolManager> make_buffer_pool() {
