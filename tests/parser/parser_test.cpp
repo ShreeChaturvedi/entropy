@@ -947,5 +947,170 @@ TEST_F(BinderTest, BindIsNullUnknownColumn) {
   EXPECT_EQ(status.code(), StatusCode::kNotFound);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SQL surface gaps and lax lexing (issue #35)
+//
+// - DECIMAL/TIMESTAMP/DATE/CHAR must be declarable in CREATE TABLE.
+// - CREATE INDEX / DROP INDEX must parse into their own statement nodes.
+// - Unterminated string literals and block comments must be lex errors.
+// - Duplicate column names in CREATE TABLE / INSERT must be rejected.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// -- Lexer: malformed input must error, not be silently accepted -------------
+
+TEST_F(LexerTest, UnterminatedStringIsInvalidToken) {
+  Lexer lexer("'unterminated");
+  EXPECT_EQ(lexer.next_token().type, TokenType::INVALID);
+}
+
+TEST_F(LexerTest, UnterminatedStringWithEscapeIsInvalidToken) {
+  // A trailing backslash must not let the scanner consume the closing state and
+  // fall off the end silently.
+  Lexer lexer("'abc\\");
+  EXPECT_EQ(lexer.next_token().type, TokenType::INVALID);
+}
+
+TEST_F(LexerTest, UnterminatedBlockCommentIsInvalidToken) {
+  Lexer lexer("SELECT /* oops");
+  EXPECT_EQ(lexer.next_token().type, TokenType::SELECT);
+  EXPECT_EQ(lexer.next_token().type, TokenType::INVALID);
+}
+
+// Guard: a properly-closed block comment must still be skipped cleanly.
+TEST_F(LexerTest, SkipClosedBlockComment) {
+  Lexer lexer("SELECT /* comment */ *");
+  EXPECT_EQ(lexer.next_token().type, TokenType::SELECT);
+  EXPECT_EQ(lexer.next_token().type, TokenType::STAR);
+  EXPECT_EQ(lexer.next_token().type, TokenType::END_OF_FILE);
+}
+
+TEST_F(ParserTest, UnterminatedStringIsParseError) {
+  Parser parser("SELECT * FROM users WHERE name = 'unterminated");
+  std::unique_ptr<Statement> stmt;
+  EXPECT_FALSE(parser.parse(&stmt).ok());
+}
+
+TEST_F(ParserTest, UnterminatedBlockCommentIsParseError) {
+  Parser parser("SELECT * FROM users /* oops");
+  std::unique_ptr<Statement> stmt;
+  EXPECT_FALSE(parser.parse(&stmt).ok());
+}
+
+// -- Lexer/parser: extended column types -------------------------------------
+
+TEST_F(LexerTest, TokenizeExtendedTypeKeywords) {
+  Lexer lexer("DECIMAL TIMESTAMP DATE CHAR");
+  EXPECT_EQ(lexer.next_token().type, TokenType::DECIMAL);
+  EXPECT_EQ(lexer.next_token().type, TokenType::TIMESTAMP);
+  EXPECT_EQ(lexer.next_token().type, TokenType::DATE);
+  EXPECT_EQ(lexer.next_token().type, TokenType::CHAR);
+}
+
+TEST_F(ParserTest, ParseCreateTableExtendedTypes) {
+  Parser parser("CREATE TABLE t (a DECIMAL, b DECIMAL(10, 2), c TIMESTAMP, "
+                "d DATE, e CHAR(8))");
+  std::unique_ptr<Statement> stmt;
+  Status status = parser.parse(&stmt);
+  ASSERT_TRUE(status.ok()) << status.to_string();
+
+  auto *create = dynamic_cast<CreateTableStatement *>(stmt.get());
+  ASSERT_NE(create, nullptr);
+  ASSERT_EQ(create->columns.size(), 5u);
+  EXPECT_EQ(create->columns[0].type, TypeId::DECIMAL);
+  EXPECT_EQ(create->columns[1].type, TypeId::DECIMAL);
+  EXPECT_EQ(create->columns[2].type, TypeId::TIMESTAMP);
+  EXPECT_EQ(create->columns[3].type, TypeId::TIMESTAMP); // DATE bridges to it
+  EXPECT_EQ(create->columns[4].type, TypeId::VARCHAR);   // CHAR bridges to it
+  EXPECT_EQ(create->columns[4].length, 8u);
+}
+
+TEST_F(ParserTest, DecimalPrecisionOverflowIsError) {
+  Parser parser("CREATE TABLE t (a DECIMAL(99999999999999999999999))");
+  std::unique_ptr<Statement> stmt;
+  EXPECT_FALSE(parser.parse(&stmt).ok());
+}
+
+TEST_F(ParserTest, DecimalMissingPrecisionIsError) {
+  Parser parser("CREATE TABLE t (a DECIMAL())");
+  std::unique_ptr<Statement> stmt;
+  EXPECT_FALSE(parser.parse(&stmt).ok());
+}
+
+// -- Parser: CREATE INDEX / DROP INDEX ---------------------------------------
+
+TEST_F(ParserTest, ParseCreateIndex) {
+  Parser parser("CREATE INDEX idx_name ON users (name)");
+  std::unique_ptr<Statement> stmt;
+  Status status = parser.parse(&stmt);
+  ASSERT_TRUE(status.ok()) << status.to_string();
+  EXPECT_EQ(stmt->type(), StatementType::CREATE_INDEX);
+
+  auto *idx = dynamic_cast<CreateIndexStatement *>(stmt.get());
+  ASSERT_NE(idx, nullptr);
+  EXPECT_EQ(idx->index_name, "idx_name");
+  EXPECT_EQ(idx->table_name, "users");
+  ASSERT_EQ(idx->columns.size(), 1u);
+  EXPECT_EQ(idx->columns[0], "name");
+}
+
+TEST_F(ParserTest, ParseCreateIndexMultiColumn) {
+  Parser parser("CREATE INDEX idx ON t (a, b, c)");
+  std::unique_ptr<Statement> stmt;
+  Status status = parser.parse(&stmt);
+  ASSERT_TRUE(status.ok()) << status.to_string();
+
+  auto *idx = dynamic_cast<CreateIndexStatement *>(stmt.get());
+  ASSERT_NE(idx, nullptr);
+  ASSERT_EQ(idx->columns.size(), 3u);
+  EXPECT_EQ(idx->columns[0], "a");
+  EXPECT_EQ(idx->columns[1], "b");
+  EXPECT_EQ(idx->columns[2], "c");
+}
+
+TEST_F(ParserTest, ParseCreateIndexMissingOnIsError) {
+  Parser parser("CREATE INDEX idx users (name)");
+  std::unique_ptr<Statement> stmt;
+  EXPECT_FALSE(parser.parse(&stmt).ok());
+}
+
+TEST_F(ParserTest, ParseDropIndex) {
+  Parser parser("DROP INDEX idx_name");
+  std::unique_ptr<Statement> stmt;
+  Status status = parser.parse(&stmt);
+  ASSERT_TRUE(status.ok()) << status.to_string();
+  EXPECT_EQ(stmt->type(), StatementType::DROP_INDEX);
+
+  auto *idx = dynamic_cast<DropIndexStatement *>(stmt.get());
+  ASSERT_NE(idx, nullptr);
+  EXPECT_EQ(idx->index_name, "idx_name");
+  EXPECT_TRUE(idx->table_name.empty());
+}
+
+TEST_F(ParserTest, ParseDropIndexOnTable) {
+  Parser parser("DROP INDEX idx_name ON users");
+  std::unique_ptr<Statement> stmt;
+  Status status = parser.parse(&stmt);
+  ASSERT_TRUE(status.ok()) << status.to_string();
+
+  auto *idx = dynamic_cast<DropIndexStatement *>(stmt.get());
+  ASSERT_NE(idx, nullptr);
+  EXPECT_EQ(idx->index_name, "idx_name");
+  EXPECT_EQ(idx->table_name, "users");
+}
+
+// -- Parser: duplicate column names are rejected -----------------------------
+
+TEST_F(ParserTest, DuplicateColumnInCreateTableIsError) {
+  Parser parser("CREATE TABLE t (id INTEGER, id VARCHAR(10))");
+  std::unique_ptr<Statement> stmt;
+  EXPECT_FALSE(parser.parse(&stmt).ok());
+}
+
+TEST_F(ParserTest, DuplicateColumnInInsertIsError) {
+  Parser parser("INSERT INTO t (a, b, a) VALUES (1, 2, 3)");
+  std::unique_ptr<Statement> stmt;
+  EXPECT_FALSE(parser.parse(&stmt).ok());
+}
+
 } // namespace
 } // namespace entropy
