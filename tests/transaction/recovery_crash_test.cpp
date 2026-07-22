@@ -176,9 +176,6 @@ protected:
   static std::vector<char> tuple_bytes(const Tuple &t) {
     return std::vector<char>(t.data(), t.data() + t.size());
   }
-  static std::span<const char> span_of(const std::vector<char> &v) {
-    return std::span<const char>(v.data(), v.size());
-  }
 
   // Insert a tuple through the heap and log it against txn (the real write
   // path). Returns the RID the heap chose.
