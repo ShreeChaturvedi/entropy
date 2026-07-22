@@ -26,6 +26,9 @@ namespace entropy {
 class WALManager;
 class LockManager;
 class TableHeap;
+class MVCCManager;
+class VersionStore;
+class BufferPoolManager;
 
 /**
  * @brief Manages transaction lifecycle
@@ -145,6 +148,52 @@ public:
     }
 
     /**
+     * @brief Attach the MVCC policy object (single logical clock source)
+     *
+     * Once set, begin() draws each transaction's start_ts (snapshot) and
+     * commit() draws each commit_ts from MVCCManager::get_timestamp(), so all
+     * MVCC visibility comparisons are well-ordered against one clock.
+     */
+    void set_mvcc(std::shared_ptr<MVCCManager> mvcc) noexcept {
+        mvcc_ = std::move(mvcc);
+    }
+
+    /**
+     * @brief Attach the in-memory version store
+     *
+     * commit() finalizes this transaction's version timestamps and abort()
+     * rolls back its uncommitted versions through the store.
+     */
+    void set_version_store(std::shared_ptr<VersionStore> version_store) noexcept {
+        version_store_ = std::move(version_store);
+    }
+
+    /**
+     * @brief Attach a buffer pool so abort() can flush its undo compensation
+     *
+     * abort() flushes every page mutated by its write-set undo before it makes
+     * the WAL ABORT record durable (see abort()). Not owned; must outlive this
+     * TransactionManager.
+     */
+    void set_buffer_pool(BufferPoolManager* buffer_pool) noexcept {
+        buffer_pool_ = buffer_pool;
+    }
+
+    /**
+     * @brief Seed the next transaction id from a recovered high-water mark
+     *
+     * Called on startup with RecoveryManager::next_txn_id() so post-restart
+     * transactions never alias ids recovered from the WAL (#19). Only advances
+     * the counter; never rewinds it.
+     */
+    void seed_next_txn_id(txn_id_t next) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (next > next_txn_id_) {
+            next_txn_id_ = next;
+        }
+    }
+
+    /**
      * @brief Resolve table OID -> TableHeap for abort undo
      *
      * Called for each write-set entry during abort. Returning nullptr skips
@@ -162,7 +211,10 @@ private:
     void undo_write_record(const WriteRecord& record);
 
     std::shared_ptr<WALManager> wal_manager_;
+    std::shared_ptr<MVCCManager> mvcc_;
+    std::shared_ptr<VersionStore> version_store_;
     LockManager* lock_manager_ = nullptr;
+    BufferPoolManager* buffer_pool_ = nullptr;
     TableResolver table_resolver_;
     std::unordered_map<txn_id_t, std::unique_ptr<Transaction>> txn_map_;
     txn_id_t next_txn_id_ = 1;

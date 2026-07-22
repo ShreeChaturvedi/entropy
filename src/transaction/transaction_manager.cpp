@@ -5,13 +5,17 @@
 
 #include "transaction/transaction_manager.hpp"
 
-#include <chrono>
+#include <unordered_set>
 
 #include "common/logger.hpp"
+#include "storage/buffer_pool.hpp"
+#include "storage/page.hpp"
 #include "storage/table_heap.hpp"
 #include "storage/tuple.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/log_record.hpp"
+#include "transaction/mvcc.hpp"
+#include "transaction/version_store.hpp"
 #include "transaction/wal.hpp"
 
 namespace entropy {
@@ -27,6 +31,15 @@ Transaction* TransactionManager::begin(IsolationLevel isolation) {
     // Create new transaction
     txn_id_t txn_id = next_txn_id_++;
     auto txn = std::make_unique<Transaction>(txn_id, isolation);
+
+    // Draw the snapshot from the single logical clock so start_ts and every
+    // commit_ts come from one monotonic source; otherwise begin_ts <= start_ts
+    // would always hold (steady_clock vs. a small logical counter) and SI would
+    // collapse to read-latest. Without an MVCC manager the constructor default
+    // stands in (direct-construction unit tests).
+    if (mvcc_) {
+        txn->set_start_ts(mvcc_->get_timestamp());
+    }
 
     // Log BEGIN record
     if (wal_manager_) {
@@ -70,9 +83,19 @@ void TransactionManager::commit(Transaction* txn) {
         }
     }
 
-    // Set commit timestamp
-    txn->set_commit_ts(static_cast<uint64_t>(
-        std::chrono::steady_clock::now().time_since_epoch().count()));
+    // Commit timestamp comes from the single logical clock so it is
+    // well-ordered against every snapshot start_ts. Without an MVCC manager
+    // wired (legacy in-memory setups with no version store) there is no
+    // visibility to order, so the transaction's own start stamp stands in.
+    const uint64_t commit_ts = mvcc_ ? mvcc_->get_timestamp() : txn->start_ts();
+    txn->set_commit_ts(commit_ts);
+
+    // Stamp this transaction's version timestamps (begin_ts/end_ts) so readers
+    // with a later snapshot observe the new value and earlier snapshots keep
+    // reading the retained before-image.
+    if (version_store_) {
+        version_store_->finalize(txn, commit_ts);
+    }
 
     // Update state
     txn->set_state(TransactionState::COMMITTED);
@@ -118,20 +141,65 @@ void TransactionManager::abort(Transaction* txn) {
     // a no-op instead of appending a duplicate WAL ABORT record.
     txn->clear_aborted_by_deadlock();
 
-    // Undo all modifications in reverse order using the write set
+    // Undo all modifications in reverse order using the write set, collecting
+    // the pages the undo compensated so they can be forced to disk before the
+    // WAL ABORT record is made durable.
+    std::unordered_set<page_id_t> undone_pages;
     const auto& write_set = txn->write_set();
     for (auto it = write_set.rbegin(); it != write_set.rend(); ++it) {
         undo_write_record(*it);
+        if (it->rid.page_id >= 0) {
+            undone_pages.insert(it->rid.page_id);
+        }
     }
 
-    // Log ABORT record
-    if (wal_manager_) {
+    // Durability ordering (mirrors RecoveryManager::undo_phase): every page the
+    // undo touched must reach disk BEFORE the ABORT record becomes durable. A
+    // durable ABORT paired with unflushed compensation is a data hazard — after
+    // a crash, recovery treats the transaction as already rolled back and never
+    // re-runs its undo, so the uncommitted mutation (possibly already stolen to
+    // disk) would be stranded there permanently.
+    bool compensation_durable = true;
+    if (buffer_pool_ != nullptr) {
+        for (page_id_t page_id : undone_pages) {
+            // fetch_page pins the page (re-reading from disk if it was evicted,
+            // in which case its state is already durable), so a false from
+            // flush_page can only mean a real write failure.
+            Page* page = buffer_pool_->fetch_page(page_id);
+            if (page == nullptr) {
+                compensation_durable = false;
+                continue;
+            }
+            const bool flushed = buffer_pool_->flush_page(page_id);
+            buffer_pool_->unpin_page(page_id, false);
+            if (!flushed) {
+                compensation_durable = false;
+            }
+        }
+    }
+
+    // Log ABORT record only once its compensation is durable. If a flush
+    // failed, withhold the durable ABORT so a later recovery still treats this
+    // transaction as a loser and re-runs its (idempotent, state-checked) undo.
+    if (wal_manager_ && compensation_durable) {
         LogRecord abort_record = LogRecord::make_abort(txn->txn_id(), txn->prev_lsn());
         lsn_t lsn = wal_manager_->append_log(abort_record);
         txn->set_prev_lsn(lsn);
 
-        // Flush abort record
+        // Flush abort record: this is the durability point the compensation
+        // above is guaranteed to precede on disk.
         (void)wal_manager_->flush_to_lsn(lsn);
+    } else if (wal_manager_) {
+        LOG_ERROR("Abort of transaction {} could not flush undo compensation; "
+                  "withholding durable ABORT so recovery re-runs the undo",
+                  txn->txn_id());
+    }
+
+    // Drop this transaction's uncommitted MVCC versions: creations are removed
+    // from their chains and uncommitted deletes reverted so the underlying
+    // committed version survives.
+    if (version_store_) {
+        version_store_->rollback(txn);
     }
 
     // Update state

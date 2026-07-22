@@ -198,6 +198,16 @@ public:
     void set_prev_lsn(lsn_t lsn) noexcept { prev_lsn_ = lsn; }
 
     /**
+     * @brief Set the transaction start timestamp (snapshot)
+     *
+     * The constructor seeds a reasonable default for transactions built
+     * directly in tests; TransactionManager::begin() overrides it with a value
+     * drawn from the single logical clock (MVCCManager::get_timestamp) so that
+     * every snapshot and every commit timestamp share one monotonic source.
+     */
+    void set_start_ts(uint64_t ts) noexcept { start_ts_ = ts; }
+
+    /**
      * @brief Set commit timestamp
      */
     void set_commit_ts(uint64_t ts) noexcept { commit_ts_ = ts; }
