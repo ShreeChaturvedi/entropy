@@ -11,6 +11,22 @@
 #include "transaction/transaction.hpp"
 
 namespace entropy {
+namespace {
+
+// True if no transaction other than `holder` holds a granted lock in `queue`.
+// This is the upgrade condition: a SHARED holder can take EXCLUSIVE exactly
+// when it is the only granted holder left in the queue.
+[[nodiscard]] bool no_other_granted_holder(const LockRequestQueue& queue,
+                                           txn_id_t holder) {
+    for (const auto& req : queue.request_queue) {
+        if (req.granted && req.txn_id != holder) {
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
 
 LockManager::LockManager(bool enable_deadlock_detection, uint32_t lock_timeout_ms)
     : enable_deadlock_detection_(enable_deadlock_detection),
@@ -107,18 +123,9 @@ Status LockManager::upgrade_lock(Transaction* txn, oid_t table_oid, const RID& r
         queue->upgrading_txn_id = INVALID_TXN_ID;
     }
 
-    // Check if we can upgrade immediately
-    // We can upgrade if we're the only holder OR all other holders are shared
-    bool can_upgrade_now = true;
-    for (const auto& req : queue->request_queue) {
-        if (req.txn_id != txn->txn_id() && req.granted) {
-            // Another transaction holds the lock
-            can_upgrade_now = false;
-            break;
-        }
-    }
-
-    if (can_upgrade_now) {
+    // Check if we can upgrade immediately: only when no other transaction still
+    // holds a granted lock on this target.
+    if (no_other_granted_holder(*queue, txn->txn_id())) {
         req_it->mode = LockMode::EXCLUSIVE;
         LOG_DEBUG("Txn {} upgraded lock to EXCLUSIVE immediately", txn->txn_id());
         return Status::Ok();
@@ -157,16 +164,8 @@ Status LockManager::upgrade_lock(Transaction* txn, oid_t table_oid, const RID& r
             return Status::Aborted("Transaction was aborted");
         }
 
-        // Check if we can upgrade
-        bool all_others_released = true;
-        for (const auto& req : queue->request_queue) {
-            if (req.txn_id != txn->txn_id() && req.granted) {
-                all_others_released = false;
-                break;
-            }
-        }
-
-        if (all_others_released) {
+        // Check if we can upgrade: every other holder has released.
+        if (no_other_granted_holder(*queue, txn->txn_id())) {
             req_it->mode = LockMode::EXCLUSIVE;
             queue->upgrading = false;
             queue->upgrading_txn_id = INVALID_TXN_ID;
@@ -520,21 +519,11 @@ void LockManager::grant_waiting_locks(LockRequestQueue* queue) {
     // Grant as many waiting requests as possible
     // For FIFO fairness, grant in order
 
-    // First, handle any upgrading transaction
-    if (queue->upgrading) {
-        // Check if upgrade can proceed
-        bool can_upgrade = true;
-        for (const auto& req : queue->request_queue) {
-            if (req.txn_id != queue->upgrading_txn_id && req.granted) {
-                can_upgrade = false;
-                break;
-            }
-        }
-        if (can_upgrade) {
-            // Upgrade will be completed by the waiting thread
-            // Just notify
-            return;
-        }
+    // First, handle any upgrading transaction. When it is the only granted
+    // holder left, its own waiting thread completes the upgrade; just notify.
+    if (queue->upgrading &&
+        no_other_granted_holder(*queue, queue->upgrading_txn_id)) {
+        return;
     }
 
     // Grant waiting requests in order

@@ -141,7 +141,7 @@ int main() {
 
 Dependencies (spdlog, GoogleTest, Google Benchmark) are fetched with CMake
 FetchContent on first configure (requires network access). Optional
-comparisons use system SQLite3, while compression uses LZ4 when enabled.
+comparisons use system SQLite3.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -170,9 +170,6 @@ ctest --preset dev
 | `ENTROPY_BUILD_BENCHMARKS` | &#10007; | Build benchmarks |
 | `ENTROPY_BENCH_COMPARE_SQLITE` | &#10007; | Build SQLite comparison benchmarks |
 | `ENTROPY_BUILD_EXAMPLES` | &#10003; | Build example programs |
-| `ENTROPY_ENABLE_LZ4` | &#10007; | Enable page compression (LZ4) |
-
-LZ4 compression tests are only built when `ENTROPY_ENABLE_LZ4=ON`.
 
 ## CI/CD and Releases
 

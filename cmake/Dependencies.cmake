@@ -83,53 +83,6 @@ if(ENTROPY_BUILD_BENCHMARKS)
 endif()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LZ4 - Fast compression library (optional)
-# ─────────────────────────────────────────────────────────────────────────────
-
-if(ENTROPY_ENABLE_LZ4)
-    find_package(lz4 QUIET)
-
-    if(NOT lz4_FOUND)
-        FetchContent_Declare(
-            lz4
-            GIT_REPOSITORY https://github.com/lz4/lz4.git
-            GIT_TAG        v1.9.4
-            GIT_SHALLOW    TRUE
-            SOURCE_SUBDIR  build/cmake
-        )
-
-        set(LZ4_BUILD_CLI OFF CACHE BOOL "" FORCE)
-        set(LZ4_BUILD_LEGACY_LZ4C OFF CACHE BOOL "" FORCE)
-
-        FetchContent_MakeAvailable(lz4)
-    endif()
-
-    set(entropy_lz4_target "")
-    if(TARGET LZ4::LZ4)
-        set(entropy_lz4_target LZ4::LZ4)
-    elseif(TARGET lz4::lz4)
-        set(entropy_lz4_target lz4::lz4)
-    elseif(TARGET lz4_static)
-        set(entropy_lz4_target lz4_static)
-    elseif(TARGET lz4_shared)
-        set(entropy_lz4_target lz4_shared)
-    elseif(TARGET lz4)
-        set(entropy_lz4_target lz4)
-    endif()
-
-    if(entropy_lz4_target)
-        if(NOT TARGET entropy_lz4)
-            add_library(entropy_lz4 INTERFACE)
-        endif()
-        target_link_libraries(entropy_lz4 INTERFACE ${entropy_lz4_target})
-    else()
-        message(FATAL_ERROR "LZ4 enabled but no CMake target was found.")
-    endif()
-
-    add_compile_definitions(ENTROPY_ENABLE_COMPRESSION)
-endif()
-
-# ─────────────────────────────────────────────────────────────────────────────
 # SQLite3 - Optional (benchmark comparison)
 # ─────────────────────────────────────────────────────────────────────────────
 
