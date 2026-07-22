@@ -12,6 +12,7 @@
  * COMMITTED/ABORTED are terminal states.
  */
 
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <unordered_set>
@@ -117,15 +118,49 @@ public:
     // Non-copyable, movable
     Transaction(const Transaction&) = delete;
     Transaction& operator=(const Transaction&) = delete;
-    Transaction(Transaction&&) = default;
-    Transaction& operator=(Transaction&&) = default;
+
+    // std::atomic is not movable, so the move operations are defined explicitly.
+    // Moving a Transaction happens only at construction time, before the object
+    // is shared across threads, so a relaxed load/store of the state is safe.
+    Transaction(Transaction&& other) noexcept
+        : txn_id_(other.txn_id_),
+          state_(other.state_.load(std::memory_order_relaxed)),
+          aborted_by_deadlock_(other.aborted_by_deadlock_.load(std::memory_order_relaxed)),
+          isolation_level_(other.isolation_level_),
+          prev_lsn_(other.prev_lsn_),
+          start_ts_(other.start_ts_),
+          commit_ts_(other.commit_ts_),
+          write_set_(std::move(other.write_set_)),
+          page_locks_(std::move(other.page_locks_)),
+          table_locks_(std::move(other.table_locks_)) {}
+
+    Transaction& operator=(Transaction&& other) noexcept {
+        if (this != &other) {
+            txn_id_ = other.txn_id_;
+            state_.store(other.state_.load(std::memory_order_relaxed),
+                         std::memory_order_relaxed);
+            aborted_by_deadlock_.store(
+                other.aborted_by_deadlock_.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            isolation_level_ = other.isolation_level_;
+            prev_lsn_ = other.prev_lsn_;
+            start_ts_ = other.start_ts_;
+            commit_ts_ = other.commit_ts_;
+            write_set_ = std::move(other.write_set_);
+            page_locks_ = std::move(other.page_locks_);
+            table_locks_ = std::move(other.table_locks_);
+        }
+        return *this;
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Accessors
     // ─────────────────────────────────────────────────────────────────────────
 
     [[nodiscard]] txn_id_t txn_id() const noexcept { return txn_id_; }
-    [[nodiscard]] TransactionState state() const noexcept { return state_; }
+    [[nodiscard]] TransactionState state() const noexcept {
+        return state_.load(std::memory_order_acquire);
+    }
     [[nodiscard]] IsolationLevel isolation_level() const noexcept { return isolation_level_; }
 
     /**
@@ -153,7 +188,9 @@ public:
      * @brief Set transaction state
      * @note Should only be called by TransactionManager
      */
-    void set_state(TransactionState state) noexcept { state_ = state; }
+    void set_state(TransactionState state) noexcept {
+        state_.store(state, std::memory_order_release);
+    }
 
     /**
      * @brief Set the previous LSN (last log record for this transaction)
@@ -169,7 +206,40 @@ public:
      * @brief Check if transaction is in a state where it can perform operations
      */
     [[nodiscard]] bool is_active() const noexcept {
-        return state_ == TransactionState::GROWING || state_ == TransactionState::SHRINKING;
+        const TransactionState s = state_.load(std::memory_order_acquire);
+        return s == TransactionState::GROWING || s == TransactionState::SHRINKING;
+    }
+
+    /**
+     * @brief Mark this transaction as a deadlock victim
+     *
+     * Set by the LockManager (possibly from another thread) together with
+     * set_state(ABORTED) so the victim's waiter loops terminate. The mark tells
+     * TransactionManager::abort() that although the state is already ABORTED,
+     * the abort has NOT been finalized: write-set undo, the WAL ABORT record,
+     * and removal from the active-transaction map must still run.
+     */
+    void set_aborted_by_deadlock() noexcept {
+        aborted_by_deadlock_.store(true, std::memory_order_release);
+    }
+
+    /**
+     * @brief True if this transaction was marked ABORTED as a deadlock victim
+     * and still needs abort finalization (undo + WAL ABORT + deregistration)
+     */
+    [[nodiscard]] bool aborted_by_deadlock() const noexcept {
+        return aborted_by_deadlock_.load(std::memory_order_acquire);
+    }
+
+    /**
+     * @brief Consume the deadlock-victim mark once finalization begins
+     *
+     * Called by TransactionManager::abort() when it admits a marked victim, so
+     * a stray second abort() on a still-live object is a no-op instead of
+     * re-appending a duplicate WAL ABORT record.
+     */
+    void clear_aborted_by_deadlock() noexcept {
+        aborted_by_deadlock_.store(false, std::memory_order_release);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -235,7 +305,12 @@ public:
 
 private:
     txn_id_t txn_id_;
-    TransactionState state_ = TransactionState::GROWING;
+    // Atomic: read cross-thread by the lock manager's waiter loops while the
+    // owning thread (or a deadlock-victim path) mutates it via set_state().
+    std::atomic<TransactionState> state_{TransactionState::GROWING};
+    // Atomic: set under the lock manager's latch, read by the victim's own
+    // thread under the TransactionManager mutex (no common lock between them).
+    std::atomic<bool> aborted_by_deadlock_{false};
     IsolationLevel isolation_level_;
 
     // WAL linkage

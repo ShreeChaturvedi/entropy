@@ -98,12 +98,25 @@ void TransactionManager::abort(Transaction* txn) {
 
     std::lock_guard<std::mutex> lock(mutex_);
 
-    if (txn->state() != TransactionState::GROWING &&
-        txn->state() != TransactionState::SHRINKING) {
+    // A deadlock victim is already marked ABORTED by the lock manager (so its
+    // waiter loops terminate), but nothing has been finalized: its writes must
+    // still be undone, the WAL ABORT record appended, and the transaction
+    // removed from the active set. Let it through; refuse everything else that
+    // is not active.
+    const TransactionState state = txn->state();
+    const bool deadlock_victim_pending =
+        state == TransactionState::ABORTED && txn->aborted_by_deadlock();
+    if (state != TransactionState::GROWING &&
+        state != TransactionState::SHRINKING && !deadlock_victim_pending) {
         LOG_WARN("Attempting to abort transaction {} in state {}", txn->txn_id(),
-                 transaction_state_to_string(txn->state()));
+                 transaction_state_to_string(state));
         return;
     }
+
+    // Consume the mark: finalization runs exactly once. A stray second abort()
+    // on a still-live victim object then sees ABORTED without the mark and is
+    // a no-op instead of appending a duplicate WAL ABORT record.
+    txn->clear_aborted_by_deadlock();
 
     // Undo all modifications in reverse order using the write set
     const auto& write_set = txn->write_set();
@@ -124,7 +137,9 @@ void TransactionManager::abort(Transaction* txn) {
     // Update state
     txn->set_state(TransactionState::ABORTED);
 
-    // Release locks after undo so concurrent writers stay blocked during rollback
+    // Release locks after undo so concurrent writers stay blocked during
+    // rollback. Deadlock victims keep their granted locks through the lock
+    // manager's wait-loop exit precisely so this ordering holds for them too.
     if (lock_manager_ != nullptr) {
         lock_manager_->release_all_locks(txn);
     }

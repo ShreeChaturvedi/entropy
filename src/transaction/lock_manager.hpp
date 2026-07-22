@@ -76,11 +76,13 @@ enum class LockMode : uint8_t {
  * @brief Represents a transaction's request for a lock
  */
 struct LockRequest {
-    txn_id_t txn_id;          // Transaction requesting the lock
-    LockMode mode;            // Requested lock mode
-    bool granted = false;     // Whether the lock has been granted
+    txn_id_t txn_id;              // Transaction requesting the lock
+    LockMode mode;                // Requested lock mode
+    bool granted = false;         // Whether the lock has been granted
+    Transaction* txn = nullptr;   // Owning transaction (for deadlock-victim abort)
 
-    LockRequest(txn_id_t tid, LockMode m) : txn_id(tid), mode(m) {}
+    LockRequest(txn_id_t tid, LockMode m, Transaction* t = nullptr)
+        : txn_id(tid), mode(m), txn(t) {}
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -299,7 +301,13 @@ public:
 
     /**
      * @brief Release all locks held by a transaction
-     * @note Called during commit or abort
+     * @note Called during commit or abort.
+     * @warning Must be called from the transaction's OWN thread (or when the
+     *          transaction is provably not parked inside a lock/upgrade wait
+     *          loop). It erases the transaction's requests, and those wait
+     *          loops retain list iterators into the queues — erasing them from
+     *          another thread is undefined behaviour. This is the same hazard
+     *          abort_victim_locked avoids by only marking and notifying.
      */
     void release_all_locks(Transaction* txn);
 
@@ -340,32 +348,76 @@ private:
      */
     void grant_waiting_locks(LockRequestQueue* queue);
 
+    /**
+     * @brief Erase one request from a queue and wake the queue (latch held).
+     *
+     * Removing ANY request can unblock others: a granted request blocks
+     * incompatible modes, and a WAITING request FIFO-gates later compatible
+     * requests (H holds S, V waits X, W waits S behind V — erasing V leaves W
+     * grantable). Every erase path must therefore re-evaluate grants and
+     * notify; if the queue becomes empty it is removed from the lock table.
+     */
+    void erase_request_locked(LockRequestQueue* queue,
+                              std::list<LockRequest>::iterator req_it,
+                              const LockTarget& target);
+
+    /**
+     * @brief Release every lock held or waited on by a transaction (latch held).
+     * @note Safe only when called on the transaction's OWN thread (it erases the
+     *       transaction's requests, including any it is actively waiting on).
+     */
+    void release_all_locks_locked(Transaction* txn);
+
+    /**
+     * @brief Abort another transaction chosen as a deadlock victim (latch held).
+     *
+     * Marks the victim ABORTED (with the deadlock mark, so
+     * TransactionManager::abort() still finalizes it) and wakes every queue it
+     * participates in. The victim's own thread then erases only its WAITING
+     * request and returns Aborted; its GRANTED locks stay held until
+     * TransactionManager::abort() releases them AFTER write-set undo, so
+     * survivors can never observe (or overwrite) not-yet-rolled-back data.
+     * Requests are never erased cross-thread: the victim's wait loops retain
+     * list iterators into the queues.
+     */
+    void abort_victim_locked(Transaction* victim);
+
     // ─────────────────────────────────────────────────────────────────────────
     // Deadlock Detection
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * @brief Check if waiting for a lock would cause a deadlock
-     * @param waiting_txn_id Transaction that would be waiting
-     * @param queue The lock request queue being waited on
-     * @return True if a deadlock would occur
+     * @brief Build the global wait-for graph from the current lock table.
+     * @note Latch must be held. Waiting requests wait for every incompatible
+     *       granted holder; an upgrading transaction (holds S, wants X) waits
+     *       for every other granted holder.
      */
-    [[nodiscard]] bool would_cause_deadlock(txn_id_t waiting_txn_id,
-                                            const LockRequestQueue* queue);
+    [[nodiscard]] std::unordered_map<txn_id_t, std::vector<txn_id_t>>
+    build_wait_for_graph() const;
 
     /**
-     * @brief Build wait-for edges: which transactions is this one waiting for?
+     * @brief Select a deadlock victim under the wait-die policy.
+     *
+     * If a wait-for cycle reachable from @p start_txn_id exists, returns the
+     * YOUNGEST transaction in that cycle (largest txn_id) as the victim; the
+     * older transactions win. Returns INVALID_TXN_ID when there is no cycle.
      */
-    [[nodiscard]] std::vector<txn_id_t> get_blocking_txns(txn_id_t waiting_txn_id,
-                                                          const LockRequestQueue* queue) const;
+    [[nodiscard]] txn_id_t select_deadlock_victim(txn_id_t start_txn_id) const;
 
     /**
-     * @brief DFS to detect cycle in wait-for graph
+     * @brief DFS that extracts the first cycle reachable from a node.
      */
-    [[nodiscard]] bool has_cycle(txn_id_t start_txn_id,
-                                 const std::unordered_map<txn_id_t, std::vector<txn_id_t>>& wait_for_graph,
-                                 std::unordered_set<txn_id_t>& visited,
-                                 std::unordered_set<txn_id_t>& rec_stack) const;
+    [[nodiscard]] bool find_cycle(
+        txn_id_t node,
+        const std::unordered_map<txn_id_t, std::vector<txn_id_t>>& graph,
+        std::vector<txn_id_t>& path, std::unordered_set<txn_id_t>& in_path,
+        std::unordered_set<txn_id_t>& visited,
+        std::vector<txn_id_t>& cycle_out) const;
+
+    /**
+     * @brief Look up a live transaction by id via the lock table (latch held).
+     */
+    [[nodiscard]] Transaction* find_transaction_locked(txn_id_t txn_id) const;
 
     // ─────────────────────────────────────────────────────────────────────────
     // Data Members
