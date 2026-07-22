@@ -45,7 +45,7 @@ Status VersionStore::on_update(const Transaction *txn, RID rid,
     VersionNode base;
     base.info.created_by = TXN_ID_NONE;
     base.info.deleted_by = TXN_ID_NONE;
-    base.info.begin_ts = 1; // committed before any live transaction
+    base.info.begin_ts = TIMESTAMP_PREHISTORY; // committed before any live txn
     base.info.end_ts = TIMESTAMP_MAX;
     chain.push_back(std::move(base));
   }
@@ -83,7 +83,7 @@ Status VersionStore::on_delete(const Transaction *txn, RID rid,
     VersionNode base;
     base.info.created_by = TXN_ID_NONE;
     base.info.deleted_by = TXN_ID_NONE;
-    base.info.begin_ts = 1;
+    base.info.begin_ts = TIMESTAMP_PREHISTORY;
     base.info.end_ts = TIMESTAMP_MAX;
     chain.push_back(std::move(base));
   }
@@ -110,14 +110,14 @@ Status VersionStore::on_delete(const Transaction *txn, RID rid,
 // Read path
 // ─────────────────────────────────────────────────────────────────────────────
 
-std::optional<std::span<const char>>
+std::optional<std::vector<char>>
 VersionStore::read_visible(RID rid, std::span<const char> heap_bytes,
                            const Transaction *txn) const {
   std::shared_lock lock(latch_);
   auto it = chains_.find(rid);
   if (it == chains_.end()) {
     // No MVCC metadata: treat the heap value as a committed, visible row.
-    return heap_bytes;
+    return std::vector<char>(heap_bytes.begin(), heap_bytes.end());
   }
 
   const auto &chain = it->second;
@@ -129,12 +129,15 @@ VersionStore::read_visible(RID rid, std::span<const char> heap_bytes,
     if (mvcc_.is_delete_visible(node.info, txn)) {
       return std::nullopt; // visible creation but deleted from my view: gone
     }
-    // This is the version I see.
+    // This is the version I see. Return an owned copy: the shared lock is
+    // released on return, so a span into before_image would dangle against a
+    // concurrent gc()/rollback().
     const bool is_head = (rit == chain.rbegin());
     if (is_head && node.info.deleted_by == TXN_ID_NONE) {
-      return heap_bytes; // live current version: bytes live in the heap
+      return std::vector<char>(heap_bytes.begin(),
+                               heap_bytes.end()); // live head: heap bytes
     }
-    return std::span<const char>(node.before_image);
+    return node.before_image; // superseded/deleted version: retained copy
   }
   return std::nullopt;
 }

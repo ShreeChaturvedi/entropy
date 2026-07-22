@@ -121,14 +121,15 @@ public:
    *
    * @param heap_bytes Current heap bytes, returned when the visible version is
    *                   the live (non-deleted) head.
-   * @return The visible bytes, or nullopt if no version is visible.
+   * @return An owned copy of the visible bytes, or nullopt if no version is
+   *         visible.
    *
-   * @note The returned span references storage owned by this store and is
-   *       valid only until the next mutating call (on_insert, on_update,
-   *       on_delete, finalize, rollback, or gc). Copy the bytes out before
-   *       mutating the store.
+   * @note Returns an owned copy rather than a span into store memory: the
+   *       shared lock is dropped on return, so a span would be a use-after-free
+   *       against a concurrent gc()/rollback() that frees the underlying
+   *       before-image. The copy is the reader's to keep.
    */
-  [[nodiscard]] std::optional<std::span<const char>>
+  [[nodiscard]] std::optional<std::vector<char>>
   read_visible(RID rid, std::span<const char> heap_bytes,
                const Transaction *txn) const;
 
