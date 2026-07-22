@@ -80,8 +80,15 @@ public:
 
     /**
      * @brief Flush all pages to disk
+     * @return Ok when every dirty page reached disk; otherwise the first
+     *         error encountered (remaining pages are still attempted, and a
+     *         page whose write failed stays dirty for a later retry).
+     *
+     * Deliberately not [[nodiscard]]: best-effort callers (the destructor,
+     * opportunistic flushes) legitimately ignore the result; durability-
+     * critical callers (clean shutdown, checkpoints) must check it.
      */
-    void flush_all_pages();
+    Status flush_all_pages();
 
     /**
      * @brief Get the pool size

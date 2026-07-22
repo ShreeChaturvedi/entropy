@@ -248,12 +248,16 @@ void BufferPoolManager::set_wal_flush_hook(std::function<Status(lsn_t)> hook) {
     wal_flush_hook_ = std::move(hook);
 }
 
-void BufferPoolManager::flush_all_pages() {
+Status BufferPoolManager::flush_all_pages() {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    Status first_error = Status::Ok();
     for (auto& [page_id, frame_id] : page_table_) {
         if (!frame_id_is_valid(frame_id)) {
             LOG_ERROR("Invalid frame id {}", frame_id);
+            if (first_error.ok()) {
+                first_error = Status::Internal("Invalid frame id in page table");
+            }
             continue;
         }
         Page* page = &pages_[frame_index(frame_id)];
@@ -264,9 +268,13 @@ void BufferPoolManager::flush_all_pages() {
             } else {
                 LOG_ERROR("Failed to flush page {}: {}", page_id,
                           status.to_string());
+                if (first_error.ok()) {
+                    first_error = status;
+                }
             }
         }
     }
+    return first_error;
 }
 
 Status BufferPoolManager::write_page_to_disk(Page* page) {
