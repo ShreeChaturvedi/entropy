@@ -14,6 +14,28 @@
 #include "storage/tuple.hpp"
 
 namespace entropy {
+namespace {
+
+/// Insert one entry per heap tuple into @p tree, keyed by column @p col_idx.
+/// Used by create_index and to rebuild an index whose root page was lost.
+void build_index_from_heap(const TableInfo &table, uint32_t col_idx,
+                           BPlusTree &tree) {
+  for (auto it = table.table_heap->begin(); it != table.table_heap->end();
+       ++it) {
+    Tuple tuple = *it;
+    TupleValue key_val = tuple.get_value(table.schema, col_idx);
+    // Convert to BPTreeKey (int64_t).
+    BPTreeKey key = 0;
+    if (key_val.is_integer()) {
+      key = static_cast<BPTreeKey>(key_val.as_integer());
+    } else if (key_val.is_bigint()) {
+      key = key_val.as_bigint();
+    }
+    (void)tree.insert(key, it.rid());
+  }
+}
+
+} // namespace
 
 Catalog::Catalog(std::shared_ptr<BufferPoolManager> buffer_pool,
                  std::string manifest_path)
@@ -62,9 +84,10 @@ void Catalog::load_from_manifest() {
   for (auto &idx : manifest.indexes) {
     // Guard against a manifest that references a root that never reached
     // disk (crash between a root change and the page flush): a zeroed page
-    // is not a valid index node, so fall back to an empty tree instead of
-    // descending into garbage.
+    // is not a valid index node, so do not descend into garbage. The loss is
+    // bounded to the index — the heap is intact — so rebuild from it below.
     page_id_t root = idx.root_page_id;
+    bool rebuild = false;
     if (root != INVALID_PAGE_ID) {
       Page *page = buffer_pool_->fetch_page(root);
       bool valid_root = false;
@@ -75,10 +98,20 @@ void Catalog::load_from_manifest() {
       }
       if (!valid_root) {
         root = INVALID_PAGE_ID;
+        rebuild = true;
       }
     }
 
     auto tree = std::make_shared<BPlusTree>(buffer_pool_, root);
+    if (rebuild) {
+      auto table_it = tables_.find(idx.table_oid);
+      if (table_it != tables_.end() && table_it->second->table_heap) {
+        // No listener is registered yet, so the rebuild inserts do not
+        // persist per root change; the next DDL or root change will.
+        build_index_from_heap(*table_it->second, idx.key_column, *tree);
+      }
+    }
+
     auto info = std::make_shared<IndexInfo>(idx.oid, idx.name, idx.table_oid,
                                             idx.key_column, std::move(tree));
     register_root_listener(info);
@@ -134,7 +167,17 @@ void Catalog::register_root_listener(const std::shared_ptr<IndexInfo> &info) {
   // Never invoked while the catalog already holds mutex_: listeners are
   // registered only after create_index's build completes, and
   // BPlusTree::reclaim_all_pages bypasses the callback.
-  info->index->set_root_change_callback([this](page_id_t) {
+  //
+  // The raw tree pointer is safe: the callback is owned by that same tree.
+  info->index->set_root_change_callback([this,
+                                         tree = info->index.get()](page_id_t) {
+    // Durability order: the pages the new root reaches must be on disk
+    // before the manifest referencing it is fsync'd (flush_page works on the
+    // pages the in-flight mutation still holds pinned). On flush failure,
+    // keep the old manifest — its root is still intact on disk.
+    if (!tree->flush_all_pages().ok()) {
+      return;
+    }
     std::unique_lock lock(mutex_);
     (void)persist(); // Best effort; the next DDL persists again.
   });
@@ -379,24 +422,18 @@ Status Catalog::create_index(const std::string &index_name,
       index);
 
   // Build index from existing data.
-  for (auto it = table_info->table_heap->begin();
-       it != table_info->table_heap->end(); ++it) {
-    Tuple tuple = *it;
-    TupleValue key_val =
-        tuple.get_value(table_info->schema, static_cast<uint32_t>(col_idx));
-    // Convert to BPTreeKey (int64_t).
-    BPTreeKey key = 0;
-    if (key_val.is_integer()) {
-      key = static_cast<BPTreeKey>(key_val.as_integer());
-    } else if (key_val.is_bigint()) {
-      key = key_val.as_bigint();
-    }
-    (void)index->insert(key, it.rid());
-  }
+  build_index_from_heap(*table_info, static_cast<uint32_t>(col_idx), *index);
 
   // Durability order: flush the freshly built tree pages before persisting
-  // the manifest that references the tree's root.
-  buffer_pool_->flush_all_pages();
+  // the manifest that references the tree's root, and roll back if any page
+  // cannot be written (a durable manifest must never reference unwritten
+  // pages).
+  Status flushed = index->flush_all_pages();
+  if (!flushed.ok()) {
+    (void)index->reclaim_all_pages();
+    next_oid_--;
+    return flushed;
+  }
 
   // Store in catalog.
   index_names_[index_name] = oid;

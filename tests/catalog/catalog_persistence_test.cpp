@@ -255,7 +255,8 @@ TEST(CatalogPersistence, CrashImageWithUnflushedPagesDoesNotHang) {
   Tuple back;
   EXPECT_TRUE(info->table_heap->get_tuple(rid, &back).ok());
 
-  // The index whose root never reached disk degrades to an empty tree.
+  // The index whose root never reached disk is rebuilt from the heap, which
+  // self-healed to empty here — so the tree is empty too.
   auto idx = catalog.get_index_shared("idx_id");
   ASSERT_NE(idx, nullptr);
   EXPECT_FALSE(idx->index->find(1).has_value());
@@ -265,7 +266,13 @@ TEST(CatalogPersistence, CrashImageWithUnflushedPagesDoesNotHang) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// A post-DDL index root change is tracked by the manifest
+// A post-DDL index root change is tracked durably by the manifest
+//
+// Deliberately NO flush_all_pages and NO clean teardown before the reopen:
+// the first buffer pool is kept alive (its destructor would flush everything
+// and mask the bug) while a second, independent pool reopens the same files —
+// the crash image. The root-change callback's own flush + persist must be
+// what makes the reopened index work.
 // ─────────────────────────────────────────────────────────────────────────────
 
 TEST(CatalogPersistence, IndexRootChangeSurvivesReopen) {
@@ -273,31 +280,86 @@ TEST(CatalogPersistence, IndexRootChangeSurvivesReopen) {
   const std::string db_path = (dir.path() / "r.db").string();
   const std::string manifest_path = (dir.path() / "r.catalog").string();
 
+  auto disk = std::make_shared<DiskManager>(db_path);
+  auto buffer_pool = std::make_shared<BufferPoolManager>(64, disk);
+  Catalog catalog(buffer_pool, manifest_path);
+
+  ASSERT_TRUE(
+      catalog.create_table("events", Schema({Column("id", TypeId::INTEGER)}))
+          .ok());
+  ASSERT_TRUE(catalog.create_index("idx_ev", "events", "id").ok());
+
+  auto idx = catalog.get_index_shared("idx_ev");
+  ASSERT_NE(idx, nullptr);
+
+  // Insert enough keys directly into the tree to force root changes
+  // (creation, then a split) after create_index already persisted. Keys up
+  // to the last root change are durable via the callback's flush; later
+  // ones may live only in unflushed leaves.
+  page_id_t prev_root = idx->index->root_page_id();
+  int last_root_change_key = -1;
+  for (int i = 0; i < 600; ++i) {
+    ASSERT_TRUE(
+        idx->index->insert(i, RID(1, static_cast<slot_id_t>(i % 100))).ok());
+    if (idx->index->root_page_id() != prev_root) {
+      prev_root = idx->index->root_page_id();
+      last_root_change_key = i;
+    }
+  }
+  ASSERT_GT(last_root_change_key, 0) << "expected at least one root split";
+
+  // Simulated kill -9: reopen through a fresh disk manager + pool while the
+  // first pool still holds its unflushed frames.
+  {
+    auto disk2 = std::make_shared<DiskManager>(db_path);
+    auto buffer_pool2 = std::make_shared<BufferPoolManager>(64, disk2);
+    Catalog catalog2(buffer_pool2, manifest_path);
+
+    auto idx2 = catalog2.get_index_shared("idx_ev");
+    ASSERT_NE(idx2, nullptr);
+    for (int key : {0, last_root_change_key / 2, last_root_change_key}) {
+      EXPECT_TRUE(idx2->index->find(key).has_value()) << "missing key " << key;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A damaged index root is rebuilt from the intact heap on load
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(CatalogPersistence, DamagedIndexRootRebuildsFromHeap) {
+  test::TempDir dir("cat_rebuild_");
+  const std::string db_path = (dir.path() / "b.db").string();
+  const std::string manifest_path = (dir.path() / "b.catalog").string();
+
+  const Schema schema = make_users_schema();
+
   {
     auto disk = std::make_shared<DiskManager>(db_path);
     auto buffer_pool = std::make_shared<BufferPoolManager>(64, disk);
     Catalog catalog(buffer_pool, manifest_path);
 
-    ASSERT_TRUE(
-        catalog.create_table("events", Schema({Column("id", TypeId::INTEGER)}))
-            .ok());
-    ASSERT_TRUE(catalog.create_index("idx_ev", "events", "id").ok());
-
-    auto idx = catalog.get_index_shared("idx_ev");
-    ASSERT_NE(idx, nullptr);
-    const page_id_t root_before = idx->index->root_page_id();
-
-    // Insert enough keys directly into the tree to force root changes
-    // (creation, then a split) after create_index already persisted.
-    for (int i = 0; i < 600; ++i) {
-      ASSERT_TRUE(
-          idx->index
-              ->insert(i, RID(1, static_cast<slot_id_t>(i % 100)))
-              .ok());
+    ASSERT_TRUE(catalog.create_table("users", schema).ok());
+    auto info = catalog.get_table_shared("users");
+    for (int i = 1; i <= 5; ++i) {
+      std::vector<TupleValue> values = {
+          TupleValue(i), TupleValue(std::string("u") + std::to_string(i))};
+      Tuple tuple(values, schema);
+      RID rid;
+      ASSERT_TRUE(info->table_heap->insert_tuple(tuple, &rid).ok());
     }
-    ASSERT_NE(idx->index->root_page_id(), root_before);
-
+    ASSERT_TRUE(catalog.create_index("idx_id", "users", "id").ok());
     buffer_pool->flush_all_pages();
+  }
+
+  // Corrupt the durable manifest: point the index root at a page that does
+  // not exist (models the root page having been lost).
+  {
+    CatalogManifest manifest;
+    ASSERT_TRUE(CatalogManifest::load(manifest_path, &manifest).ok());
+    ASSERT_EQ(manifest.indexes.size(), 1u);
+    manifest.indexes[0].root_page_id = 1000;
+    ASSERT_TRUE(manifest.save(manifest_path).ok());
   }
 
   {
@@ -305,10 +367,10 @@ TEST(CatalogPersistence, IndexRootChangeSurvivesReopen) {
     auto buffer_pool = std::make_shared<BufferPoolManager>(64, disk);
     Catalog catalog(buffer_pool, manifest_path);
 
-    // Lookups only work if the manifest tracked the moved root.
-    auto idx = catalog.get_index_shared("idx_ev");
+    // The heap is intact, so the index is rebuilt rather than left empty.
+    auto idx = catalog.get_index_shared("idx_id");
     ASSERT_NE(idx, nullptr);
-    for (int key : {0, 251, 599}) {
+    for (int key = 1; key <= 5; ++key) {
       EXPECT_TRUE(idx->index->find(key).has_value()) << "missing key " << key;
     }
   }
