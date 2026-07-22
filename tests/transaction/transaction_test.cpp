@@ -1049,13 +1049,33 @@ TEST_F(AbortUndoTest, DeadlockVictimAbortFinalizesThroughManager) {
 
   // Cross-lock to deadlock. The younger transaction is the wait-die victim;
   // its thread receives Status::Aborted and calls TransactionManager::abort --
-  // the handoff under test.
+  // the handoff under test. The victim keeps its X lock on rid_b until that
+  // abort finishes undo, so the survivor acquires rid_b only AFTER the
+  // rollback: it must observe the restored row, then its own committed write
+  // must be what remains.
   Status older_status = Status::Ok();
   Status younger_status = Status::Ok();
+  std::vector<char> survivor_saw;  // rid_b bytes right after acquisition
+  bool survivor_updated = false;
+
+  Tuple gamma = make_tuple(2, "gamma");
 
   std::thread t_old([&] {
     older_status =
         lock_mgr_->lock_row(older, kTableOid, rid_b, LockMode::EXCLUSIVE);
+    if (older_status.ok()) {
+      // Read what the lock now protects, then overwrite it and log the write,
+      // exactly as a real writer would.
+      Tuple current;
+      if (table_heap_->get_tuple(rid_b, &current).ok()) {
+        survivor_saw.assign(current.data(), current.data() + current.size());
+      }
+      if (table_heap_->update_tuple(gamma, rid_b).ok()) {
+        tm_->log_update(older, kTableOid, rid_b, survivor_saw,
+                        tuple_bytes(gamma));
+        survivor_updated = true;
+      }
+    }
   });
   std::thread t_young([&] {
     // Let the older transaction block first so the cycle closes here.
@@ -1063,6 +1083,10 @@ TEST_F(AbortUndoTest, DeadlockVictimAbortFinalizesThroughManager) {
     younger_status =
         lock_mgr_->lock_row(younger, kTableOid, rid_a, LockMode::EXCLUSIVE);
     if (younger_status.code() == StatusCode::kAborted) {
+      // A real caller may do arbitrary work between the failed lock call and
+      // abort(); correctness must not depend on the abort being instantaneous.
+      // The victim's X lock on rid_b protects this whole window.
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
       tm_->abort(younger);
     }
   });
@@ -1073,11 +1097,15 @@ TEST_F(AbortUndoTest, DeadlockVictimAbortFinalizesThroughManager) {
   ASSERT_TRUE(older_status.ok())
       << "survivor must acquire the victim's lock: " << older_status.message();
 
-  // The victim's heap write was undone.
-  Tuple restored;
-  ASSERT_TRUE(table_heap_->get_tuple(rid_b, &restored).ok());
-  EXPECT_EQ(std::memcmp(restored.data(), row_b.data(), row_b.size()), 0)
-      << "Deadlock victim's write must be undone by TransactionManager::abort";
+  // The survivor's first read under the lock saw the victim's write already
+  // undone (undo-then-release ordering), never the aborted "beta2". A shrink
+  // via TablePage::update_record keeps the old slot length (internal
+  // fragmentation), so compare the restored prefix; the varchar length prefix
+  // inside those bytes distinguishes "beta" from "beta2".
+  ASSERT_GE(survivor_saw.size(), row_b.size());
+  EXPECT_EQ(std::memcmp(survivor_saw.data(), row_b.data(), row_b.size()), 0)
+      << "Survivor must never observe the victim's not-yet-rolled-back data";
+  ASSERT_TRUE(survivor_updated);
 
   // The victim left the active-transaction set.
   bool victim_active = false;
@@ -1098,8 +1126,15 @@ TEST_F(AbortUndoTest, DeadlockVictimAbortFinalizesThroughManager) {
   }
   EXPECT_TRUE(saw_abort) << "WAL must contain an ABORT record for the victim";
 
-  // Survivor commits normally and nothing leaks.
+  // Survivor commits; its committed write is what remains -- the victim's
+  // rollback must not have destroyed it.
   tm_->commit(older);
+  Tuple final_row;
+  ASSERT_TRUE(table_heap_->get_tuple(rid_b, &final_row).ok());
+  ASSERT_GE(final_row.size(), gamma.size());
+  EXPECT_EQ(std::memcmp(final_row.data(), gamma.data(), gamma.size()), 0)
+      << "Victim rollback must not clobber the survivor's committed write";
+
   EXPECT_EQ(tm_->active_transaction_count(), 0u);
   EXPECT_EQ(lock_mgr_->lock_table_size(), 0u);
 }

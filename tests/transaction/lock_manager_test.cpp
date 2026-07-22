@@ -7,6 +7,12 @@
  * counts. Every deadlock test uses a LONG lock timeout so that a resolution that
  * completes quickly proves the deadlock was broken by detection + victim release
  * (wait-die), not by the fallback wait timeout.
+ *
+ * Contract modeled by the victim threads: a wait-die victim KEEPS its granted
+ * locks when its lock call returns Aborted; TransactionManager::abort() then
+ * undoes its writes and releases the locks. These lock-manager-only tests model
+ * that finalization by calling release_all_locks from the victim's own thread
+ * right after the Aborted status (there are no writes to undo here).
  */
 
 #include <gtest/gtest.h>
@@ -59,6 +65,9 @@ TEST(LockManagerDeadlockTest, TwoTxnDeadlockYoungerAbortsSurvivorAcquiresFast) {
   });
   std::thread t_young([&] {
     younger_status = lock_mgr->lock_table(&younger, kResA, LockMode::EXCLUSIVE);
+    if (younger_status.code() == StatusCode::kAborted) {
+      lock_mgr->release_all_locks(&younger);  // model abort finalization
+    }
   });
   t_old.join();
   t_young.join();
@@ -172,6 +181,9 @@ TEST(LockManagerDeadlockTest, WaitDieNeverVictimizesOldest) {
     });
     std::thread t_young([&] {
       younger_status = lock_mgr->lock_table(&younger, kResA, LockMode::EXCLUSIVE);
+      if (younger_status.code() == StatusCode::kAborted) {
+        lock_mgr->release_all_locks(&younger);  // model abort finalization
+      }
     });
     t_old.join();
     t_young.join();
@@ -217,9 +229,15 @@ TEST(LockManagerDeadlockTest, OverlappingCyclesSharingResourceResolveFast) {
 
   std::thread t_b([&] {
     b_status = lock_mgr->lock_table(&b, kResB, LockMode::EXCLUSIVE);
+    if (b_status.code() == StatusCode::kAborted) {
+      lock_mgr->release_all_locks(&b);  // model abort finalization
+    }
   });
   std::thread t_d([&] {
     d_status = lock_mgr->lock_table(&d, kResD, LockMode::EXCLUSIVE);
+    if (d_status.code() == StatusCode::kAborted) {
+      lock_mgr->release_all_locks(&d);  // model abort finalization
+    }
   });
   std::thread t_a([&] {
     // Let B and D block first so BOTH cycles run through A's X request on the
