@@ -136,15 +136,59 @@ TEST_F(OptimizerTest, CollectStatisticsManyColumns) {
     ASSERT_NE(it, stats->columns.end()) << "missing stats for column " << c;
     const ColumnStatistics &cs = it->second;
     if (c == kNullColumn) {
-      // All-null column: no distinct non-null values, null_fraction == 1.0.
+      // All-null column: no distinct non-null values, null_fraction == 1.0,
+      // and no min/max were observed.
       EXPECT_DOUBLE_EQ(cs.null_fraction, 1.0) << "column " << c;
       EXPECT_DOUBLE_EQ(cs.distinct_values, 0.0) << "column " << c;
+      EXPECT_FALSE(cs.min_value.has_value()) << "column " << c;
+      EXPECT_FALSE(cs.max_value.has_value()) << "column " << c;
     } else {
-      // Non-null column: distinct_estimates == row_count, scaled by 0.9.
+      // Non-null column: every row holds a distinct value (r*100 + c), so the
+      // exact distinct-value count is kNumRows (not the old ~0.9 * rows fudge),
+      // with min at r=0 and max at r=kNumRows-1.
       EXPECT_DOUBLE_EQ(cs.null_fraction, 0.0) << "column " << c;
-      EXPECT_DOUBLE_EQ(cs.distinct_values, kNumRows * 0.9) << "column " << c;
+      EXPECT_DOUBLE_EQ(cs.distinct_values, static_cast<double>(kNumRows))
+          << "column " << c;
+      ASSERT_TRUE(cs.min_value.has_value()) << "column " << c;
+      ASSERT_TRUE(cs.max_value.has_value()) << "column " << c;
+      EXPECT_EQ(cs.min_value->as_integer(), static_cast<int>(c)) << "column "
+                                                                 << c;
+      EXPECT_EQ(cs.max_value->as_integer(),
+                (kNumRows - 1) * 100 + static_cast<int>(c))
+          << "column " << c;
     }
   }
+}
+
+// Issue #12: NDV was computed as 0.9 * non_null_rows, so a low-cardinality
+// column over many rows reported a nonsensically high distinct count (e.g. a
+// boolean over 1M rows -> ~900k). NDV must reflect the true distinct count.
+TEST_F(OptimizerTest, NdvReflectsTrueDistinctCount) {
+  Schema flags_schema({
+      Column("id", TypeId::INTEGER),
+      Column("flag", TypeId::INTEGER), // only two distinct values (0/1)
+  });
+  ASSERT_TRUE(catalog_->create_table("flags", flags_schema).ok());
+  TableInfo *flags_info = catalog_->get_table("flags");
+  ASSERT_NE(flags_info, nullptr);
+
+  constexpr int kRows = 200;
+  for (int i = 0; i < kRows; ++i) {
+    std::vector<TupleValue> values = {TupleValue(i), TupleValue(i % 2)};
+    Tuple tuple(values, flags_schema);
+    RID rid;
+    ASSERT_TRUE(flags_info->table_heap->insert_tuple(tuple, &rid).ok());
+  }
+
+  statistics_->collect_statistics(flags_info->oid);
+  const auto *stats = statistics_->get_table_stats(flags_info->oid);
+  ASSERT_NE(stats, nullptr);
+  EXPECT_EQ(stats->row_count, static_cast<size_t>(kRows));
+
+  // id is unique -> NDV == kRows; flag has exactly 2 distinct values.
+  EXPECT_DOUBLE_EQ(stats->columns.at(0).distinct_values,
+                   static_cast<double>(kRows));
+  EXPECT_DOUBLE_EQ(stats->columns.at(1).distinct_values, 2.0);
 }
 
 TEST_F(OptimizerTest, PredicateSelectivity) {
