@@ -19,6 +19,14 @@ Status Parser::parse(std::unique_ptr<Statement> *result) {
   }
 
   has_error_ = false;
+
+  // The first token is fetched in the constructor, bypassing advance()'s lex
+  // error check, so validate it here before parsing begins.
+  if (current_.type == TokenType::INVALID) {
+    set_error("Lex error: " + current_.value);
+    return Status::InvalidArgument(error_.to_string());
+  }
+
   auto stmt = parse_statement();
 
   if (has_error_) {
@@ -45,7 +53,15 @@ Token Parser::current_token() { return current_; }
 
 Token Parser::peek_token() { return lexer_.peek_token(); }
 
-void Parser::advance() { current_ = lexer_.next_token(); }
+void Parser::advance() {
+  current_ = lexer_.next_token();
+  // An INVALID token is a lex error (unterminated string/comment, stray
+  // character). Surface it immediately with the lexer's message so it wins over
+  // any later, less specific parser error. set_error keeps the first error.
+  if (current_.type == TokenType::INVALID) {
+    set_error("Lex error: " + current_.value);
+  }
+}
 
 bool Parser::check(TokenType type) { return current_.type == type; }
 
@@ -127,7 +143,10 @@ std::unique_ptr<Statement> Parser::parse_statement() {
     if (check(TokenType::TABLE)) {
       return parse_create_table();
     }
-    set_error("Expected TABLE after CREATE");
+    if (check(TokenType::INDEX)) {
+      return parse_create_index();
+    }
+    set_error("Expected TABLE or INDEX after CREATE");
     return nullptr;
   }
   if (check(TokenType::DROP)) {
@@ -135,7 +154,10 @@ std::unique_ptr<Statement> Parser::parse_statement() {
     if (check(TokenType::TABLE)) {
       return parse_drop_table();
     }
-    set_error("Expected TABLE after DROP");
+    if (check(TokenType::INDEX)) {
+      return parse_drop_index();
+    }
+    set_error("Expected TABLE or INDEX after DROP");
     return nullptr;
   }
   if (check(TokenType::EXPLAIN)) {
@@ -337,7 +359,17 @@ std::unique_ptr<InsertStatement> Parser::parse_insert() {
   if (match(TokenType::LPAREN)) {
     do {
       if (check(TokenType::IDENTIFIER)) {
-        stmt->columns.push_back(current_.value);
+        std::string name = current_.value;
+        // Reject duplicate column names in the target list: a column would
+        // otherwise be assigned twice with no clear semantics.
+        for (const auto &existing : stmt->columns) {
+          if (existing == name) {
+            set_error("Duplicate column name '" + name +
+                      "' in INSERT column list");
+            return nullptr;
+          }
+        }
+        stmt->columns.push_back(std::move(name));
         advance();
       } else {
         set_error("Expected column name");
@@ -504,6 +536,15 @@ std::unique_ptr<CreateTableStatement> Parser::parse_create_table() {
       col.nullable = false;
     }
 
+    // Reject duplicate column names: the second definition would otherwise be
+    // silently unreachable.
+    for (const auto &existing : stmt->columns) {
+      if (existing.name == col.name) {
+        set_error("Duplicate column name '" + col.name + "' in CREATE TABLE");
+        return nullptr;
+      }
+    }
+
     stmt->columns.push_back(col);
   } while (match(TokenType::COMMA));
 
@@ -523,6 +564,75 @@ std::unique_ptr<DropTableStatement> Parser::parse_drop_table() {
   } else {
     set_error("Expected table name after DROP TABLE");
     return nullptr;
+  }
+
+  match(TokenType::SEMICOLON);
+  return stmt;
+}
+
+std::unique_ptr<CreateIndexStatement> Parser::parse_create_index() {
+  auto stmt = std::make_unique<CreateIndexStatement>();
+  expect(TokenType::INDEX, "Expected INDEX");
+
+  // Index name
+  if (check(TokenType::IDENTIFIER)) {
+    stmt->index_name = current_.value;
+    advance();
+  } else {
+    set_error("Expected index name after CREATE INDEX");
+    return nullptr;
+  }
+
+  expect(TokenType::ON, "Expected ON after index name");
+
+  // Table name
+  if (check(TokenType::IDENTIFIER)) {
+    stmt->table_name = current_.value;
+    advance();
+  } else {
+    set_error("Expected table name after ON");
+    return nullptr;
+  }
+
+  // Key column list
+  expect(TokenType::LPAREN, "Expected ( before index columns");
+  do {
+    if (check(TokenType::IDENTIFIER)) {
+      stmt->columns.push_back(current_.value);
+      advance();
+    } else {
+      set_error("Expected column name in index key list");
+      return nullptr;
+    }
+  } while (match(TokenType::COMMA));
+  expect(TokenType::RPAREN, "Expected )");
+
+  match(TokenType::SEMICOLON);
+  return stmt;
+}
+
+std::unique_ptr<DropIndexStatement> Parser::parse_drop_index() {
+  auto stmt = std::make_unique<DropIndexStatement>();
+  expect(TokenType::INDEX, "Expected INDEX");
+
+  // Index name
+  if (check(TokenType::IDENTIFIER)) {
+    stmt->index_name = current_.value;
+    advance();
+  } else {
+    set_error("Expected index name after DROP INDEX");
+    return nullptr;
+  }
+
+  // Optional ON table (MySQL-style DROP INDEX name ON table)
+  if (match(TokenType::ON)) {
+    if (check(TokenType::IDENTIFIER)) {
+      stmt->table_name = current_.value;
+      advance();
+    } else {
+      set_error("Expected table name after ON");
+      return nullptr;
+    }
   }
 
   match(TokenType::SEMICOLON);
@@ -742,7 +852,41 @@ TypeId Parser::parse_data_type(size_t *length_out) {
     type = TypeId::FLOAT;
   } else if (match(TokenType::DOUBLE)) {
     type = TypeId::DOUBLE;
-  } else if (match(TokenType::VARCHAR) || match(TokenType::TEXT)) {
+  } else if (match(TokenType::TIMESTAMP) || match(TokenType::DATE)) {
+    // The engine has a single date/time type (TIMESTAMP). DATE is accepted as a
+    // synonym so it is declarable from SQL rather than rejected outright.
+    type = TypeId::TIMESTAMP;
+  } else if (match(TokenType::DECIMAL)) {
+    type = TypeId::DECIMAL;
+    // Accept optional precision/scale: DECIMAL(p) or DECIMAL(p, s). Storage is a
+    // fixed-width slot, so the values are validated for form and consumed; the
+    // precision/scale are not yet carried into the column metadata.
+    if (match(TokenType::LPAREN)) {
+      uint64_t ignored = 0;
+      if (!check(TokenType::INTEGER_LITERAL)) {
+        set_error("Expected precision in DECIMAL(precision[, scale])");
+        return type;
+      }
+      if (!to_uint64(current_.value, &ignored)) {
+        return type;
+      }
+      advance();
+      if (match(TokenType::COMMA)) {
+        if (!check(TokenType::INTEGER_LITERAL)) {
+          set_error("Expected scale in DECIMAL(precision, scale)");
+          return type;
+        }
+        if (!to_uint64(current_.value, &ignored)) {
+          return type;
+        }
+        advance();
+      }
+      expect(TokenType::RPAREN, "Expected )");
+    }
+  } else if (match(TokenType::VARCHAR) || match(TokenType::TEXT) ||
+             match(TokenType::CHAR)) {
+    // CHAR maps onto the engine's VARCHAR representation (there is no separate
+    // fixed-length character type); both accept an optional length.
     type = TypeId::VARCHAR;
     // Parse optional length: VARCHAR(100)
     if (match(TokenType::LPAREN)) {

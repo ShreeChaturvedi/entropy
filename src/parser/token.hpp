@@ -80,6 +80,10 @@ enum class TokenType {
   TEXT,
   FLOAT,
   DOUBLE,
+  DECIMAL,
+  TIMESTAMP,
+  DATE,
+  CHAR,
 
   // Symbols
   LPAREN,    // (
@@ -140,7 +144,7 @@ struct Token {
   [[nodiscard]] bool is(TokenType t) const noexcept { return type == t; }
 
   [[nodiscard]] bool is_keyword() const noexcept {
-    return type >= TokenType::CREATE && type <= TokenType::DOUBLE;
+    return type >= TokenType::CREATE && type <= TokenType::CHAR;
   }
 
   [[nodiscard]] bool is_literal() const noexcept {
@@ -223,6 +227,11 @@ private:
   size_t pos_ = 0;
   size_t line_ = 1;
   size_t column_ = 1;
+
+  // Set when a block comment runs to EOF without a closing "*/". The next
+  // next_token() surfaces this as an INVALID token so the parser can report a
+  // lex error instead of silently swallowing the rest of the input.
+  bool unterminated_comment_ = false;
 
   // Cached peek token
   bool has_peeked_ = false;
