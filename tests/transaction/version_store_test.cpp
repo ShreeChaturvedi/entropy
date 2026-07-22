@@ -414,6 +414,51 @@ TEST_F(VersionStoreTest, ConcurrentReadVisibleAndGcStayConsistent) {
   EXPECT_EQ(bad.load(), 0) << "a reader observed a torn before-image";
 }
 
+// A stream of committing transactions finalizes versions (unique-lock mutation
+// of the chain map) while readers concurrently read a stable committed row. The
+// readers must always observe that row's committed value — never a torn read or
+// a corrupted map traversal.
+TEST_F(VersionStoreTest, ConcurrentFinalizeAndReadStayConsistent) {
+  Transaction base_creator(1);
+  ASSERT_TRUE(store_.on_insert(&base_creator, rid_).ok());
+  store_.finalize(&base_creator, 2); // rid_ committed and stable
+  const std::string base = "BASE";
+
+  std::atomic<bool> stop{false};
+  std::atomic<int> bad{0};
+
+  std::vector<std::thread> readers;
+  for (int i = 0; i < 3; ++i) {
+    readers.emplace_back([&] {
+      Transaction reader(500);
+      while (!stop.load(std::memory_order_relaxed)) {
+        auto v = store_.read_visible(rid_, span_of(base), &reader);
+        if (!v.has_value() || bytes_of(*v) != base) {
+          bad.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    });
+  }
+
+  std::thread writer([&] {
+    for (int i = 0; i < 4000; ++i) {
+      RID other{10, static_cast<slot_id_t>(i % 200)};
+      Transaction w(static_cast<txn_id_t>(1000 + i));
+      if (store_.on_insert(&w, other).ok()) {
+        store_.finalize(&w, static_cast<uint64_t>(3 + i));
+      }
+    }
+    stop.store(true, std::memory_order_relaxed);
+  });
+
+  writer.join();
+  for (auto &t : readers) {
+    t.join();
+  }
+
+  EXPECT_EQ(bad.load(), 0) << "a reader observed a torn / corrupted value";
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MVCCManager creator/deleter distinction (#27)
 // ─────────────────────────────────────────────────────────────────────────────
