@@ -30,7 +30,7 @@ class ExecutorTest : public ::testing::Test {
 protected:
   void SetUp() override {
     temp_file_ = std::make_unique<test::TempFile>("exec_test_");
-    disk_manager_ = std::make_shared<DiskManager>(temp_file_->string());
+    disk_manager_ = std::make_shared<FileDiskManager>(temp_file_->string());
     buffer_pool_ = std::make_shared<BufferPoolManager>(20, disk_manager_);
     catalog_ = std::make_unique<Catalog>(buffer_pool_);
 
@@ -468,7 +468,7 @@ class JoinTest : public ::testing::Test {
 protected:
   void SetUp() override {
     temp_file_ = std::make_unique<test::TempFile>("join_test_");
-    disk_manager_ = std::make_shared<DiskManager>(temp_file_->string());
+    disk_manager_ = std::make_shared<FileDiskManager>(temp_file_->string());
     buffer_pool_ = std::make_shared<BufferPoolManager>(20, disk_manager_);
     catalog_ = std::make_unique<Catalog>(buffer_pool_);
 
@@ -665,7 +665,7 @@ class AggregationTest : public ::testing::Test {
 protected:
   void SetUp() override {
     temp_file_ = std::make_unique<test::TempFile>("agg_test_");
-    disk_manager_ = std::make_shared<DiskManager>(temp_file_->string());
+    disk_manager_ = std::make_shared<FileDiskManager>(temp_file_->string());
     buffer_pool_ = std::make_shared<BufferPoolManager>(20, disk_manager_);
     catalog_ = std::make_unique<Catalog>(buffer_pool_);
 
@@ -1404,7 +1404,7 @@ class IndexScanTest : public ::testing::Test {
 protected:
   void SetUp() override {
     temp_file_ = std::make_unique<test::TempFile>("index_scan_test");
-    disk_manager_ = std::make_shared<DiskManager>(temp_file_->string());
+    disk_manager_ = std::make_shared<FileDiskManager>(temp_file_->string());
     buffer_pool_ = std::make_shared<BufferPoolManager>(16, disk_manager_);
     catalog_ = std::make_unique<Catalog>(buffer_pool_);
 

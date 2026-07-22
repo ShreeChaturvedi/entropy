@@ -850,7 +850,7 @@ protected:
     db_file_ = test_dir_ / "data.db";
     wal_file_ = test_dir_ / "test.wal";
 
-    disk_manager_ = std::make_shared<DiskManager>(db_file_.string());
+    disk_manager_ = std::make_shared<FileDiskManager>(db_file_.string());
     buffer_pool_ = std::make_shared<BufferPoolManager>(16, disk_manager_);
     table_heap_ = std::make_shared<TableHeap>(buffer_pool_);
 
