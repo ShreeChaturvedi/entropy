@@ -237,6 +237,13 @@ Token Lexer::next_token() {
 
   skip_whitespace();
 
+  // A block comment that ran to EOF without a closing "*/" is a lex error, not
+  // a silent end-of-input.
+  if (unterminated_comment_) {
+    return Token(TokenType::INVALID, "Unterminated block comment", line_,
+                 column_);
+  }
+
   if (pos_ >= sql_.size()) {
     return make_token(TokenType::END_OF_FILE, "");
   }
@@ -328,10 +335,12 @@ void Lexer::skip_block_comment() {
     if (current_char() == '*' && peek_char() == '/') {
       advance();
       advance();
-      break;
+      return;
     }
     advance();
   }
+  // Reached EOF without a closing "*/": flag it so next_token() emits an error.
+  unterminated_comment_ = true;
 }
 
 Token Lexer::scan_identifier_or_keyword() {
@@ -394,6 +403,7 @@ Token Lexer::scan_string() {
   advance(); // Skip opening quote
 
   std::string value;
+  bool terminated = false;
   while (pos_ < sql_.size()) {
     char c = current_char();
     if (c == quote) {
@@ -404,6 +414,7 @@ Token Lexer::scan_string() {
         advance();
       } else {
         advance(); // Skip closing quote
+        terminated = true;
         break;
       }
     } else if (c == '\\') {
@@ -438,6 +449,13 @@ Token Lexer::scan_string() {
       value += c;
       advance();
     }
+  }
+
+  // Running off the end before the closing quote is a lex error, not a
+  // silently-accepted string.
+  if (!terminated) {
+    return Token(TokenType::INVALID, "Unterminated string literal", line_,
+                 start_col);
   }
 
   return Token(TokenType::STRING_LITERAL, value, line_, start_col);

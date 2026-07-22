@@ -224,6 +224,11 @@ private:
   size_t line_ = 1;
   size_t column_ = 1;
 
+  // Set when a block comment runs to EOF without a closing "*/". The next
+  // next_token() surfaces this as an INVALID token so the parser can report a
+  // lex error instead of silently swallowing the rest of the input.
+  bool unterminated_comment_ = false;
+
   // Cached peek token
   bool has_peeked_ = false;
   Token peeked_token_;
