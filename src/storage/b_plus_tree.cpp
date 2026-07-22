@@ -14,7 +14,7 @@ namespace entropy {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void BPlusTree::change_root(page_id_t new_root_id) {
-    root_page_id_ = new_root_id;
+    root_page_id_.store(new_root_id, std::memory_order_relaxed);
     if (root_change_callback_) {
         root_change_callback_(new_root_id);
     }
@@ -36,19 +36,20 @@ BPlusTree::BPlusTree(std::shared_ptr<BufferPoolManager> buffer_pool,
     , internal_max_size_(internal_max_size) {}
 
 bool BPlusTree::is_empty() const {
-    if (root_page_id_ == INVALID_PAGE_ID) {
+    const page_id_t root = root_page_id();
+    if (root == INVALID_PAGE_ID) {
         return true;
     }
 
     // Check if root page has any keys
-    Page* page = buffer_pool_->fetch_page(root_page_id_);
+    Page* page = buffer_pool_->fetch_page(root);
     if (page == nullptr) {
         return true;
     }
 
     BPTreePage bp_page(page);
     uint32_t num_keys = bp_page.num_keys();
-    buffer_pool_->unpin_page(root_page_id_, false);
+    buffer_pool_->unpin_page(root, false);
 
     return num_keys == 0;
 }
@@ -58,11 +59,10 @@ bool BPlusTree::is_empty() const {
 // ─────────────────────────────────────────────────────────────────────────────
 
 page_id_t BPlusTree::find_leaf(KeyType key) {
-    if (root_page_id_ == INVALID_PAGE_ID) {
+    page_id_t current_page_id = root_page_id();
+    if (current_page_id == INVALID_PAGE_ID) {
         return INVALID_PAGE_ID;
     }
-
-    page_id_t current_page_id = root_page_id_;
 
     while (true) {
         Page* page = buffer_pool_->fetch_page(current_page_id);
@@ -133,7 +133,7 @@ Page* BPlusTree::create_internal_page(page_id_t* page_id) {
 
 Status BPlusTree::insert(KeyType key, const ValueType& value) {
     // Case 1: Empty tree - create root as leaf
-    if (root_page_id_ == INVALID_PAGE_ID) {
+    if (root_page_id() == INVALID_PAGE_ID) {
         page_id_t new_root_id;
         Page* root_page = create_leaf_page(&new_root_id);
         if (root_page == nullptr) {
@@ -775,13 +775,14 @@ BPlusTree::range_scan(KeyType start_key, KeyType end_key) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Page Reclamation
+// Whole-tree Maintenance
 // ─────────────────────────────────────────────────────────────────────────────
 
-Status BPlusTree::reclaim_all_pages() {
+std::vector<page_id_t> BPlusTree::collect_tree_pages() {
+    std::vector<page_id_t> pages;
     std::vector<page_id_t> pending;
-    if (root_page_id_ != INVALID_PAGE_ID) {
-        pending.push_back(root_page_id_);
+    if (root_page_id() != INVALID_PAGE_ID) {
+        pending.push_back(root_page_id());
     }
 
     // Iterative traversal; the visited set makes the walk terminate even on a
@@ -806,18 +807,36 @@ Status BPlusTree::reclaim_all_pages() {
                 pending.push_back(internal.child_at(i));
             }
         } else if (!node.is_leaf()) {
-            // Not an intact index page — never free what we do not own.
+            // Not an intact index page — not ours to touch.
             buffer_pool_->unpin_page(page_id, false);
             continue;
         }
         buffer_pool_->unpin_page(page_id, false);
+        pages.push_back(page_id);
+    }
+
+    return pages;
+}
+
+Status BPlusTree::reclaim_all_pages() {
+    for (page_id_t page_id : collect_tree_pages()) {
         buffer_pool_->delete_page(page_id);
     }
 
     // Bypass change_root deliberately: the caller is destroying the tree and
     // persists the removal itself (firing the callback here could deadlock a
     // caller that already holds its own lock).
-    root_page_id_ = INVALID_PAGE_ID;
+    root_page_id_.store(INVALID_PAGE_ID, std::memory_order_relaxed);
+    return Status::Ok();
+}
+
+Status BPlusTree::flush_all_pages() {
+    for (page_id_t page_id : collect_tree_pages()) {
+        if (!buffer_pool_->flush_page(page_id)) {
+            return Status::IOError("Failed to flush index page " +
+                                   std::to_string(page_id));
+        }
+    }
     return Status::Ok();
 }
 
@@ -856,12 +875,11 @@ BPlusTreeIterator BPlusTree::lower_bound(KeyType key) {
 }
 
 BPlusTreeIterator BPlusTree::begin() {
-    if (root_page_id_ == INVALID_PAGE_ID) {
+    // Find the leftmost leaf
+    page_id_t current = root_page_id();
+    if (current == INVALID_PAGE_ID) {
         return end();
     }
-
-    // Find the leftmost leaf
-    page_id_t current = root_page_id_;
 
     while (true) {
         Page* page = buffer_pool_->fetch_page(current);
