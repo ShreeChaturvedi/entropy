@@ -1931,6 +1931,157 @@ TEST_F(RecoveryTest, UndoSkipsSlotReusedByCommittedTransaction) {
   EXPECT_EQ(*r, bytes("BBBB"));
 }
 
+TEST_F(RecoveryTest, WarmPoolRetryFlushesCompensationBeforeAbort) {
+  // A first recover() may apply compensations in-pool and then fail the page
+  // flush transiently (error returned, no ABORT appended - correct). A retry
+  // on the same warm pool applies nothing (the state-checked undo skips every
+  // op), but it must STILL flush the loser's page before making any ABORT
+  // durable, or the compensation dies with the pool while the durable ABORT
+  // removes the transaction from every future loser set.
+  lsn_t insert_lsn = INVALID_LSN;
+  {
+    WALManager wal(wal_file_.string());
+    auto begin = LogRecord::make_begin(9);
+    [[maybe_unused]] lsn_t lsn = wal.append_log(begin);
+    auto insert =
+        LogRecord::make_insert(9, begin.lsn(), 10, RID(0, 0), bytes("loser-row"));
+    insert_lsn = wal.append_log(insert);
+    ASSERT_NE(insert_lsn, INVALID_LSN);
+    // No commit - crash simulation.
+    (void)wal.flush();
+  }
+
+  // Disk: stolen page holding the uncommitted row (page_lsn = insert LSN).
+  {
+    auto setup_pool = make_buffer_pool();
+    Page *page = setup_pool->fetch_page(0);
+    ASSERT_NE(page, nullptr);
+    TablePage table_page(page);
+    table_page.init();
+    const std::vector<char> row = bytes("loser-row");
+    auto slot =
+        table_page.insert_record(row.data(), static_cast<uint16_t>(row.size()));
+    ASSERT_TRUE(slot.has_value());
+    ASSERT_EQ(*slot, 0u);
+    page->set_lsn(insert_lsn);
+    setup_pool->unpin_page(0, true);
+    ASSERT_TRUE(setup_pool->flush_page(0));
+  }
+
+  // Warm pool exactly as a failed first recovery leaves it: the compensation
+  // applied in-pool (row deleted, page dirty) but never flushed to disk.
+  auto pool = make_buffer_pool();
+  {
+    Page *page = pool->fetch_page(0);
+    ASSERT_NE(page, nullptr);
+    TablePage table_page(page);
+    ASSERT_TRUE(table_page.delete_record(0));
+    pool->unpin_page(0, true);
+  }
+
+  auto disk_row_present = [this]() {
+    auto probe_disk = std::make_shared<DiskManager>(db_file_.string());
+    BufferPoolManager probe_pool(4, probe_disk);
+    Page *page = probe_pool.fetch_page(0);
+    EXPECT_NE(page, nullptr);
+    TablePage table_page(page);
+    const bool present = !table_page.get_record(0).empty();
+    probe_pool.unpin_page(0, false);
+    return present;
+  };
+  ASSERT_TRUE(disk_row_present());
+
+  // Ordering probe: the only WAL sync during this recover() is the one that
+  // makes the ABORT durable; at that moment the compensation must already be
+  // on disk.
+  auto wal = std::make_shared<WALManager>(wal_file_.string());
+  bool abort_sync_seen = false;
+  bool compensated_at_abort_sync = false;
+  wal->set_sync_hook_for_testing([&]() -> Status {
+    abort_sync_seen = true;
+    compensated_at_abort_sync = !disk_row_present();
+    return Status::Ok();
+  });
+
+  RecoveryManager recovery(pool, wal, disk_manager_);
+  ASSERT_TRUE(recovery.recover().ok());
+
+  // The retry applied nothing, yet the compensation reached disk before the
+  // ABORT became durable.
+  EXPECT_EQ(recovery.undo_count(), 0u);
+  EXPECT_TRUE(abort_sync_seen);
+  EXPECT_TRUE(compensated_at_abort_sync);
+  EXPECT_FALSE(disk_row_present());
+}
+
+TEST_F(RecoveryTest, UndoInsertSkipsLongerCommittedRowSharingPrefix) {
+  // Loser T1 inserts "AB" at (0,0) and deletes it; committed T2 reuses the
+  // slot with "ABxy". A prefix match would mistake T2's longer row for T1's
+  // insert and destroy committed data; the exact-length check must skip it.
+  {
+    WALManager wal(wal_file_.string());
+
+    auto begin1 = LogRecord::make_begin(1);
+    [[maybe_unused]] lsn_t lsn = wal.append_log(begin1);
+    auto insert1 =
+        LogRecord::make_insert(1, begin1.lsn(), 10, RID(0, 0), bytes("AB"));
+    lsn = wal.append_log(insert1);
+    auto delete1 =
+        LogRecord::make_delete(1, insert1.lsn(), 10, RID(0, 0), bytes("AB"));
+    lsn = wal.append_log(delete1);
+    // No commit for T1 - loser.
+
+    auto begin2 = LogRecord::make_begin(2);
+    lsn = wal.append_log(begin2);
+    auto insert2 =
+        LogRecord::make_insert(2, begin2.lsn(), 10, RID(0, 0), bytes("ABxy"));
+    lsn = wal.append_log(insert2);
+    auto commit2 = LogRecord::make_commit(2, insert2.lsn());
+    lsn = wal.append_log(commit2);
+
+    (void)wal.flush();
+  }
+
+  auto pool = make_buffer_pool();
+  auto wal = std::make_shared<WALManager>(wal_file_.string());
+  RecoveryManager recovery(pool, wal, disk_manager_);
+
+  ASSERT_TRUE(recovery.recover().ok());
+  EXPECT_EQ(recovery.undo_count(), 0u);
+
+  auto r = record_at(*pool, RID(0, 0));
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(*r, bytes("ABxy"));
+}
+
+TEST_F(RecoveryTest, UndoRemovesGrownLoserRow) {
+  // Loser inserts a small row then grows it via UPDATE (the before-image is a
+  // prefix of the after-image, the nastiest length case). Undo must restore
+  // the before-image with its exact length and then remove the insert
+  // entirely - the exact-length INSERT check may not strand the row.
+  {
+    WALManager wal(wal_file_.string());
+    auto begin = LogRecord::make_begin(3);
+    [[maybe_unused]] lsn_t lsn = wal.append_log(begin);
+    auto insert =
+        LogRecord::make_insert(3, begin.lsn(), 10, RID(0, 0), bytes("AB"));
+    lsn = wal.append_log(insert);
+    auto update = LogRecord::make_update(3, insert.lsn(), 10, RID(0, 0),
+                                         bytes("AB"), bytes("ABCDEFGH"));
+    lsn = wal.append_log(update);
+    // No commit - crash simulation.
+    (void)wal.flush();
+  }
+
+  auto pool = make_buffer_pool();
+  auto wal = std::make_shared<WALManager>(wal_file_.string());
+  RecoveryManager recovery(pool, wal, disk_manager_);
+
+  ASSERT_TRUE(recovery.recover().ok());
+  EXPECT_EQ(recovery.undo_count(), 2u);
+  EXPECT_FALSE(record_at(*pool, RID(0, 0)).has_value());
+}
+
 TEST_F(RecoveryTest, RedoReinsertsIntoReusedSlot) {
   // Delete then re-insert at the same RID pre-crash: redo must reproduce the
   // slot reuse exactly (insert_record_at into the emptied slot), leaving the
