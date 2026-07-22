@@ -162,6 +162,41 @@ TEST_F(TablePageTest, UpdateRecordSmaller) {
     EXPECT_STREQ(record.data(), updated);
 }
 
+// Regression test for issue #7: an in-place shrink update must record the new
+// (smaller) logical length in the slot. Otherwise get_record returns stale
+// trailing bytes from the old record and Tuple.size() over-reports the length.
+// The existing UpdateRecordSmaller test misses this because EXPECT_STREQ stops
+// at the NUL terminator; here we assert the exact reported length and that the
+// freed bytes are reclaimed by compaction.
+TEST_F(TablePageTest, UpdateRecordShrinkReportsNewLength) {
+    const std::string original(50, 'A');
+    auto slot = table_page_->insert_record(
+        original.data(), static_cast<uint16_t>(original.size()));
+    ASSERT_TRUE(slot.has_value());
+
+    const std::string shorter(20, 'B');
+    ASSERT_TRUE(table_page_->update_record(
+        slot.value(), shorter.data(), static_cast<uint16_t>(shorter.size())));
+
+    // Re-read must return exactly the new bytes, no stale trailing content.
+    auto rec = table_page_->get_record(slot.value());
+    ASSERT_EQ(rec.size(), shorter.size());
+    EXPECT_EQ(std::string(rec.data(), rec.size()), shorter);
+
+    // The bytes freed by the shrink are an internal hole until compact(), after
+    // which they must be reclaimed into contiguous free space exactly.
+    const uint16_t free_before_compact = table_page_->get_free_space();
+    table_page_->compact();
+    const uint16_t free_after_compact = table_page_->get_free_space();
+    EXPECT_EQ(free_after_compact - free_before_compact,
+              static_cast<uint16_t>(original.size() - shorter.size()));
+
+    // Content survives compaction unchanged and still reports the new length.
+    auto rec2 = table_page_->get_record(slot.value());
+    ASSERT_EQ(rec2.size(), shorter.size());
+    EXPECT_EQ(std::string(rec2.data(), rec2.size()), shorter);
+}
+
 TEST_F(TablePageTest, UpdateRecordLarger) {
     const char original[] = "Short";
     auto slot_id = table_page_->insert_record(original, sizeof(original));
