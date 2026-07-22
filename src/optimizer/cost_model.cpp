@@ -99,10 +99,12 @@ size_t CostModel::estimate_cardinality(const PlanNode *plan) const {
 
   case PlanNodeType::FILTER: {
     // Selectivity depends on the actual predicate, not a fixed 0.1. A filter
-    // node has no table context, so equality falls back to predicate-type
-    // defaults; a scan-level predicate (handled above) can still use 1/NDV.
+    // node has no table context (INVALID_OID), so equality falls back to
+    // predicate-type defaults; a scan-level predicate (handled above) can still
+    // use 1/NDV.
     auto *filter = static_cast<const FilterPlanNode *>(plan);
-    double sel = statistics_->estimate_selectivity(0, filter->predicate());
+    double sel =
+        statistics_->estimate_selectivity(INVALID_OID, filter->predicate());
     return static_cast<size_t>(static_cast<double>(child_card) * sel);
   }
 
