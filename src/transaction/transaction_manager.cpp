@@ -113,6 +113,11 @@ void TransactionManager::abort(Transaction* txn) {
         return;
     }
 
+    // Consume the mark: finalization runs exactly once. A stray second abort()
+    // on a still-live victim object then sees ABORTED without the mark and is
+    // a no-op instead of appending a duplicate WAL ABORT record.
+    txn->clear_aborted_by_deadlock();
+
     // Undo all modifications in reverse order using the write set
     const auto& write_set = txn->write_set();
     for (auto it = write_set.rbegin(); it != write_set.rend(); ++it) {
@@ -132,7 +137,9 @@ void TransactionManager::abort(Transaction* txn) {
     // Update state
     txn->set_state(TransactionState::ABORTED);
 
-    // Release locks after undo so concurrent writers stay blocked during rollback
+    // Release locks after undo so concurrent writers stay blocked during
+    // rollback. Deadlock victims keep their granted locks through the lock
+    // manager's wait-loop exit precisely so this ordering holds for them too.
     if (lock_manager_ != nullptr) {
         lock_manager_->release_all_locks(txn);
     }
