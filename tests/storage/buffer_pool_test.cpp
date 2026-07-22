@@ -239,6 +239,53 @@ TEST(BufferPoolWalHookTest, HookErrorVetoesPageWrite) {
     EXPECT_EQ(dm->events[2].lsn, 99u);
 }
 
+// Regression: when an eviction flush fails, the victim frame must be returned
+// to the replacer, not the free list. The old code pushed it to the free list
+// while its page id still mapped to that frame; a later new_page could then pop
+// the same frame and reset() it even though a re-fetch had pinned the page,
+// corrupting live data under the pin. A transient WAL-flush-hook failure makes
+// the eviction flush fail in normal operation.
+TEST(BufferPoolEvictionFailureTest, FailedEvictionKeepsVictimFrameOutOfFreeList) {
+    auto dm = std::make_shared<RecordingDiskManager>();
+    BufferPoolManager bpm(/*pool_size=*/1, dm);
+
+    // Page 0: sentinel byte, dirty, unpinned -> the single evictable frame.
+    page_id_t p0;
+    Page* page0 = bpm.new_page(&p0);
+    ASSERT_NE(page0, nullptr);
+    page0->set_lsn(5);
+    page0->data()[config::kPageHeaderSize] = 'A';
+    bpm.unpin_page(p0, /*is_dirty=*/true);
+
+    // Fail the next page write via the WAL flush hook so evicting page 0 fails.
+    bpm.set_wal_flush_hook(
+        [](lsn_t) { return Status::IOError("wal flush failed"); });
+
+    // Admitting a new page must evict + flush page 0, which now fails.
+    page_id_t p1;
+    Page* page1 = bpm.new_page(&p1);
+    EXPECT_EQ(page1, nullptr);
+
+    // Allow writes again.
+    bpm.set_wal_flush_hook(nullptr);
+
+    // Page 0 is still mapped: re-fetch pins it and its data is intact.
+    Page* refetched = bpm.fetch_page(p0);
+    ASSERT_NE(refetched, nullptr);
+    EXPECT_EQ(refetched->data()[config::kPageHeaderSize], 'A');
+
+    // With the bug, frame 0 also sits on the free list, so this new_page pops it
+    // and reset()s page 0 under our pin. With the fix, frame 0 is pinned and not
+    // free, so no victim is available and new_page fails, leaving page 0 intact.
+    page_id_t p2;
+    Page* page2 = bpm.new_page(&p2);
+    EXPECT_EQ(page2, nullptr) << "new_page reused the still-pinned victim frame";
+    EXPECT_EQ(refetched->data()[config::kPageHeaderSize], 'A')
+        << "victim page was reset while pinned";
+
+    bpm.unpin_page(p0, /*is_dirty=*/false);
+}
+
 // The hook must also fire (before each write) on the flush_all_pages path.
 TEST(BufferPoolWalHookTest, HookRunsBeforeWritesOnFlushAllPages) {
     auto dm = std::make_shared<RecordingDiskManager>();
