@@ -1556,7 +1556,7 @@ protected:
 
   // Build a page store backed by this test's database file.
   std::shared_ptr<BufferPoolManager> make_buffer_pool() {
-    disk_manager_ = std::make_shared<DiskManager>(db_file_.string());
+    disk_manager_ = std::make_shared<FileDiskManager>(db_file_.string());
     return std::make_shared<BufferPoolManager>(16, disk_manager_);
   }
 
@@ -1980,7 +1980,7 @@ TEST_F(RecoveryTest, WarmPoolRetryFlushesCompensationBeforeAbort) {
   }
 
   auto disk_row_present = [this]() {
-    auto probe_disk = std::make_shared<DiskManager>(db_file_.string());
+    auto probe_disk = std::make_shared<FileDiskManager>(db_file_.string());
     BufferPoolManager probe_pool(4, probe_disk);
     Page *page = probe_pool.fetch_page(0);
     EXPECT_NE(page, nullptr);
