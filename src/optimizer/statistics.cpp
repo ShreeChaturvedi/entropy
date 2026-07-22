@@ -190,14 +190,14 @@ double Statistics::estimate_selectivity(oid_t table_oid,
   if (auto *logical = dynamic_cast<const LogicalExpression *>(predicate)) {
     switch (logical->op()) {
     case LogicalOpType::AND: {
-      double l = estimate_selectivity(table_oid, logical->left());
-      double r = estimate_selectivity(table_oid, logical->right());
-      return l * r;
+      double left_sel = estimate_selectivity(table_oid, logical->left());
+      double right_sel = estimate_selectivity(table_oid, logical->right());
+      return left_sel * right_sel;
     }
     case LogicalOpType::OR: {
-      double l = estimate_selectivity(table_oid, logical->left());
-      double r = estimate_selectivity(table_oid, logical->right());
-      return l + r - (l * r);
+      double left_sel = estimate_selectivity(table_oid, logical->left());
+      double right_sel = estimate_selectivity(table_oid, logical->right());
+      return left_sel + right_sel - (left_sel * right_sel);
     }
     case LogicalOpType::NOT:
       // left() holds the sole operand for unary NOT.
