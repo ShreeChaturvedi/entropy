@@ -201,6 +201,94 @@ TEST_F(OptimizerTest, PredicateSelectivity) {
   EXPECT_DOUBLE_EQ(sel, Statistics::EQUALITY_SELECTIVITY);
 }
 
+// Builds `column CMP const`, binding the column to its schema index so the
+// optimizer can resolve it (the binder does this at runtime).
+static std::unique_ptr<ComparisonExpression>
+make_cmp(ComparisonType cmp, const std::string &column, size_t column_index,
+         TupleValue value) {
+  auto col = std::make_unique<ColumnRefExpression>(column);
+  col->set_column_index(column_index);
+  return std::make_unique<ComparisonExpression>(
+      cmp, std::move(col),
+      std::make_unique<ConstantExpression>(std::move(value)));
+}
+
+// Issue #12: equality selectivity was a flat 0.01 constant that ignored the
+// column's real distinct-value count. With stats, `col = const` must be 1/NDV.
+TEST_F(OptimizerTest, EqualitySelectivityUsesNdv) {
+  statistics_->collect_statistics(table_info_->oid);
+
+  // id: 100 distinct -> 1/100; age: 50 distinct (20..69, each twice) -> 1/50.
+  auto id_eq = make_cmp(ComparisonType::EQUAL, "id", 0, TupleValue(42));
+  auto age_eq = make_cmp(ComparisonType::EQUAL, "age", 2, TupleValue(30));
+  EXPECT_DOUBLE_EQ(
+      statistics_->estimate_selectivity(table_info_->oid, id_eq.get()),
+      1.0 / 100.0);
+  EXPECT_DOUBLE_EQ(
+      statistics_->estimate_selectivity(table_info_->oid, age_eq.get()),
+      1.0 / 50.0);
+
+  // Inequality is the complement of equality selectivity: 1 - 1/NDV.
+  auto age_neq = make_cmp(ComparisonType::NOT_EQUAL, "age", 2, TupleValue(30));
+  EXPECT_DOUBLE_EQ(
+      statistics_->estimate_selectivity(table_info_->oid, age_neq.get()),
+      1.0 - 1.0 / 50.0);
+}
+
+// Issue #12: logical connectives returned fixed constants and never recursed.
+TEST_F(OptimizerTest, LogicalSelectivityRecursesIntoOperands) {
+  statistics_->collect_statistics(table_info_->oid);
+
+  // id = 42 (1/100) AND age = 30 (1/50) -> product under independence.
+  auto conj = std::make_unique<LogicalExpression>(
+      LogicalOpType::AND,
+      make_cmp(ComparisonType::EQUAL, "id", 0, TupleValue(42)),
+      make_cmp(ComparisonType::EQUAL, "age", 2, TupleValue(30)));
+  EXPECT_DOUBLE_EQ(
+      statistics_->estimate_selectivity(table_info_->oid, conj.get()),
+      (1.0 / 100.0) * (1.0 / 50.0));
+
+  // OR combines by inclusion-exclusion: sL + sR - sL*sR.
+  auto disj = std::make_unique<LogicalExpression>(
+      LogicalOpType::OR,
+      make_cmp(ComparisonType::EQUAL, "id", 0, TupleValue(42)),
+      make_cmp(ComparisonType::EQUAL, "age", 2, TupleValue(30)));
+  double sl = 1.0 / 100.0;
+  double sr = 1.0 / 50.0;
+  EXPECT_DOUBLE_EQ(
+      statistics_->estimate_selectivity(table_info_->oid, disj.get()),
+      sl + sr - sl * sr);
+}
+
+// Issue #12: range selectivity must reflect the covered fraction of the
+// column's [min,max] domain, not a flat constant.
+TEST_F(OptimizerTest, RangeSelectivityFromMinMax) {
+  statistics_->collect_statistics(table_info_->oid);
+  // age domain is [20, 69] -> span of 50 integer values.
+  const column_id_t age_col = 2;
+
+  // age <= 24  -> {20..24} = 5/50.
+  EXPECT_DOUBLE_EQ(
+      statistics_->range_selectivity(table_info_->oid, age_col,
+                                     std::nullopt, BPTreeKey{24}),
+      5.0 / 50.0);
+  // Full domain -> 1.0.
+  EXPECT_DOUBLE_EQ(
+      statistics_->range_selectivity(table_info_->oid, age_col, BPTreeKey{20},
+                                     BPTreeKey{69}),
+      1.0);
+  // Entirely above the domain -> 0.0.
+  EXPECT_DOUBLE_EQ(
+      statistics_->range_selectivity(table_info_->oid, age_col, BPTreeKey{70},
+                                     std::nullopt),
+      0.0);
+  // Without collected stats, falls back to the Selinger 1/3 default.
+  EXPECT_DOUBLE_EQ(
+      statistics_->range_selectivity(9999, age_col, std::nullopt,
+                                     BPTreeKey{24}),
+      Statistics::RANGE_SELECTIVITY);
+}
+
 // CostModel Tests
 
 TEST_F(OptimizerTest, SeqScanCost) {

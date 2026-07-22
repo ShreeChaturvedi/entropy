@@ -74,6 +74,39 @@ bool value_less(const TupleValue &a, const TupleValue &b) {
   return false; // Incomparable: leave the current extremum in place.
 }
 
+// Extract an integer key from a value for range-selectivity math. Only integer
+// domains index into a B+ tree (BPTreeKey == int64_t), so non-integral types
+// (float/double/string) are rejected.
+bool value_as_int(const TupleValue &v, int64_t *out) {
+  if (v.is_bool()) {
+    *out = v.as_bool() ? 1 : 0;
+  } else if (v.is_tinyint()) {
+    *out = v.as_tinyint();
+  } else if (v.is_smallint()) {
+    *out = v.as_smallint();
+  } else if (v.is_integer()) {
+    *out = v.as_integer();
+  } else if (v.is_bigint()) {
+    *out = v.as_bigint();
+  } else {
+    return false;
+  }
+  return true;
+}
+
+// The column referenced by a comparison, whichever side it is on (col OP const
+// or const OP col). Returns nullptr when neither side is a bare column.
+const ColumnRefExpression *
+comparison_column(const ComparisonExpression *comp) {
+  if (auto *c = dynamic_cast<const ColumnRefExpression *>(comp->left())) {
+    return c;
+  }
+  if (auto *c = dynamic_cast<const ColumnRefExpression *>(comp->right())) {
+    return c;
+  }
+  return nullptr;
+}
+
 } // namespace
 
 Statistics::Statistics(std::shared_ptr<Catalog> catalog)
@@ -109,7 +142,7 @@ double Statistics::column_selectivity(oid_t table_oid,
 
   auto col_it = table_it->second.columns.find(column_id);
   if (col_it == table_it->second.columns.end()) {
-    return DEFAULT_SELECTIVITY;
+    return EQUALITY_SELECTIVITY;
   }
 
   // Selectivity = 1 / distinct_values for equality predicates
@@ -117,10 +150,10 @@ double Statistics::column_selectivity(oid_t table_oid,
     return 1.0 / col_it->second.distinct_values;
   }
 
-  return DEFAULT_SELECTIVITY;
+  return EQUALITY_SELECTIVITY;
 }
 
-double Statistics::estimate_selectivity([[maybe_unused]] oid_t table_oid,
+double Statistics::estimate_selectivity(oid_t table_oid,
                                         const Expression *predicate) const {
   if (!predicate) {
     return 1.0; // No predicate = all rows
@@ -128,39 +161,84 @@ double Statistics::estimate_selectivity([[maybe_unused]] oid_t table_oid,
 
   // Handle comparison expressions
   if (auto *comp = dynamic_cast<const ComparisonExpression *>(predicate)) {
+    // Prefer 1/NDV from collected statistics for (in)equality; fall back to the
+    // Selinger default when the column or its stats are unavailable.
+    const ColumnRefExpression *col = comparison_column(comp);
+    double eq_sel = EQUALITY_SELECTIVITY;
+    if (col != nullptr) {
+      eq_sel = column_selectivity(
+          table_oid, static_cast<column_id_t>(col->column_index()));
+    }
+
     switch (comp->cmp()) {
     case ComparisonType::EQUAL:
-      return EQUALITY_SELECTIVITY;
+      return eq_sel;
+    case ComparisonType::NOT_EQUAL:
+      return 1.0 - eq_sel;
     case ComparisonType::LESS_THAN:
     case ComparisonType::LESS_EQUAL:
     case ComparisonType::GREATER_THAN:
     case ComparisonType::GREATER_EQUAL:
       return RANGE_SELECTIVITY;
-    case ComparisonType::NOT_EQUAL:
-      return 1.0 - EQUALITY_SELECTIVITY;
     default:
       return DEFAULT_SELECTIVITY;
     }
   }
 
-  // Handle logical expressions
+  // Handle logical expressions by recursing into operands (independence /
+  // inclusion-exclusion), instead of returning a fixed constant.
   if (auto *logical = dynamic_cast<const LogicalExpression *>(predicate)) {
-    // For simplicity, use default selectivity for logical expressions
-    // Full implementation would recursively estimate
     switch (logical->op()) {
-    case LogicalOpType::AND:
-      return DEFAULT_SELECTIVITY * DEFAULT_SELECTIVITY;
-    case LogicalOpType::OR:
-      return 2 * DEFAULT_SELECTIVITY -
-             (DEFAULT_SELECTIVITY * DEFAULT_SELECTIVITY);
+    case LogicalOpType::AND: {
+      double l = estimate_selectivity(table_oid, logical->left());
+      double r = estimate_selectivity(table_oid, logical->right());
+      return l * r;
+    }
+    case LogicalOpType::OR: {
+      double l = estimate_selectivity(table_oid, logical->left());
+      double r = estimate_selectivity(table_oid, logical->right());
+      return l + r - (l * r);
+    }
     case LogicalOpType::NOT:
-      return 1.0 - DEFAULT_SELECTIVITY;
+      // left() holds the sole operand for unary NOT.
+      return 1.0 - estimate_selectivity(table_oid, logical->left());
     default:
       return DEFAULT_SELECTIVITY;
     }
   }
 
   return DEFAULT_SELECTIVITY;
+}
+
+double Statistics::range_selectivity(oid_t table_oid, column_id_t column_id,
+                                     std::optional<BPTreeKey> lower,
+                                     std::optional<BPTreeKey> upper) const {
+  const TableStatistics *ts = get_table_stats(table_oid);
+  if (ts != nullptr) {
+    auto it = ts->columns.find(column_id);
+    if (it != ts->columns.end() && it->second.min_value.has_value() &&
+        it->second.max_value.has_value()) {
+      int64_t mn = 0;
+      int64_t mx = 0;
+      if (value_as_int(*it->second.min_value, &mn) &&
+          value_as_int(*it->second.max_value, &mx) && mx >= mn) {
+        // Clamp the (inclusive) query bounds to the observed domain.
+        int64_t lo = lower.has_value() ? std::max<int64_t>(*lower, mn) : mn;
+        int64_t hi = upper.has_value() ? std::min<int64_t>(*upper, mx) : mx;
+        if (hi < lo) {
+          return 0.0;
+        }
+        // Compute in double to avoid overflow across a wide integer domain.
+        double span = (static_cast<double>(mx) - static_cast<double>(mn)) + 1.0;
+        double covered =
+            (static_cast<double>(hi) - static_cast<double>(lo)) + 1.0;
+        return std::clamp(covered / span, 0.0, 1.0);
+      }
+    }
+  }
+
+  // No usable histogram: fall back to the Selinger range default (1/3).
+  return RANGE_SELECTIVITY;
 }
 
 void Statistics::collect_statistics(oid_t table_oid) {
