@@ -121,7 +121,8 @@ Status RecoveryManager::recover() {
 }
 
 Status RecoveryManager::create_checkpoint(
-    const std::vector<txn_id_t> &active_txn_ids) {
+    const std::vector<txn_id_t> &active_txn_ids,
+    std::shared_mutex *write_barrier) {
   if (!wal_) {
     return Status::InvalidArgument("No WAL manager provided");
   }
@@ -133,19 +134,36 @@ Status RecoveryManager::create_checkpoint(
   // buffer pool no pages can be flushed, so no anchor is recorded and
   // recovery falls back to a full page-LSN-gated scan.
   //
-  // SINGLE-THREADED ONLY: this ordering assumes no writer runs concurrently
-  // (see the class doc). A writer holding a pre-anchor LSN that dirties its
-  // page after flush_all_pages would be skipped by anchored redo without
-  // being durable. WP7's concurrent wiring must quiesce writers here or
-  // switch to a real dirty-page-table (min recLSN) anchor.
-  lsn_t begin_lsn = INVALID_LSN;
-  if (buffer_pool_) {
+  // Quiesce writers for the capture+flush window: with the barrier held
+  // exclusively, no logging writer can be mid-append (they take it shared
+  // across append + page-LSN stamp), so every record with LSN < begin_lsn has
+  // already stamped and dirtied its page and is captured by flush_all_pages.
+  // A null barrier keeps the historical single-threaded contract.
+  auto do_capture_and_flush = [&](lsn_t &begin_lsn) -> Status {
+    if (!buffer_pool_) {
+      return Status::Ok();
+    }
     begin_lsn = wal_->next_lsn();
     Status flush_status = wal_->flush();
     if (!flush_status.ok()) {
       return flush_status;
     }
     buffer_pool_->flush_all_pages();
+    return Status::Ok();
+  };
+
+  lsn_t begin_lsn = INVALID_LSN;
+  if (write_barrier != nullptr) {
+    std::unique_lock<std::shared_mutex> quiesce(*write_barrier);
+    Status s = do_capture_and_flush(begin_lsn);
+    if (!s.ok()) {
+      return s;
+    }
+  } else {
+    Status s = do_capture_and_flush(begin_lsn);
+    if (!s.ok()) {
+      return s;
+    }
   }
 
   LogRecord checkpoint = LogRecord::make_checkpoint(active_txn_ids, begin_lsn);

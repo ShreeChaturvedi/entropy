@@ -5,6 +5,7 @@
 
 #include "transaction/transaction_manager.hpp"
 
+#include <shared_mutex>
 #include <unordered_set>
 
 #include "common/logger.hpp"
@@ -297,11 +298,33 @@ size_t TransactionManager::active_transaction_count() const {
     return txn_map_.size();
 }
 
+void TransactionManager::stamp_page_lsn(RID rid, lsn_t lsn) {
+    if (buffer_pool_ == nullptr || lsn == INVALID_LSN || rid.page_id < 0) {
+        return;
+    }
+    // Record the page's highest applied LSN so the buffer pool's WAL flush hook
+    // can enforce WAL-before-page and recovery can gate idempotent redo. The
+    // executor mutated the page's bytes just before this call, so it is already
+    // dirty; marking it dirty again on unpin is harmless.
+    Page* page = buffer_pool_->fetch_page(rid.page_id);
+    if (page == nullptr) {
+        return;
+    }
+    if (lsn > page->lsn()) {
+        page->set_lsn(lsn);
+    }
+    buffer_pool_->unpin_page(rid.page_id, true);
+}
+
 lsn_t TransactionManager::log_insert(Transaction* txn, oid_t table_oid, RID rid,
                                      const std::vector<char>& tuple_data) {
     if (txn == nullptr) {
         return INVALID_LSN;
     }
+
+    // Hold the checkpoint barrier (shared) across append + page-LSN stamp so a
+    // concurrent checkpoint cannot capture its redo anchor between the two.
+    std::shared_lock<std::shared_mutex> barrier(checkpoint_latch_);
 
     lsn_t lsn = INVALID_LSN;
     if (wal_manager_) {
@@ -309,6 +332,7 @@ lsn_t TransactionManager::log_insert(Transaction* txn, oid_t table_oid, RID rid,
             LogRecord::make_insert(txn->txn_id(), txn->prev_lsn(), table_oid, rid, tuple_data);
         lsn = wal_manager_->append_log(record);
         txn->set_prev_lsn(lsn);
+        stamp_page_lsn(rid, lsn);
     }
 
     // Always track write set for abort undo (even without WAL)
@@ -323,12 +347,15 @@ lsn_t TransactionManager::log_delete(Transaction* txn, oid_t table_oid, RID rid,
         return INVALID_LSN;
     }
 
+    std::shared_lock<std::shared_mutex> barrier(checkpoint_latch_);
+
     lsn_t lsn = INVALID_LSN;
     if (wal_manager_) {
         LogRecord record =
             LogRecord::make_delete(txn->txn_id(), txn->prev_lsn(), table_oid, rid, tuple_data);
         lsn = wal_manager_->append_log(record);
         txn->set_prev_lsn(lsn);
+        stamp_page_lsn(rid, lsn);
     }
 
     // Always track write set with old data for abort undo
@@ -344,12 +371,15 @@ lsn_t TransactionManager::log_update(Transaction* txn, oid_t table_oid, RID rid,
         return INVALID_LSN;
     }
 
+    std::shared_lock<std::shared_mutex> barrier(checkpoint_latch_);
+
     lsn_t lsn = INVALID_LSN;
     if (wal_manager_) {
         LogRecord record = LogRecord::make_update(txn->txn_id(), txn->prev_lsn(), table_oid, rid,
                                                   old_data, new_data);
         lsn = wal_manager_->append_log(record);
         txn->set_prev_lsn(lsn);
+        stamp_page_lsn(rid, lsn);
     }
 
     // Always track write set with old data for abort undo

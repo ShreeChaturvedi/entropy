@@ -14,6 +14,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -204,11 +205,37 @@ public:
         table_resolver_ = std::move(resolver);
     }
 
+    /**
+     * @brief Barrier that quiesces logging writers against a checkpoint
+     *
+     * Each log_insert/log_update/log_delete holds this in SHARED mode across the
+     * whole append + page-LSN-stamp it performs. A checkpoint takes it
+     * EXCLUSIVELY around its redo-anchor capture + page flush (see
+     * RecoveryManager::create_checkpoint), so no writer can appear with a
+     * sub-anchor LSN whose page is not yet stamped/flushed. Row locks are
+     * acquired by the executor BEFORE it calls the log methods, so a writer
+     * never blocks on another transaction while holding this shared latch and
+     * the checkpoint's exclusive wait is bounded.
+     */
+    [[nodiscard]] std::shared_mutex& checkpoint_barrier() noexcept {
+        return checkpoint_latch_;
+    }
+
 private:
     /**
      * @brief Undo one write-set entry (inverse of the logged operation)
      */
     void undo_write_record(const WriteRecord& record);
+
+    /**
+     * @brief Stamp @p lsn onto the page holding @p rid (WAL-before-page / redo)
+     *
+     * The page LSN records the highest log record whose effect the page
+     * reflects, which the buffer pool's WAL flush hook reads to enforce
+     * WAL-before-page and recovery reads to gate idempotent redo. No-op without
+     * a buffer pool, an invalid LSN, or an invalid page id.
+     */
+    void stamp_page_lsn(RID rid, lsn_t lsn);
 
     std::shared_ptr<WALManager> wal_manager_;
     std::shared_ptr<MVCCManager> mvcc_;
@@ -219,6 +246,10 @@ private:
     std::unordered_map<txn_id_t, std::unique_ptr<Transaction>> txn_map_;
     txn_id_t next_txn_id_ = 1;
     mutable std::mutex mutex_;
+    // Quiesces logging writers against a concurrent checkpoint (see
+    // checkpoint_barrier()). Separate from mutex_: the log methods do not hold
+    // mutex_, so the two never nest.
+    std::shared_mutex checkpoint_latch_;
 };
 
 }  // namespace entropy
