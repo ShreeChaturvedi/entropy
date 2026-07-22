@@ -155,17 +155,15 @@ Status RecoveryManager::create_checkpoint(
   };
 
   lsn_t begin_lsn = INVALID_LSN;
+  Status captured = Status::Ok();
   if (write_barrier != nullptr) {
     std::unique_lock<std::shared_mutex> quiesce(*write_barrier);
-    Status s = do_capture_and_flush(begin_lsn);
-    if (!s.ok()) {
-      return s;
-    }
+    captured = do_capture_and_flush(begin_lsn);
   } else {
-    Status s = do_capture_and_flush(begin_lsn);
-    if (!s.ok()) {
-      return s;
-    }
+    captured = do_capture_and_flush(begin_lsn);
+  }
+  if (!captured.ok()) {
+    return captured;
   }
 
   LogRecord checkpoint = LogRecord::make_checkpoint(active_txn_ids, begin_lsn);
