@@ -218,9 +218,11 @@ public:
       case StatementType::UPDATE:
         return execute_update(dynamic_cast<UpdateStatement *>(stmt.get()),
                               &exec_ctx);
-      default:
+      case StatementType::DELETE_STMT:
         return execute_delete(dynamic_cast<DeleteStatement *>(stmt.get()),
                               &exec_ctx);
+      default:
+        return Result(Status::Internal("Unreachable statement type"));
       }
     }();
 
@@ -229,8 +231,9 @@ public:
       // be partially applied, so abort it (write-set undo + version rollback
       // + lock release) and surface the error. An explicit transaction ends
       // here too — its effects are gone, and later statements must not run
-      // on an aborted transaction.
-      end_thread_txn(txn);
+      // on an aborted transaction. (Autocommit has no thread binding to drop;
+      // take_thread_txn is then a nullptr-returning no-op.)
+      (void)take_thread_txn();
       txn_manager_->abort(txn);
       return result;
     }
@@ -729,16 +732,6 @@ private:
     Transaction *txn = it->second;
     thread_txns_.erase(it);
     return txn;
-  }
-
-  /// Drop the thread->txn binding for @p txn if it is the calling thread's
-  /// explicit transaction (no-op for autocommit transactions).
-  void end_thread_txn(const Transaction *txn) {
-    std::lock_guard<std::mutex> lock(session_mutex_);
-    auto it = thread_txns_.find(std::this_thread::get_id());
-    if (it != thread_txns_.end() && it->second == txn) {
-      thread_txns_.erase(it);
-    }
   }
 
   std::string path_;

@@ -5,13 +5,7 @@
 
 #include "execution/update_executor.hpp"
 
-#include <span>
 #include <vector>
-
-#include "execution/executor_context.hpp"
-#include "transaction/lock_manager.hpp"
-#include "transaction/transaction_manager.hpp"
-#include "transaction/version_store.hpp"
 
 namespace entropy {
 
@@ -68,8 +62,6 @@ std::optional<Tuple> UpdateExecutor::next() {
     to_update.push_back(std::move(*tuple));
   }
 
-  const bool transactional = ctx_ != nullptr && ctx_->txn != nullptr;
-
   // Phase 2: apply SET expressions to the snapshotted rows only.
   for (const auto &tuple : to_update) {
     RID rid = tuple.rid();
@@ -94,82 +86,45 @@ std::optional<Tuple> UpdateExecutor::next() {
 
     Tuple new_tuple(new_values, *schema_);
 
-    // Transactional path: lock the row, run first-updater-wins conflict
-    // detection against the before-image, then mutate + log. The lock and the
-    // conflict check run BEFORE the heap mutation so a conflict aborts without
-    // touching the heap. The row lock is held until commit/abort, so no other
-    // writer can interleave between the check and the mutation.
-    if (transactional) {
-      if (ctx_->lock_mgr != nullptr) {
-        Status locked = ctx_->lock_mgr->lock_row(ctx_->txn, table_oid_, rid,
-                                                 LockMode::EXCLUSIVE);
-        if (!locked.ok()) {
-          status_ = locked;
-          break;
-        }
-      }
-      if (ctx_->version_store != nullptr) {
-        std::span<const char> before(tuple.data(), tuple.size());
-        Status versioned = ctx_->version_store->on_update(ctx_->txn, rid, before);
-        if (!versioned.ok()) {
-          status_ = versioned; // write-write conflict
-          break;
-        }
-      }
+    // Pre-mutation: row lock + first-updater-wins registration against the
+    // before-image. A conflict aborts before the heap is touched, and the
+    // lock is held until commit/abort so no other writer can interleave
+    // between this check and the mutation.
+    Status status =
+        txn_acquire_write(ctx_, table_oid_, rid, tuple, TxnWriteKind::kUpdate);
+    if (!status.ok()) {
+      status_ = status;
+      break;
     }
 
     RID new_rid = rid;
-    Status status = table_heap_->update_tuple(new_tuple, rid, &new_rid);
+    status = table_heap_->update_tuple(new_tuple, rid, &new_rid);
     if (!status.ok()) {
       status_ = status;
       break;
     }
     rows_updated_++;
 
-    if (transactional) {
-      std::vector<char> old_bytes(tuple.data(), tuple.data() + tuple.size());
-      std::vector<char> new_bytes(new_tuple.data(),
-                                  new_tuple.data() + new_tuple.size());
-      if (new_rid == rid) {
-        // In-place update: one UPDATE record at the original RID.
-        if (ctx_->txn_mgr != nullptr) {
-          (void)ctx_->txn_mgr->log_update(ctx_->txn, table_oid_, rid, old_bytes,
-                                          new_bytes);
-        }
-      } else {
-        // Grow-update relocated the row (heap did delete@old + insert@new).
-        // Record it as such: a single UPDATE record at the old RID could not
-        // be redone (the old slot is empty after replaying the delete) and
-        // the new RID would carry no version metadata, exposing the
-        // uncommitted bytes to every snapshot. Lock the new RID, convert the
-        // old chain's pending update into a delete, open a chain at the new
-        // location, and log delete+insert so redo/undo reproduce the move.
-        if (ctx_->lock_mgr != nullptr) {
-          Status locked = ctx_->lock_mgr->lock_row(ctx_->txn, table_oid_,
-                                                   new_rid, LockMode::EXCLUSIVE);
-          if (!locked.ok()) {
-            status_ = locked;
-            break;
-          }
-        }
-        if (ctx_->version_store != nullptr) {
-          std::span<const char> before(old_bytes.data(), old_bytes.size());
-          Status versioned =
-              ctx_->version_store->on_delete(ctx_->txn, rid, before);
-          if (versioned.ok()) {
-            versioned = ctx_->version_store->on_insert(ctx_->txn, new_rid);
-          }
-          if (!versioned.ok()) {
-            status_ = versioned;
-            break;
-          }
-        }
-        if (ctx_->txn_mgr != nullptr) {
-          (void)ctx_->txn_mgr->log_delete(ctx_->txn, table_oid_, rid,
-                                          old_bytes);
-          (void)ctx_->txn_mgr->log_insert(ctx_->txn, table_oid_, new_rid,
-                                          new_bytes);
-        }
+    if (new_rid == rid) {
+      // In-place update: one UPDATE record at the original RID.
+      txn_log_update(ctx_, table_oid_, rid, tuple, new_tuple);
+    } else {
+      // Grow-update relocated the row (the heap did delete@old + insert@new).
+      // Record it as such: a single UPDATE record at the old RID could not be
+      // redone (the old slot is empty after replaying the delete), and the
+      // new RID would otherwise carry no version metadata and expose the
+      // uncommitted bytes to every snapshot. Convert the pending update on
+      // the old chain into a delete, log it, then register the new location
+      // as an insert (lock + version + log).
+      status = txn_acquire_write(ctx_, table_oid_, rid, tuple,
+                                 TxnWriteKind::kDelete);
+      if (status.ok()) {
+        txn_log_delete(ctx_, table_oid_, rid, tuple);
+        status = txn_register_insert(ctx_, table_oid_, new_rid, new_tuple);
+      }
+      if (!status.ok()) {
+        status_ = status;
+        break;
       }
     }
   }

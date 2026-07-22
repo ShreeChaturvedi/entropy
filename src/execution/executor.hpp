@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 
+#include "entropy/status.hpp"
 #include "storage/tuple.hpp"
 
 namespace entropy {
@@ -39,6 +40,53 @@ inline bool predicate_is_true(const TupleValue& value) {
  */
 [[nodiscard]] std::optional<Tuple> mvcc_visible(const ExecutorContext *ctx,
                                                 const Tuple &heap_tuple);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Transactional write helpers (the write-side counterparts of mvcc_visible)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Each helper is a no-op returning Ok() when @p ctx (or its transaction) is
+// null, and internally guards every context member, so executors carry no
+// per-callsite null pyramids and unit tests can keep driving them without a
+// context.
+
+/// Which mutation a writer is about to apply to an existing row.
+enum class TxnWriteKind { kUpdate, kDelete };
+
+/**
+ * @brief Pre-mutation step for UPDATE/DELETE on an existing row
+ *
+ * Acquires the row-level exclusive lock, then registers the write intent with
+ * the version store (retaining @p before as the before-image) under
+ * first-updater-wins: a conflicting concurrent change yields Status::Aborted
+ * and the heap must not be touched. Must run BEFORE the heap mutation; the
+ * lock is held until commit/abort, so no other writer can interleave between
+ * this check and the mutation.
+ */
+[[nodiscard]] Status txn_acquire_write(const ExecutorContext *ctx,
+                                       oid_t table_oid, RID rid,
+                                       const Tuple &before, TxnWriteKind kind);
+
+/**
+ * @brief Post-mutation step for a freshly inserted row
+ *
+ * Locks the newly placed RID, registers the uncommitted version (invisible to
+ * every other snapshot until commit), and logs the insert to the WAL and the
+ * transaction's write set (undo = delete).
+ */
+[[nodiscard]] Status txn_register_insert(const ExecutorContext *ctx,
+                                         oid_t table_oid, RID rid,
+                                         const Tuple &tuple);
+
+/// Log an in-place UPDATE to the WAL and the write set (undo = restore
+/// @p before). Called after the heap mutation succeeded.
+void txn_log_update(const ExecutorContext *ctx, oid_t table_oid, RID rid,
+                    const Tuple &before, const Tuple &after);
+
+/// Log a DELETE to the WAL and the write set (undo = re-insert @p before).
+/// Called after the heap mutation succeeded.
+void txn_log_delete(const ExecutorContext *ctx, oid_t table_oid, RID rid,
+                    const Tuple &before);
 
 /**
  * @brief Base class for all executors
