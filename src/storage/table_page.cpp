@@ -147,11 +147,17 @@ bool TablePage::update_record(slot_id_t slot_id, const char* data, uint16_t size
         return false;
     }
 
-    // If new size fits in existing space, update in place
+    // If new size fits in existing space, update in place.
     if (size <= slot->length) {
         std::memcpy(page_->data() + slot->offset, data, size);
-        // Note: We keep the old length to maintain contiguity
-        // The extra space becomes internal fragmentation
+        // Record the new (possibly smaller) logical length so get_record and
+        // Tuple.size() report exactly `size` bytes rather than stale trailing
+        // content from the old record. Any bytes a shrink frees become an
+        // internal hole that the next compact() reclaims; they are already
+        // excluded from get_free_space(), which measures only the contiguous
+        // gap between the slot array and free_space_end, so this keeps the
+        // page's free-space accounting consistent.
+        slot->length = size;
         page_->set_dirty(true);
         return true;
     }

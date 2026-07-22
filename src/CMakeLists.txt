@@ -49,10 +49,6 @@ target_link_libraries(entropy_storage
         entropy_common
 )
 
-if(ENTROPY_ENABLE_LZ4 AND TARGET entropy_lz4)
-    target_link_libraries(entropy_storage PUBLIC entropy_lz4)
-endif()
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Catalog Library
 # ─────────────────────────────────────────────────────────────────────────────
