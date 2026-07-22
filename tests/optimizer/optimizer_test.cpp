@@ -5,6 +5,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
+
 #include "catalog/catalog.hpp"
 #include "catalog/column.hpp"
 #include "catalog/schema.hpp"
@@ -308,6 +310,52 @@ TEST_F(OptimizerTest, IndexScanCost) {
   EXPECT_GT(cost, 0);
 }
 
+// Minimal plan node reporting a DML type, used to exercise the cost model's
+// default (INSERT/UPDATE/DELETE) branch, which has no concrete node class.
+class ModifyTestNode : public PlanNode {
+public:
+  explicit ModifyTestNode(const Schema *schema)
+      : PlanNode(PlanNodeType::INSERT), schema_(schema) {}
+  [[nodiscard]] const Schema *output_schema() const override { return schema_; }
+
+private:
+  const Schema *schema_;
+};
+
+// Issue #12: the DML/default cost branch set cost = children_cost and then
+// returned cost + children_cost, counting the child subtree twice.
+TEST_F(OptimizerTest, DmlCostDoesNotDoubleCountChild) {
+  auto child = std::make_unique<SeqScanPlanNode>(table_info_->oid,
+                                                 &output_schema_, nullptr);
+  double child_cost = cost_model_->estimate_cost(child.get());
+  ASSERT_GT(child_cost, 0.0);
+
+  auto modify = std::make_unique<ModifyTestNode>(&output_schema_);
+  modify->add_child(std::move(child));
+  double modify_cost = cost_model_->estimate_cost(modify.get());
+
+  // Child counted exactly once (no intrinsic DML cost), not doubled.
+  EXPECT_DOUBLE_EQ(modify_cost, child_cost);
+}
+
+// Issue #12: an index tuple fetch cost less than a sequential tuple (0.005 vs
+// 0.01) and ignored random I/O. The marginal cost of fetching one matching
+// tuple via the index must now exceed a plain sequential tuple.
+TEST_F(OptimizerTest, IndexFetchCostsMoreThanSequentialTuple) {
+  size_t rows = statistics_->table_cardinality(table_info_->oid);
+  double seek = std::log2(static_cast<double>(rows)) *
+                CostModel::RANDOM_PAGE_COST;
+
+  // Index full scan touches every row via random fetches.
+  auto index_full = std::make_unique<IndexScanPlanNode>(
+      table_info_->oid, 1, &output_schema_,
+      IndexScanPlanNode::ScanType::FULL_SCAN);
+  double full_cost = cost_model_->estimate_cost(index_full.get());
+
+  double marginal_per_tuple = (full_cost - seek) / static_cast<double>(rows);
+  EXPECT_GT(marginal_per_tuple, CostModel::TUPLE_CPU_COST);
+}
+
 TEST_F(OptimizerTest, CostComparison) {
   auto seq_scan = std::make_unique<SeqScanPlanNode>(table_info_->oid,
                                                     &output_schema_, nullptr);
@@ -419,6 +467,41 @@ TEST_F(OptimizerTest, PlanNodeTypes) {
 
   auto limit = std::make_unique<LimitPlanNode>(10, 0, &output_schema_);
   EXPECT_EQ(limit->type(), PlanNodeType::LIMIT);
+}
+
+// Issue #12: filter cardinality was child_card * 0.1 for every predicate,
+// ignoring the predicate entirely. It must vary with the predicate shape.
+TEST_F(OptimizerTest, FilterCardinalityDependsOnPredicate) {
+  auto make_filter = [&](std::unique_ptr<Expression> pred) {
+    auto child = std::make_unique<SeqScanPlanNode>(table_info_->oid,
+                                                   &output_schema_, nullptr);
+    auto filter =
+        std::make_unique<FilterPlanNode>(std::move(pred), &output_schema_);
+    filter->add_child(std::move(child));
+    return filter;
+  };
+
+  size_t base = cost_model_->estimate_cardinality(
+      std::make_unique<SeqScanPlanNode>(table_info_->oid, &output_schema_,
+                                        nullptr)
+          .get());
+  ASSERT_EQ(base, 100u);
+
+  auto eq_filter =
+      make_filter(make_cmp(ComparisonType::EQUAL, "id", 0, TupleValue(42)));
+  auto range_filter =
+      make_filter(make_cmp(ComparisonType::LESS_THAN, "age", 2, TupleValue(30)));
+
+  size_t eq_card = cost_model_->estimate_cardinality(eq_filter.get());
+  size_t range_card = cost_model_->estimate_cardinality(range_filter.get());
+
+  // Equality (1/10 default) is more selective than a range (1/3 default), and
+  // the range no longer collapses to the old flat 0.1 result (10).
+  EXPECT_EQ(eq_card, static_cast<size_t>(static_cast<double>(base) *
+                                         Statistics::EQUALITY_SELECTIVITY));
+  EXPECT_EQ(range_card, static_cast<size_t>(static_cast<double>(base) *
+                                            Statistics::RANGE_SELECTIVITY));
+  EXPECT_LT(eq_card, range_card);
 }
 
 TEST_F(OptimizerTest, CardinalityEstimation) {
