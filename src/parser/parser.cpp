@@ -143,7 +143,10 @@ std::unique_ptr<Statement> Parser::parse_statement() {
     if (check(TokenType::TABLE)) {
       return parse_create_table();
     }
-    set_error("Expected TABLE after CREATE");
+    if (check(TokenType::INDEX)) {
+      return parse_create_index();
+    }
+    set_error("Expected TABLE or INDEX after CREATE");
     return nullptr;
   }
   if (check(TokenType::DROP)) {
@@ -151,7 +154,10 @@ std::unique_ptr<Statement> Parser::parse_statement() {
     if (check(TokenType::TABLE)) {
       return parse_drop_table();
     }
-    set_error("Expected TABLE after DROP");
+    if (check(TokenType::INDEX)) {
+      return parse_drop_index();
+    }
+    set_error("Expected TABLE or INDEX after DROP");
     return nullptr;
   }
   if (check(TokenType::EXPLAIN)) {
@@ -539,6 +545,75 @@ std::unique_ptr<DropTableStatement> Parser::parse_drop_table() {
   } else {
     set_error("Expected table name after DROP TABLE");
     return nullptr;
+  }
+
+  match(TokenType::SEMICOLON);
+  return stmt;
+}
+
+std::unique_ptr<CreateIndexStatement> Parser::parse_create_index() {
+  auto stmt = std::make_unique<CreateIndexStatement>();
+  expect(TokenType::INDEX, "Expected INDEX");
+
+  // Index name
+  if (check(TokenType::IDENTIFIER)) {
+    stmt->index_name = current_.value;
+    advance();
+  } else {
+    set_error("Expected index name after CREATE INDEX");
+    return nullptr;
+  }
+
+  expect(TokenType::ON, "Expected ON after index name");
+
+  // Table name
+  if (check(TokenType::IDENTIFIER)) {
+    stmt->table_name = current_.value;
+    advance();
+  } else {
+    set_error("Expected table name after ON");
+    return nullptr;
+  }
+
+  // Key column list
+  expect(TokenType::LPAREN, "Expected ( before index columns");
+  do {
+    if (check(TokenType::IDENTIFIER)) {
+      stmt->columns.push_back(current_.value);
+      advance();
+    } else {
+      set_error("Expected column name in index key list");
+      return nullptr;
+    }
+  } while (match(TokenType::COMMA));
+  expect(TokenType::RPAREN, "Expected )");
+
+  match(TokenType::SEMICOLON);
+  return stmt;
+}
+
+std::unique_ptr<DropIndexStatement> Parser::parse_drop_index() {
+  auto stmt = std::make_unique<DropIndexStatement>();
+  expect(TokenType::INDEX, "Expected INDEX");
+
+  // Index name
+  if (check(TokenType::IDENTIFIER)) {
+    stmt->index_name = current_.value;
+    advance();
+  } else {
+    set_error("Expected index name after DROP INDEX");
+    return nullptr;
+  }
+
+  // Optional ON table (MySQL-style DROP INDEX name ON table)
+  if (match(TokenType::ON)) {
+    if (check(TokenType::IDENTIFIER)) {
+      stmt->table_name = current_.value;
+      advance();
+    } else {
+      set_error("Expected table name after ON");
+      return nullptr;
+    }
   }
 
   match(TokenType::SEMICOLON);

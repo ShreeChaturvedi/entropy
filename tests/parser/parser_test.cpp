@@ -1036,5 +1036,67 @@ TEST_F(ParserTest, DecimalMissingPrecisionIsError) {
   EXPECT_FALSE(parser.parse(&stmt).ok());
 }
 
+// -- Parser: CREATE INDEX / DROP INDEX ---------------------------------------
+
+TEST_F(ParserTest, ParseCreateIndex) {
+  Parser parser("CREATE INDEX idx_name ON users (name)");
+  std::unique_ptr<Statement> stmt;
+  Status status = parser.parse(&stmt);
+  ASSERT_TRUE(status.ok()) << status.to_string();
+  EXPECT_EQ(stmt->type(), StatementType::CREATE_INDEX);
+
+  auto *idx = dynamic_cast<CreateIndexStatement *>(stmt.get());
+  ASSERT_NE(idx, nullptr);
+  EXPECT_EQ(idx->index_name, "idx_name");
+  EXPECT_EQ(idx->table_name, "users");
+  ASSERT_EQ(idx->columns.size(), 1u);
+  EXPECT_EQ(idx->columns[0], "name");
+}
+
+TEST_F(ParserTest, ParseCreateIndexMultiColumn) {
+  Parser parser("CREATE INDEX idx ON t (a, b, c)");
+  std::unique_ptr<Statement> stmt;
+  Status status = parser.parse(&stmt);
+  ASSERT_TRUE(status.ok()) << status.to_string();
+
+  auto *idx = dynamic_cast<CreateIndexStatement *>(stmt.get());
+  ASSERT_NE(idx, nullptr);
+  ASSERT_EQ(idx->columns.size(), 3u);
+  EXPECT_EQ(idx->columns[0], "a");
+  EXPECT_EQ(idx->columns[1], "b");
+  EXPECT_EQ(idx->columns[2], "c");
+}
+
+TEST_F(ParserTest, ParseCreateIndexMissingOnIsError) {
+  Parser parser("CREATE INDEX idx users (name)");
+  std::unique_ptr<Statement> stmt;
+  EXPECT_FALSE(parser.parse(&stmt).ok());
+}
+
+TEST_F(ParserTest, ParseDropIndex) {
+  Parser parser("DROP INDEX idx_name");
+  std::unique_ptr<Statement> stmt;
+  Status status = parser.parse(&stmt);
+  ASSERT_TRUE(status.ok()) << status.to_string();
+  EXPECT_EQ(stmt->type(), StatementType::DROP_INDEX);
+
+  auto *idx = dynamic_cast<DropIndexStatement *>(stmt.get());
+  ASSERT_NE(idx, nullptr);
+  EXPECT_EQ(idx->index_name, "idx_name");
+  EXPECT_TRUE(idx->table_name.empty());
+}
+
+TEST_F(ParserTest, ParseDropIndexOnTable) {
+  Parser parser("DROP INDEX idx_name ON users");
+  std::unique_ptr<Statement> stmt;
+  Status status = parser.parse(&stmt);
+  ASSERT_TRUE(status.ok()) << status.to_string();
+
+  auto *idx = dynamic_cast<DropIndexStatement *>(stmt.get());
+  ASSERT_NE(idx, nullptr);
+  EXPECT_EQ(idx->index_name, "idx_name");
+  EXPECT_EQ(idx->table_name, "users");
+}
+
 } // namespace
 } // namespace entropy
