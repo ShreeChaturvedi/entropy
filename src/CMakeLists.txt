@@ -14,8 +14,9 @@ add_library(entropy_common STATIC
 
 target_include_directories(entropy_common
     PUBLIC
-        ${ENTROPY_INCLUDE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}
+        $<BUILD_INTERFACE:${ENTROPY_INCLUDE_DIR}>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
 target_link_libraries(entropy_common
@@ -40,8 +41,9 @@ add_library(entropy_storage STATIC
 
 target_include_directories(entropy_storage
     PUBLIC
-        ${ENTROPY_INCLUDE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}
+        $<BUILD_INTERFACE:${ENTROPY_INCLUDE_DIR}>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
 target_link_libraries(entropy_storage
@@ -66,8 +68,9 @@ add_library(entropy_catalog STATIC
 
 target_include_directories(entropy_catalog
     PUBLIC
-        ${ENTROPY_INCLUDE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}
+        $<BUILD_INTERFACE:${ENTROPY_INCLUDE_DIR}>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
 target_link_libraries(entropy_catalog
@@ -93,8 +96,9 @@ add_library(entropy_transaction STATIC
 
 target_include_directories(entropy_transaction
     PUBLIC
-        ${ENTROPY_INCLUDE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}
+        $<BUILD_INTERFACE:${ENTROPY_INCLUDE_DIR}>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
 target_link_libraries(entropy_transaction
@@ -117,8 +121,9 @@ add_library(entropy_parser STATIC
 
 target_include_directories(entropy_parser
     PUBLIC
-        ${ENTROPY_INCLUDE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}
+        $<BUILD_INTERFACE:${ENTROPY_INCLUDE_DIR}>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
 target_link_libraries(entropy_parser
@@ -141,8 +146,9 @@ add_library(entropy_optimizer STATIC
 
 target_include_directories(entropy_optimizer
     PUBLIC
-        ${ENTROPY_INCLUDE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}
+        $<BUILD_INTERFACE:${ENTROPY_INCLUDE_DIR}>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
 target_link_libraries(entropy_optimizer
@@ -174,8 +180,9 @@ add_library(entropy_execution STATIC
 
 target_include_directories(entropy_execution
     PUBLIC
-        ${ENTROPY_INCLUDE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}
+        $<BUILD_INTERFACE:${ENTROPY_INCLUDE_DIR}>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
 target_link_libraries(entropy_execution
@@ -199,9 +206,10 @@ add_library(entropy STATIC
 
 target_include_directories(entropy
     PUBLIC
-        ${ENTROPY_INCLUDE_DIR}
-        ${ENTROPY_GENERATED_INCLUDE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}
+        $<BUILD_INTERFACE:${ENTROPY_INCLUDE_DIR}>
+        $<BUILD_INTERFACE:${ENTROPY_GENERATED_INCLUDE_DIR}>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
 target_link_libraries(entropy
@@ -243,5 +251,28 @@ set_target_properties(entropy_shell PROPERTIES
 )
 
 install(TARGETS entropy_shell
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Library Install & Export
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Every library target reachable from the public `entropy` umbrella is installed
+# and added to the `entropyTargets` export set consumed by entropyConfig.cmake.
+# entropy_shell_utils is intentionally excluded: it only backs the CLI executable
+# and is not part of the public library surface.
+install(TARGETS
+        entropy
+        entropy_common
+        entropy_storage
+        entropy_catalog
+        entropy_transaction
+        entropy_parser
+        entropy_optimizer
+        entropy_execution
+    EXPORT entropyTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
