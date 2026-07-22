@@ -70,7 +70,7 @@ Page* BufferPoolManager::fetch_page(page_id_t page_id) {
 
     // If victim page is dirty, flush it
     if (page->is_dirty()) {
-        auto status = disk_manager_->write_page(page->page_id(), page->data());
+        auto status = write_page_to_disk(page);
         if (!status.ok()) {
             LOG_ERROR("Failed to flush dirty page {}: {}", page->page_id(),
                       status.to_string());
@@ -148,7 +148,7 @@ bool BufferPoolManager::flush_page(page_id_t page_id) {
     }
     Page* page = &pages_[frame_index(frame_id)];
 
-    auto status = disk_manager_->write_page(page_id, page->data());
+    auto status = write_page_to_disk(page);
     if (!status.ok()) {
         return false;
     }
@@ -173,7 +173,7 @@ Page* BufferPoolManager::new_page(page_id_t* page_id) {
 
     // Flush victim if dirty
     if (page->is_dirty()) {
-        auto status = disk_manager_->write_page(page->page_id(), page->data());
+        auto status = write_page_to_disk(page);
         if (!status.ok()) {
             LOG_ERROR("Failed to flush dirty page {}: {}", page->page_id(),
                       status.to_string());
@@ -232,6 +232,11 @@ size_t BufferPoolManager::free_list_size() const {
     return free_list_.size();
 }
 
+void BufferPoolManager::set_wal_flush_hook(std::function<Status(lsn_t)> hook) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    wal_flush_hook_ = std::move(hook);
+}
+
 void BufferPoolManager::flush_all_pages() {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -242,7 +247,7 @@ void BufferPoolManager::flush_all_pages() {
         }
         Page* page = &pages_[frame_index(frame_id)];
         if (page->is_dirty()) {
-            auto status = disk_manager_->write_page(page_id, page->data());
+            auto status = write_page_to_disk(page);
             if (status.ok()) {
                 page->set_dirty(false);
             } else {
@@ -251,6 +256,19 @@ void BufferPoolManager::flush_all_pages() {
             }
         }
     }
+}
+
+Status BufferPoolManager::write_page_to_disk(Page* page) {
+    // WAL-before-page (steal): the log must be durable up to this page's LSN
+    // before the page itself reaches disk. If the log flush fails, the page
+    // write must not happen at all.
+    if (wal_flush_hook_) {
+        auto status = wal_flush_hook_(page->lsn());
+        if (!status.ok()) {
+            return status;
+        }
+    }
+    return disk_manager_->write_page(page->page_id(), page->data());
 }
 
 frame_id_t BufferPoolManager::find_victim_frame() {
