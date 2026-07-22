@@ -80,6 +80,10 @@ enum class TokenType {
   TEXT,
   FLOAT,
   DOUBLE,
+  DECIMAL,
+  TIMESTAMP,
+  DATE,
+  CHAR,
 
   // Symbols
   LPAREN,    // (
@@ -140,7 +144,7 @@ struct Token {
   [[nodiscard]] bool is(TokenType t) const noexcept { return type == t; }
 
   [[nodiscard]] bool is_keyword() const noexcept {
-    return type >= TokenType::CREATE && type <= TokenType::DOUBLE;
+    return type >= TokenType::CREATE && type <= TokenType::CHAR;
   }
 
   [[nodiscard]] bool is_literal() const noexcept {

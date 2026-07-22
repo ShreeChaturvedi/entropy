@@ -74,6 +74,10 @@ const std::unordered_map<std::string, TokenType> Lexer::keywords_ = {
     {"TEXT", TokenType::TEXT},
     {"FLOAT", TokenType::FLOAT},
     {"DOUBLE", TokenType::DOUBLE},
+    {"DECIMAL", TokenType::DECIMAL},
+    {"TIMESTAMP", TokenType::TIMESTAMP},
+    {"DATE", TokenType::DATE},
+    {"CHAR", TokenType::CHAR},
 };
 
 const char *token_type_to_string(TokenType type) {
@@ -176,6 +180,14 @@ const char *token_type_to_string(TokenType type) {
     return "FLOAT";
   case TokenType::DOUBLE:
     return "DOUBLE";
+  case TokenType::DECIMAL:
+    return "DECIMAL";
+  case TokenType::TIMESTAMP:
+    return "TIMESTAMP";
+  case TokenType::DATE:
+    return "DATE";
+  case TokenType::CHAR:
+    return "CHAR";
   case TokenType::LPAREN:
     return "LPAREN";
   case TokenType::RPAREN:

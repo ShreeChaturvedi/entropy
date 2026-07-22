@@ -758,7 +758,41 @@ TypeId Parser::parse_data_type(size_t *length_out) {
     type = TypeId::FLOAT;
   } else if (match(TokenType::DOUBLE)) {
     type = TypeId::DOUBLE;
-  } else if (match(TokenType::VARCHAR) || match(TokenType::TEXT)) {
+  } else if (match(TokenType::TIMESTAMP) || match(TokenType::DATE)) {
+    // The engine has a single date/time type (TIMESTAMP). DATE is accepted as a
+    // synonym so it is declarable from SQL rather than rejected outright.
+    type = TypeId::TIMESTAMP;
+  } else if (match(TokenType::DECIMAL)) {
+    type = TypeId::DECIMAL;
+    // Accept optional precision/scale: DECIMAL(p) or DECIMAL(p, s). Storage is a
+    // fixed-width slot, so the values are validated for form and consumed; the
+    // precision/scale are not yet carried into the column metadata.
+    if (match(TokenType::LPAREN)) {
+      uint64_t ignored = 0;
+      if (!check(TokenType::INTEGER_LITERAL)) {
+        set_error("Expected precision in DECIMAL(precision[, scale])");
+        return type;
+      }
+      if (!to_uint64(current_.value, &ignored)) {
+        return type;
+      }
+      advance();
+      if (match(TokenType::COMMA)) {
+        if (!check(TokenType::INTEGER_LITERAL)) {
+          set_error("Expected scale in DECIMAL(precision, scale)");
+          return type;
+        }
+        if (!to_uint64(current_.value, &ignored)) {
+          return type;
+        }
+        advance();
+      }
+      expect(TokenType::RPAREN, "Expected )");
+    }
+  } else if (match(TokenType::VARCHAR) || match(TokenType::TEXT) ||
+             match(TokenType::CHAR)) {
+    // CHAR maps onto the engine's VARCHAR representation (there is no separate
+    // fixed-length character type); both accept an optional length.
     type = TypeId::VARCHAR;
     // Parse optional length: VARCHAR(100)
     if (match(TokenType::LPAREN)) {
