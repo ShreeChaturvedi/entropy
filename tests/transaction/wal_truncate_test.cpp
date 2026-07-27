@@ -362,5 +362,109 @@ TEST_F(CheckpointTruncateRecoveryTest, ActiveTxnsSkipTruncation) {
   EXPECT_TRUE(saw_checkpoint);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Demonstrable WAL bound: periodic checkpoints keep LogStore size finite
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(WALBoundTest, PeriodicCheckpointsKeepLogStoreSizeBounded) {
+  // Long multi-round workload: each round appends a batch of committed
+  // BEGIN/INSERT/COMMIT records and dirties a page, then checkpoints with an
+  // empty active set so truncate_before reclaims the pre-anchor prefix.
+  // With truncation, peak LogStore size stays under a fixed bound. Without
+  // it, the same volume of work grows past that bound — evidence that
+  // truncation is what keeps the WAL from growing without limit.
+  constexpr int kRounds = 40;
+  constexpr int kTxnsPerRound = 25;
+  // One round of 25 tiny inserts is a few KB plus a checkpoint record; a
+  // generous bound still sits far below the no-truncation total.
+  constexpr uint64_t kBoundBytes = 32 * 1024;
+
+  test::TempFile db("wal_bound_db_");
+  const std::string wal_path = db.path().string() + ".wal";
+  auto cleanup = [&] {
+    std::error_code ec;
+    std::filesystem::remove(wal_path, ec);
+  };
+  cleanup();
+
+  auto disk = std::make_shared<FileDiskManager>(db.string());
+  auto pool = std::make_shared<BufferPoolManager>(32, disk);
+  auto store = std::make_shared<FileLogStore>(wal_path);
+  auto wal = std::make_shared<WALManager>(store);
+
+  // Initialize page 0 once so inserts can stamp an LSN.
+  {
+    Page *page = pool->fetch_page(0);
+    ASSERT_NE(page, nullptr);
+    TablePage table_page(page);
+    table_page.init();
+    pool->unpin_page(0, true);
+  }
+
+  txn_id_t next_txn = 1;
+  uint64_t peak_with_trunc = 0;
+  RecoveryManager checkpointer(pool, wal, disk);
+
+  auto append_round = [&](int n) {
+    for (int i = 0; i < n; ++i) {
+      const txn_id_t tid = next_txn++;
+      auto begin = LogRecord::make_begin(tid);
+      ASSERT_NE(wal->append_log(begin), INVALID_LSN);
+      auto row = std::vector<char>{'r', static_cast<char>(i & 0x7f),
+                                   static_cast<char>(tid & 0x7f)};
+      auto insert = LogRecord::make_insert(tid, begin.lsn(), 10, RID(0, 0), row);
+      ASSERT_NE(wal->append_log(insert), INVALID_LSN);
+      {
+        Page *page = pool->fetch_page(0);
+        ASSERT_NE(page, nullptr);
+        page->set_lsn(insert.lsn());
+        pool->unpin_page(0, true);
+      }
+      auto commit = LogRecord::make_commit(tid, insert.lsn());
+      ASSERT_NE(wal->append_log(commit), INVALID_LSN);
+    }
+    ASSERT_TRUE(wal->flush().ok());
+  };
+
+  for (int round = 0; round < kRounds; ++round) {
+    append_round(kTxnsPerRound);
+    peak_with_trunc = std::max(peak_with_trunc, store->size());
+    ASSERT_TRUE(checkpointer.create_checkpoint({}).ok());
+    peak_with_trunc = std::max(peak_with_trunc, store->size());
+  }
+
+  EXPECT_LT(peak_with_trunc, kBoundBytes)
+      << "with periodic checkpoint truncation, WAL must stay under a fixed "
+         "bound; peak="
+      << peak_with_trunc;
+
+  // Control: same total transaction volume, no checkpoint/truncation.
+  cleanup();
+  next_txn = 1;
+  disk = std::make_shared<FileDiskManager>(db.string());
+  pool = std::make_shared<BufferPoolManager>(32, disk);
+  store = std::make_shared<FileLogStore>(wal_path);
+  wal = std::make_shared<WALManager>(store);
+  {
+    Page *page = pool->fetch_page(0);
+    ASSERT_NE(page, nullptr);
+    TablePage table_page(page);
+    table_page.init();
+    pool->unpin_page(0, true);
+  }
+  for (int round = 0; round < kRounds; ++round) {
+    append_round(kTxnsPerRound);
+  }
+  const uint64_t size_without_trunc = store->size();
+  EXPECT_GT(size_without_trunc, kBoundBytes)
+      << "without truncation the same workload must grow past the bound; "
+         "size="
+      << size_without_trunc;
+  EXPECT_GT(size_without_trunc, peak_with_trunc)
+      << "truncated run must reclaim space the control retains";
+
+  cleanup();
+}
+
 }  // namespace
 }  // namespace entropy
