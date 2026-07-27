@@ -231,19 +231,21 @@ void BPlusTree::change_root(page_id_t new_root_id) {
 }
 
 BPlusTree::BPlusTree(std::shared_ptr<BufferPoolManager> buffer_pool,
-                     page_id_t root_page_id)
+                     page_id_t root_page_id, bool unique)
     : buffer_pool_(std::move(buffer_pool))
     , root_page_id_(root_page_id)
     , leaf_max_size_(BPTreeLeafPage::compute_max_size())
-    , internal_max_size_(BPTreeInternalPage::compute_max_size()) {}
+    , internal_max_size_(BPTreeInternalPage::compute_max_size())
+    , unique_(unique) {}
 
 BPlusTree::BPlusTree(std::shared_ptr<BufferPoolManager> buffer_pool,
                      page_id_t root_page_id, uint32_t leaf_max_size,
-                     uint32_t internal_max_size)
+                     uint32_t internal_max_size, bool unique)
     : buffer_pool_(std::move(buffer_pool))
     , root_page_id_(root_page_id)
     , leaf_max_size_(leaf_max_size)
-    , internal_max_size_(internal_max_size) {}
+    , internal_max_size_(internal_max_size)
+    , unique_(unique) {}
 
 Page* BPlusTree::latch_root_read() const {
     while (true) {
@@ -327,6 +329,15 @@ std::optional<BPlusTree::ValueType> BPlusTree::find(KeyType key) {
     leaf_page->runlatch();
     buffer_pool_->unpin_page(leaf_id, false);
     return result;
+}
+
+std::vector<RID> BPlusTree::find_all(KeyType key) {
+    // Unique trees store at most one RID per key. Multi-match lands in WS2.
+    std::vector<RID> out;
+    if (auto rid = find(key); rid.has_value()) {
+        out.push_back(*rid);
+    }
+    return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -608,6 +619,12 @@ void BPlusTree::drain_deferred_free() {
         }
     }
     deferred_free_ = std::move(still_refused);
+}
+
+Status BPlusTree::remove(KeyType key, const RID & /*rid*/) {
+    // Unique path: a single entry per key, so RID is ignored. Non-unique
+    // multi-match removal is deferred to WS2.
+    return remove(key);
 }
 
 Status BPlusTree::remove(KeyType key) {
@@ -1008,10 +1025,10 @@ Status BPlusTree::flush_all_pages() {
 // Iterator Support
 // ─────────────────────────────────────────────────────────────────────────────
 
-BPlusTreeIterator BPlusTree::lower_bound(KeyType key) {
+BPlusTreeIterator BPlusTree::lower_bound_leaf(KeyType key) {
     Page* leaf_page = descend_to_leaf_read(key);
     if (leaf_page == nullptr) {
-        return end();
+        return end_leaf();
     }
 
     BPTreeLeafPage leaf(leaf_page);
@@ -1026,17 +1043,17 @@ BPlusTreeIterator BPlusTree::lower_bound(KeyType key) {
     if (idx >= nkeys) {
         // Position falls past this leaf; start at the next one, if any.
         if (next_leaf == INVALID_PAGE_ID) {
-            return end();
+            return end_leaf();
         }
         return BPlusTreeIterator(this, next_leaf, 0);
     }
     return BPlusTreeIterator(this, leaf_id, idx);
 }
 
-BPlusTreeIterator BPlusTree::begin() {
+BPlusTreeIterator BPlusTree::begin_leaf() {
     Page* page = latch_root_read();
     if (page == nullptr) {
-        return end();
+        return end_leaf();
     }
 
     // Descend to the leftmost leaf, hand-over-hand.
@@ -1049,7 +1066,7 @@ BPlusTreeIterator BPlusTree::begin() {
             page->runlatch();
             buffer_pool_->unpin_page(leaf_id, false);
             if (nkeys == 0) {
-                return end();
+                return end_leaf();
             }
             return BPlusTreeIterator(this, leaf_id, 0);
         }
@@ -1061,7 +1078,7 @@ BPlusTreeIterator BPlusTree::begin() {
             page_id_t pid = page->page_id();
             page->runlatch();
             buffer_pool_->unpin_page(pid, false);
-            return end();
+            return end_leaf();
         }
         child->rlatch();
         page_id_t pid = page->page_id();
@@ -1071,8 +1088,20 @@ BPlusTreeIterator BPlusTree::begin() {
     }
 }
 
-BPlusTreeIterator BPlusTree::end() {
+BPlusTreeIterator BPlusTree::end_leaf() {
     return BPlusTreeIterator();
+}
+
+IndexIterator BPlusTree::lower_bound(KeyType key) {
+    return IndexIterator(lower_bound_leaf(key));
+}
+
+IndexIterator BPlusTree::begin() {
+    return IndexIterator(begin_leaf());
+}
+
+IndexIterator BPlusTree::end() {
+    return IndexIterator(end_leaf());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

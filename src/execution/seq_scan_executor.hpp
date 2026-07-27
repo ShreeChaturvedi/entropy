@@ -15,7 +15,8 @@ namespace entropy {
  * @brief Sequential scan executor
  *
  * Iterates through all tuples in a TableHeap, optionally
- * filtering with a predicate expression.
+ * filtering with a predicate expression. Keeps TableHeap (not TableStore)
+ * because TableIterator friends the concrete heap for the scan mutex.
  */
 class SeqScanExecutor : public Executor {
 public:

@@ -51,6 +51,7 @@
 #include "storage/buffer_pool.hpp"
 #include "storage/disk_manager.hpp"
 #include "storage/table_heap.hpp"
+#include "storage/table_store.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/mvcc.hpp"
 #include "transaction/recovery.hpp"
@@ -463,7 +464,7 @@ public:
     // Abort undo resolves table oids through the catalog. The shared_ptr
     // keeps the TableInfo (and its heap) alive across a concurrent drop.
     txn_manager_->set_table_resolver(
-        [catalog = catalog_](oid_t table_oid) -> TableHeap * {
+        [catalog = catalog_](oid_t table_oid) -> TableStore * {
           auto info = catalog->get_table_shared(table_oid);
           return info ? info->table_heap.get() : nullptr;
         });

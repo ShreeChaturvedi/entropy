@@ -25,7 +25,7 @@
 #include <optional>
 
 #include "execution/executor.hpp"
-#include "storage/b_plus_tree.hpp"
+#include "storage/index.hpp"
 #include "storage/table_heap.hpp"
 
 namespace entropy {
@@ -42,7 +42,7 @@ enum class IndexScanType {
 /**
  * @brief Index Scan Executor
  *
- * Uses B+ tree index for efficient lookups:
+ * Uses an Index for efficient lookups:
  * - Point lookup: O(log n) to find single key
  * - Range scan: O(log n + k) for k results
  *
@@ -54,36 +54,36 @@ public:
   /**
    * @brief Construct for point lookup
    * @param ctx Execution context
-   * @param index B+ tree index
+   * @param index Secondary index
    * @param table_heap Table containing actual rows
    * @param schema Output schema
    * @param key Key value to look up
    */
-  IndexScanExecutor(ExecutorContext *ctx, BPlusTree *index,
-                    TableHeap *table_heap, const Schema *schema, BPTreeKey key);
+  IndexScanExecutor(ExecutorContext *ctx, Index *index, TableHeap *table_heap,
+                    const Schema *schema, BPTreeKey key);
 
   /**
    * @brief Construct for range scan
    * @param ctx Execution context
-   * @param index B+ tree index
+   * @param index Secondary index
    * @param table_heap Table containing actual rows
    * @param schema Output schema
    * @param start_key Start of range (inclusive)
    * @param end_key End of range (inclusive)
    */
-  IndexScanExecutor(ExecutorContext *ctx, BPlusTree *index,
-                    TableHeap *table_heap, const Schema *schema,
-                    BPTreeKey start_key, BPTreeKey end_key);
+  IndexScanExecutor(ExecutorContext *ctx, Index *index, TableHeap *table_heap,
+                    const Schema *schema, BPTreeKey start_key,
+                    BPTreeKey end_key);
 
   /**
    * @brief Construct for full index scan
    * @param ctx Execution context
-   * @param index B+ tree index
+   * @param index Secondary index
    * @param table_heap Table containing actual rows
    * @param schema Output schema
    */
-  IndexScanExecutor(ExecutorContext *ctx, BPlusTree *index,
-                    TableHeap *table_heap, const Schema *schema);
+  IndexScanExecutor(ExecutorContext *ctx, Index *index, TableHeap *table_heap,
+                    const Schema *schema);
 
   void init() override;
   std::optional<Tuple> next() override;
@@ -95,7 +95,7 @@ private:
   // slot is probed as a ghost: its retained before-image may still be visible.
   [[nodiscard]] std::optional<Tuple> fetch_visible(RID rid);
 
-  BPlusTree *index_;
+  Index *index_;
   TableHeap *table_heap_;
   const Schema *schema_;
 
@@ -103,9 +103,9 @@ private:
   BPTreeKey start_key_ = 0;
   BPTreeKey end_key_ = 0;
 
-  // Iterator for range/full scans
-  BPlusTreeIterator iterator_;
-  BPlusTreeIterator end_iterator_;
+  // Iterator for range/full scans (type-erased over the concrete index)
+  IndexIterator iterator_;
+  IndexIterator end_iterator_;
 
   // For point lookup (may have duplicates if non-unique index)
   std::optional<RID> point_lookup_rid_;

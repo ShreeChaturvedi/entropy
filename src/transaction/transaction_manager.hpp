@@ -27,6 +27,7 @@ namespace entropy {
 class WALManager;
 class LockManager;
 class TableHeap;
+class TableStore;
 class MVCCManager;
 class VersionStore;
 class BufferPoolManager;
@@ -210,12 +211,13 @@ public:
     }
 
     /**
-     * @brief Resolve table OID -> TableHeap for abort undo
+     * @brief Resolve table OID -> TableStore for abort undo
      *
      * Called for each write-set entry during abort. Returning nullptr skips
-     * physical undo for that entry (logged as a warning).
+     * physical undo for that entry (logged as a warning). Concrete heaps
+     * remain TableHeap; TableStore* is the abstract CRUD surface.
      */
-    using TableResolver = std::function<TableHeap*(oid_t table_oid)>;
+    using TableResolver = std::function<TableStore *(oid_t table_oid)>;
     void set_table_resolver(TableResolver resolver) {
         table_resolver_ = std::move(resolver);
     }

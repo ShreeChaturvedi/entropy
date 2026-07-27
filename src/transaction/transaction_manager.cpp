@@ -13,6 +13,7 @@
 #include "storage/buffer_pool.hpp"
 #include "storage/page.hpp"
 #include "storage/table_heap.hpp"
+#include "storage/table_store.hpp"
 #include "storage/tuple.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/log_record.hpp"
@@ -253,7 +254,7 @@ void TransactionManager::undo_write_record(const WriteRecord& record) {
         return;
     }
 
-    TableHeap* heap = table_resolver_(record.table_oid);
+    TableStore* heap = table_resolver_(record.table_oid);
     if (heap == nullptr) {
         LOG_WARN("Abort undo skipped: table {} not found", record.table_oid);
         return;

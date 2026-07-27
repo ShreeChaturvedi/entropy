@@ -29,7 +29,7 @@ namespace entropy {
 
 // Forward declarations
 class Catalog;
-class TableHeap;
+class TableStore;
 class Schema;
 
 // ─────────────────────────────────────────────────────────────────────────────

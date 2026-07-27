@@ -22,14 +22,14 @@ namespace entropy {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Point lookup constructor
-IndexScanExecutor::IndexScanExecutor(ExecutorContext *ctx, BPlusTree *index,
+IndexScanExecutor::IndexScanExecutor(ExecutorContext *ctx, Index *index,
                                      TableHeap *table_heap,
                                      const Schema *schema, BPTreeKey key)
     : Executor(ctx), index_(index), table_heap_(table_heap), schema_(schema),
       scan_type_(IndexScanType::POINT_LOOKUP), start_key_(key), end_key_(key) {}
 
 // Range scan constructor
-IndexScanExecutor::IndexScanExecutor(ExecutorContext *ctx, BPlusTree *index,
+IndexScanExecutor::IndexScanExecutor(ExecutorContext *ctx, Index *index,
                                      TableHeap *table_heap,
                                      const Schema *schema, BPTreeKey start_key,
                                      BPTreeKey end_key)
@@ -38,7 +38,7 @@ IndexScanExecutor::IndexScanExecutor(ExecutorContext *ctx, BPlusTree *index,
       end_key_(end_key) {}
 
 // Full scan constructor
-IndexScanExecutor::IndexScanExecutor(ExecutorContext *ctx, BPlusTree *index,
+IndexScanExecutor::IndexScanExecutor(ExecutorContext *ctx, Index *index,
                                      TableHeap *table_heap,
                                      const Schema *schema)
     : Executor(ctx), index_(index), table_heap_(table_heap), schema_(schema),

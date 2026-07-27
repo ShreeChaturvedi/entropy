@@ -24,7 +24,7 @@ namespace entropy {
 // Forward declarations
 class BufferPoolManager;
 class TableHeap;
-class BPlusTree;
+class Index;
 struct CatalogManifest;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -54,17 +54,18 @@ struct TableInfo {
  * @brief Complete information about an index
  */
 struct IndexInfo {
-  oid_t oid;                        ///< Unique index identifier
-  std::string name;                 ///< Index name
-  oid_t table_oid;                  ///< Table this index belongs to
-  column_id_t key_column;           ///< Column being indexed
-  std::shared_ptr<BPlusTree> index; ///< B+ tree index structure
+  oid_t oid;                    ///< Unique index identifier
+  std::string name;             ///< Index name
+  oid_t table_oid;              ///< Table this index belongs to
+  column_id_t key_column;       ///< Column being indexed
+  std::shared_ptr<Index> index; ///< Index structure (BPlusTree today)
+  bool is_unique = true; ///< Unique-key enforcement (default: unique for compat)
 
   IndexInfo() = default;
   IndexInfo(oid_t id, std::string n, oid_t tbl, column_id_t col,
-            std::shared_ptr<BPlusTree> idx)
+            std::shared_ptr<Index> idx, bool unique = true)
       : oid(id), name(std::move(n)), table_oid(tbl), key_column(col),
-        index(std::move(idx)) {}
+        index(std::move(idx)), is_unique(unique) {}
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

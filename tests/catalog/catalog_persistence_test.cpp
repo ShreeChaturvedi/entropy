@@ -297,13 +297,15 @@ TEST(CatalogPersistence, IndexRootChangeSurvivesReopen) {
   // (creation, then a split) after create_index already persisted. Keys up
   // to the last root change are durable via the callback's flush; later
   // ones may live only in unflushed leaves.
-  page_id_t prev_root = idx->index->root_page_id();
+  auto tree = std::dynamic_pointer_cast<BPlusTree>(idx->index);
+  ASSERT_NE(tree, nullptr);
+  page_id_t prev_root = tree->root_page_id();
   int last_root_change_key = -1;
   for (int i = 0; i < 600; ++i) {
     ASSERT_TRUE(
         idx->index->insert(i, RID(1, static_cast<slot_id_t>(i % 100))).ok());
-    if (idx->index->root_page_id() != prev_root) {
-      prev_root = idx->index->root_page_id();
+    if (tree->root_page_id() != prev_root) {
+      prev_root = tree->root_page_id();
       last_root_change_key = i;
     }
   }
