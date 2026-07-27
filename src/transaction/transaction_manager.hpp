@@ -28,6 +28,7 @@ class WALManager;
 class LockManager;
 class TableHeap;
 class TableStore;
+class Index;
 class MVCCManager;
 class VersionStore;
 class BufferPoolManager;
@@ -223,6 +224,16 @@ public:
     }
 
     /**
+     * @brief Resolve index OID -> Index for abort undo of INDEX_* write records
+     *
+     * Returning nullptr skips physical undo for that entry (logged as a warning).
+     */
+    using IndexResolver = std::function<Index *(oid_t index_oid)>;
+    void set_index_resolver(IndexResolver resolver) {
+        index_resolver_ = std::move(resolver);
+    }
+
+    /**
      * @brief Barrier that quiesces heap writers against a checkpoint
      *
      * The heap write path (TableHeap::insert_tuple/delete_tuple/
@@ -277,6 +288,7 @@ private:
     LockManager* lock_manager_ = nullptr;
     BufferPoolManager* buffer_pool_ = nullptr;
     TableResolver table_resolver_;
+    IndexResolver index_resolver_;
     std::unordered_map<txn_id_t, std::unique_ptr<Transaction>> txn_map_;
     txn_id_t next_txn_id_ = 1;
     /// Highest version-GC bound already applied (guarded by mutex_). A commit
