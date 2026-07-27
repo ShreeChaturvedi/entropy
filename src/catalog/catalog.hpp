@@ -143,11 +143,20 @@ public:
    * @param index_name Name of the index
    * @param table_name Table to index
    * @param column_name Column to index
-   * @return Status::Ok() on success
+   * @param is_unique When true, reject duplicate keys during build and DML.
+   *        Default false (SQL CREATE INDEX is non-unique).
+   * @return Status::Ok() on success; AlreadyExists if a unique index would
+   *         drop/reject duplicate heap keys during build
    */
   [[nodiscard]] Status create_index(const std::string &index_name,
                                     const std::string &table_name,
-                                    const std::string &column_name);
+                                    const std::string &column_name,
+                                    bool is_unique = false);
+
+  /**
+   * @brief Drop an index by name and reclaim its pages
+   */
+  [[nodiscard]] Status drop_index(const std::string &index_name);
 
   /**
    * @brief Look up an index, returning a stable owning handle

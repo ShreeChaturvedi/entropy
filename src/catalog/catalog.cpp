@@ -19,8 +19,9 @@ namespace {
 
 /// Insert one entry per heap tuple into @p index, keyed by column @p col_idx.
 /// Used by create_index and to rebuild an index whose root page was lost.
-void build_index_from_heap(const TableInfo &table, uint32_t col_idx,
-                           Index &index) {
+/// Propagates insert failures (unique-key conflicts must not be dropped).
+Status build_index_from_heap(const TableInfo &table, uint32_t col_idx,
+                             Index &index) {
   for (auto it = table.table_heap->begin(); it != table.table_heap->end();
        ++it) {
     Tuple tuple = *it;
@@ -32,8 +33,12 @@ void build_index_from_heap(const TableInfo &table, uint32_t col_idx,
     } else if (key_val.is_bigint()) {
       key = key_val.as_bigint();
     }
-    (void)index.insert(key, it.rid());
+    Status st = index.insert(key, it.rid());
+    if (!st.ok()) {
+      return st;
+    }
   }
+  return Status::Ok();
 }
 
 /// BPlusTree-only helpers used for root callbacks / page reclaim.
@@ -115,7 +120,7 @@ void Catalog::load_from_manifest() {
       if (table_it != tables_.end() && table_it->second->table_heap) {
         // No listener is registered yet, so the rebuild inserts do not
         // persist per root change; the next DDL or root change will.
-        build_index_from_heap(*table_it->second, idx.key_column, *tree);
+        (void)build_index_from_heap(*table_it->second, idx.key_column, *tree);
       }
     }
 
@@ -409,7 +414,7 @@ std::vector<std::string> Catalog::get_table_names() const {
 
 Status Catalog::create_index(const std::string &index_name,
                              const std::string &table_name,
-                             const std::string &column_name) {
+                             const std::string &column_name, bool is_unique) {
   std::unique_lock lock(mutex_);
 
   // Check if index already exists.
@@ -429,8 +434,9 @@ Status Catalog::create_index(const std::string &index_name,
     return Status::NotFound("Column not found: " + column_name);
   }
 
-  // Create B+ tree index (unique by default; matches historical behavior).
-  auto index = std::make_shared<BPlusTree>(buffer_pool_);
+  // Create B+ tree with the requested uniqueness policy.
+  auto index =
+      std::make_shared<BPlusTree>(buffer_pool_, INVALID_PAGE_ID, is_unique);
 
   // Allocate new OID.
   oid_t oid = next_oid_++;
@@ -438,10 +444,17 @@ Status Catalog::create_index(const std::string &index_name,
   // Create IndexInfo.
   auto info = std::make_shared<IndexInfo>(
       oid, index_name, table_info->oid, static_cast<column_id_t>(col_idx),
-      index, /*is_unique=*/true);
+      index, is_unique);
 
-  // Build index from existing data.
-  build_index_from_heap(*table_info, static_cast<uint32_t>(col_idx), *index);
+  // Build index from existing data. Unique indexes fail on duplicate keys
+  // rather than silently dropping heap rows.
+  Status built =
+      build_index_from_heap(*table_info, static_cast<uint32_t>(col_idx), *index);
+  if (!built.ok()) {
+    (void)index->reclaim_all_pages();
+    next_oid_--;
+    return built;
+  }
 
   // Durability order: flush the freshly built tree pages before persisting
   // the manifest that references the tree's root, and roll back if any page
@@ -470,6 +483,39 @@ Status Catalog::create_index(const std::string &index_name,
   // Register only after the build: root changes during the build would call
   // back into the lock this thread already holds.
   register_root_listener(info);
+
+  return Status::Ok();
+}
+
+Status Catalog::drop_index(const std::string &index_name) {
+  std::unique_lock lock(mutex_);
+
+  auto name_it = index_names_.find(index_name);
+  if (name_it == index_names_.end()) {
+    return Status::NotFound("Index not found: " + index_name);
+  }
+
+  oid_t oid = name_it->second;
+  std::shared_ptr<IndexInfo> info = find_index(oid);
+
+  indexes_.erase(oid);
+  index_names_.erase(name_it);
+
+  Status persisted = persist();
+  if (!persisted.ok()) {
+    if (info) {
+      index_names_[index_name] = oid;
+      indexes_[oid] = info;
+    }
+    return persisted;
+  }
+
+  if (info) {
+    if (auto tree = as_bplus_tree(info->index)) {
+      tree->set_root_change_callback(nullptr);
+      (void)tree->reclaim_all_pages();
+    }
+  }
 
   return Status::Ok();
 }
