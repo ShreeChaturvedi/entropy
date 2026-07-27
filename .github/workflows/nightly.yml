@@ -1,0 +1,66 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # daily
+  workflow_dispatch:
+
+jobs:
+  # Deterministic crash-simulation seed sweep across every schedule named by
+  # entropy-sim --list. Modest per-schedule seed counts keep wall time under a
+  # typical nightly budget while still exercising recovery paths beyond the
+  # unit-test sample (40 seeds). Nonzero exit if any schedule fails a seed.
+  entropy-sim-sweep:
+    name: entropy-sim seed sweep
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DENTROPY_BUILD_TESTS=OFF
+          -DENTROPY_BUILD_EXAMPLES=OFF
+          -DENTROPY_BUILD_BENCHMARKS=OFF
+
+      - name: Build entropy-sim
+        run: cmake --build build --config Release --target entropy_sim_cli --parallel
+
+      - name: Run seed sweep across all schedules
+        run: |
+          set -euo pipefail
+          mkdir -p sim-results
+          SEEDS=200
+          mapfile -t SCHEDULES < <(./build/tools/entropy-sim --list | awk '/^  / {print $1}')
+          if [ "${#SCHEDULES[@]}" -eq 0 ]; then
+            echo "error: entropy-sim --list returned no schedules"
+            exit 1
+          fi
+          echo "schedules: ${SCHEDULES[*]} (seeds=${SEEDS} each)"
+          fail=0
+          for s in "${SCHEDULES[@]}"; do
+            out="sim-results/${s}.jsonl"
+            echo "::group::schedule=${s} seeds=${SEEDS}"
+            if ! ./build/tools/entropy-sim \
+                --schedule "$s" \
+                --seeds "$SEEDS" \
+                --start-seed 1 \
+                --out "$out"; then
+              echo "schedule ${s} failed"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "${fail}"
+
+      - name: Upload JSONL results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: entropy-sim-jsonl-${{ github.run_id }}
+          path: sim-results/*.jsonl
+          if-no-files-found: warn
