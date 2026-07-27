@@ -57,6 +57,32 @@ uint64_t SimLogStore::size() const {
   return bytes_.size();
 }
 
+Status SimLogStore::truncate_prefix(uint64_t offset) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (crashed_) {
+    return Status::Ok();  // frozen device: no-op, draw no randomness
+  }
+  if (offset > bytes_.size()) {
+    return Status::InvalidArgument("truncate_prefix offset exceeds size");
+  }
+  if (offset == 0) {
+    return Status::Ok();
+  }
+
+  bytes_.erase(bytes_.begin(),
+               bytes_.begin() + static_cast<std::ptrdiff_t>(offset));
+  // Durable watermark shifts with the discarded prefix; never exceed new size.
+  if (durable_size_ >= offset) {
+    durable_size_ -= offset;
+  } else {
+    durable_size_ = 0;
+  }
+  if (durable_size_ > bytes_.size()) {
+    durable_size_ = bytes_.size();
+  }
+  return Status::Ok();
+}
+
 void SimLogStore::set_sync_hook_for_testing(std::function<Status()> /*hook*/) {
   // The simulator models durability directly, so the WAL test sync hook is
   // intentionally ignored; sync() is the fsync boundary. The hook's contract

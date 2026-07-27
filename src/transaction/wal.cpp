@@ -162,6 +162,145 @@ std::vector<char> FileLogStore::read_all() {
     return bytes;
 }
 
+Status FileLogStore::truncate_prefix(uint64_t offset) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    if (offset > size_) {
+        return Status::InvalidArgument("truncate_prefix offset exceeds size");
+    }
+    if (offset == 0) {
+        return Status::Ok();
+    }
+
+    // Push pending iostream buffers so the on-disk image matches size_.
+    stream_.flush();
+    if (stream_.fail()) {
+        stream_.clear();
+        return Status::IOError("Failed to flush WAL before truncate_prefix");
+    }
+
+    // Read the suffix that must survive. Write it to a sibling temp file first
+    // so a failure leaves the original file intact (consistent store).
+    std::vector<char> suffix;
+    if (offset < size_) {
+        std::ifstream in(path_, std::ios::binary);
+        if (!in.is_open()) {
+            return Status::IOError("Failed to open WAL for truncate read: " + path_);
+        }
+        in.seekg(static_cast<std::streamoff>(offset));
+        if (in.fail()) {
+            return Status::IOError("Failed to seek WAL for truncate_prefix");
+        }
+        suffix.resize(size_ - offset);
+        in.read(suffix.data(), static_cast<std::streamsize>(suffix.size()));
+        if (static_cast<size_t>(in.gcount()) != suffix.size()) {
+            return Status::IOError("Failed to read WAL suffix for truncate_prefix");
+        }
+    }
+
+    const std::string temp_path = path_ + ".trunc_tmp";
+    {
+        std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) {
+            return Status::IOError("Failed to create temp file for truncate: " +
+                                   temp_path);
+        }
+        if (!suffix.empty()) {
+            out.write(suffix.data(), static_cast<std::streamsize>(suffix.size()));
+            if (out.fail()) {
+                out.close();
+                std::error_code ec;
+                std::filesystem::remove(temp_path, ec);
+                return Status::IOError("Failed to write truncated WAL suffix");
+            }
+        }
+        out.flush();
+        if (out.fail()) {
+            out.close();
+            std::error_code ec;
+            std::filesystem::remove(temp_path, ec);
+            return Status::IOError("Failed to flush truncated WAL temp file");
+        }
+    }
+
+    // Durably persist the temp file before swapping it into place.
+#ifdef _WIN32
+    {
+        const HANDLE handle =
+            ::CreateFileA(temp_path.c_str(), GENERIC_WRITE,
+                          FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            std::error_code ec;
+            std::filesystem::remove(temp_path, ec);
+            return Status::IOError("Failed to open temp WAL for flush");
+        }
+        const BOOL ok = ::FlushFileBuffers(handle);
+        ::CloseHandle(handle);
+        if (!ok) {
+            std::error_code ec;
+            std::filesystem::remove(temp_path, ec);
+            return Status::IOError("FlushFileBuffers failed on truncated WAL temp");
+        }
+    }
+#else
+    {
+        const int fd = ::open(temp_path.c_str(), O_RDWR);
+        if (fd < 0) {
+            std::error_code ec;
+            std::filesystem::remove(temp_path, ec);
+            return Status::IOError("Failed to open temp WAL for fsync");
+        }
+        const int rc = ::fsync(fd);
+        const int err = errno;
+        ::close(fd);
+        if (rc != 0) {
+            std::error_code ec;
+            std::filesystem::remove(temp_path, ec);
+            return Status::IOError("fsync failed on truncated WAL temp (errno=" +
+                                   std::to_string(err) + ")");
+        }
+    }
+#endif
+
+    // Close the live handle before replacing the file (required on Windows).
+    if (stream_.is_open()) {
+        stream_.close();
+    }
+
+    std::error_code rename_ec;
+    std::filesystem::rename(temp_path, path_, rename_ec);
+    if (rename_ec) {
+        // Fallback: remove destination then rename (some platforms refuse
+        // overwrite via rename when the target exists).
+        std::error_code rm_ec;
+        std::filesystem::remove(path_, rm_ec);
+        rename_ec.clear();
+        std::filesystem::rename(temp_path, path_, rename_ec);
+        if (rename_ec) {
+            // Original may already be gone; try to restore from temp if present.
+            std::error_code restore_ec;
+            std::filesystem::rename(temp_path, path_, restore_ec);
+            stream_.open(path_, std::ios::in | std::ios::out | std::ios::binary);
+            if (stream_.is_open()) {
+                stream_.seekp(0, std::ios::end);
+                const auto end_pos = stream_.tellp();
+                size_ = (end_pos > 0) ? static_cast<uint64_t>(end_pos) : 0;
+            }
+            return Status::IOError("Failed to replace WAL with truncated file: " +
+                                   rename_ec.message());
+        }
+    }
+
+    stream_.open(path_, std::ios::in | std::ios::out | std::ios::binary);
+    if (!stream_.is_open()) {
+        return Status::IOError("Failed to reopen WAL after truncate: " + path_);
+    }
+    stream_.seekp(0, std::ios::end);
+    size_ = suffix.size();
+    return Status::Ok();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // WALManager
 // ─────────────────────────────────────────────────────────────────────────────
@@ -320,6 +459,83 @@ Status WALManager::flush_to_lsn(lsn_t lsn) {
     }
 
     return flush();
+}
+
+Status WALManager::truncate_before(lsn_t truncate_lsn) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // INVALID_LSN / 0: no record has a strictly smaller LSN (LSNs start at 1).
+    if (truncate_lsn == INVALID_LSN) {
+        return Status::Ok();
+    }
+
+    // Make the store complete: buffered records must be durable before we
+    // decide what may be reclaimed, and truncation never walks past flushed.
+    Status flush_status = flush_internal();
+    if (!flush_status.ok()) {
+        return flush_status;
+    }
+
+    if (!log_store_) {
+        return Status::Ok();
+    }
+
+    // Scan the byte stream: LSNs are sequential counters, not file offsets.
+    // Find the first complete record with LSN >= truncate_lsn; its starting
+    // byte offset is the truncate_prefix cutoff.
+    const std::vector<char> bytes = log_store_->read_all();
+    size_t pos = 0;
+    uint64_t cut = 0;
+    bool found_keep = false;
+
+    while (pos + LOG_RECORD_HEADER_SIZE <= bytes.size()) {
+        LogRecordHeader header;
+        std::memcpy(&header, bytes.data() + pos, LOG_RECORD_HEADER_SIZE);
+
+        if (header.size < LOG_RECORD_HEADER_SIZE || header.size > WAL_MAX_RECORD_SIZE) {
+            break;
+        }
+        if (pos + header.size > bytes.size()) {
+            break;  // incomplete tail: leave it for the reader to drop
+        }
+
+        if (header.lsn >= truncate_lsn) {
+            cut = static_cast<uint64_t>(pos);
+            found_keep = true;
+            break;
+        }
+        pos += header.size;
+    }
+
+    if (!found_keep) {
+        // Every complete record is before the cutoff (or the log is empty /
+        // unparseable). Reclaim the complete prefix; keep any incomplete tail
+        // so a torn final record is not silently promoted.
+        cut = static_cast<uint64_t>(pos);
+        if (cut == 0 && bytes.empty()) {
+            return Status::Ok();
+        }
+        // If we parsed nothing but bytes remain, do not invent a cut.
+        if (cut == 0 && !bytes.empty()) {
+            return Status::Ok();
+        }
+        // All complete records discarded; if nothing incomplete remains, empty.
+        if (pos == bytes.size()) {
+            cut = bytes.size();
+        }
+    }
+
+    if (cut == 0) {
+        return Status::Ok();
+    }
+
+    Status trunc_status = log_store_->truncate_prefix(cut);
+    if (!trunc_status.ok()) {
+        return trunc_status;
+    }
+
+    LOG_INFO("WAL truncated before LSN {} (discarded {} bytes)", truncate_lsn, cut);
+    return Status::Ok();
 }
 
 std::vector<LogRecord> WALManager::read_log() {

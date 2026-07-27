@@ -80,6 +80,28 @@ target_link_libraries(transaction_tests
 
 gtest_discover_tests(transaction_tests)
 
+# WAL truncation (LogStore + WALManager + checkpoint reclaim). Links sim_log_store
+# sources directly so it does not need the full entropy_sim / catalog graph.
+add_executable(wal_truncate_tests
+    transaction/wal_truncate_test.cpp
+    ${CMAKE_SOURCE_DIR}/src/sim/sim_log_store.cpp
+)
+
+target_link_libraries(wal_truncate_tests
+    PRIVATE
+        entropy_transaction
+        test_utils
+        GTest::gtest
+        GTest::gtest_main
+)
+
+target_include_directories(wal_truncate_tests
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+)
+
+gtest_discover_tests(wal_truncate_tests)
+
 # Lock manager concurrency / deadlock (wait-die) tests
 add_executable(lock_manager_tests
     transaction/lock_manager_test.cpp
