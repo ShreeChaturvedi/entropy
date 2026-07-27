@@ -35,6 +35,7 @@ option(ENTROPY_BUILD_EXAMPLES "Build example programs" ON)
 option(ENTROPY_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(ENTROPY_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
 option(ENTROPY_BUILD_TUI "Build the terminal UI (fetches FTXUI)" OFF)
+option(ENTROPY_WERROR "Treat warnings as errors" OFF)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CMake Modules

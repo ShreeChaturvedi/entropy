@@ -40,6 +40,19 @@
         "ENTROPY_BUILD_TESTS": "OFF",
         "ENTROPY_BUILD_EXAMPLES": "OFF"
       }
+    },
+    {
+      "name": "ci",
+      "displayName": "CI",
+      "description": "Release build with tests and warnings-as-errors",
+      "binaryDir": "${sourceDir}/build/ci",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ENTROPY_BUILD_TESTS": "ON",
+        "ENTROPY_BUILD_EXAMPLES": "ON",
+        "ENTROPY_BUILD_BENCHMARKS": "OFF",
+        "ENTROPY_WERROR": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -54,6 +67,10 @@
     {
       "name": "bench",
       "configurePreset": "bench"
+    },
+    {
+      "name": "ci",
+      "configurePreset": "ci"
     }
   ],
   "testPresets": [
@@ -70,6 +87,14 @@
       "output": {
         "outputOnFailure": true
       }
+    },
+    {
+      "name": "ci",
+      "configurePreset": "ci",
+      "output": {
+        "outputOnFailure": true
+      },
+      "configuration": "Release"
     }
   ]
 }
