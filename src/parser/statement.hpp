@@ -291,6 +291,7 @@ public:
   std::string table_name;
   std::vector<std::string> columns;
   bool if_not_exists = false;
+  bool is_unique = false; ///< CREATE UNIQUE INDEX
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

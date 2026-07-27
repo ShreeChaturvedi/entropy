@@ -1051,6 +1051,22 @@ TEST_F(ParserTest, ParseCreateIndex) {
   EXPECT_EQ(idx->table_name, "users");
   ASSERT_EQ(idx->columns.size(), 1u);
   EXPECT_EQ(idx->columns[0], "name");
+  EXPECT_FALSE(idx->is_unique);
+}
+
+TEST_F(ParserTest, ParseCreateUniqueIndex) {
+  Parser parser("CREATE UNIQUE INDEX idx_id ON users (id)");
+  std::unique_ptr<Statement> stmt;
+  Status status = parser.parse(&stmt);
+  ASSERT_TRUE(status.ok()) << status.to_string();
+
+  auto *idx = dynamic_cast<CreateIndexStatement *>(stmt.get());
+  ASSERT_NE(idx, nullptr);
+  EXPECT_EQ(idx->index_name, "idx_id");
+  EXPECT_EQ(idx->table_name, "users");
+  ASSERT_EQ(idx->columns.size(), 1u);
+  EXPECT_EQ(idx->columns[0], "id");
+  EXPECT_TRUE(idx->is_unique);
 }
 
 TEST_F(ParserTest, ParseCreateIndexMultiColumn) {

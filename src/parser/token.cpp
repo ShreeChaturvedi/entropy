@@ -19,6 +19,7 @@ const std::unordered_map<std::string, TokenType> Lexer::keywords_ = {
     {"DROP", TokenType::DROP},
     {"TABLE", TokenType::TABLE},
     {"INDEX", TokenType::INDEX},
+    {"UNIQUE", TokenType::UNIQUE},
     {"PRIMARY", TokenType::PRIMARY},
     {"KEY", TokenType::KEY},
 
@@ -90,6 +91,8 @@ const char *token_type_to_string(TokenType type) {
     return "TABLE";
   case TokenType::INDEX:
     return "INDEX";
+  case TokenType::UNIQUE:
+    return "UNIQUE";
   case TokenType::PRIMARY:
     return "PRIMARY";
   case TokenType::KEY:
