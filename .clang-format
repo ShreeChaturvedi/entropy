@@ -1,0 +1,20 @@
+# Entropy C++ style (DESIGN.md Coding Conventions)
+# 4-space indent, 100-column limit, #pragma once headers.
+# Do not mass-reformat the tree until style debt is intentionally cleared.
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+AccessModifierOffset: -4
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AlwaysBreakTemplateDeclarations: Yes
+BreakBeforeBraces: Attach
+PointerAlignment: Right
+ReferenceAlignment: Right
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve
+SpaceAfterTemplateKeyword: true
+Standard: c++20

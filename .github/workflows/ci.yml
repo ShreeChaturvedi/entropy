@@ -8,6 +8,37 @@ on:
   pull_request:
 
 jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # clang-format dry-run against the engine/tooling trees. Installs the tool in
+  # the job so a missing host package never silently skips the check. Does not
+  # reformat the tree; style debt is paid intentionally, not by CI.
+  # ───────────────────────────────────────────────────────────────────────────
+  format-check:
+    name: clang-format
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
+
+      - name: Check formatting (dry-run)
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(
+            find src tests tools include tui \
+              \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \
+                 -o -name '*.h' -o -name '*.hh' -o -name '*.hpp' -o -name '*.hxx' \) \
+              -type f | sort
+          )
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No C/C++ sources found under src/ tests/ tools/ include/ tui/"
+            exit 1
+          fi
+          clang-format --dry-run -Werror "${files[@]}"
+
   build-test:
     runs-on: ${{ matrix.os }}
     strategy:
