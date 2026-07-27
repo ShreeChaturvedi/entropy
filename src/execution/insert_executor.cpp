@@ -5,6 +5,9 @@
 
 #include "execution/insert_executor.hpp"
 
+#include "catalog/catalog.hpp"
+#include "execution/executor_context.hpp"
+
 namespace entropy {
 
 void InsertExecutor::init() {
@@ -25,6 +28,14 @@ std::optional<Tuple> InsertExecutor::next() {
   // are null without a transaction context (executor unit tests).
   std::shared_mutex *barrier = txn_checkpoint_barrier(ctx_);
   const SlotReservedFn slot_reserved = txn_slot_reserved(ctx_);
+
+  const Schema *schema = nullptr;
+  if (ctx_ != nullptr && ctx_->catalog != nullptr &&
+      table_oid_ != INVALID_OID) {
+    if (const TableInfo *info = ctx_->catalog->get_table(table_oid_)) {
+      schema = &info->schema;
+    }
+  }
 
   // Insert all tuples
   while (current_idx_ < tuples_.size()) {
@@ -48,6 +59,14 @@ std::optional<Tuple> InsertExecutor::next() {
     if (!status.ok()) {
       status_ = status;
       break;
+    }
+
+    if (schema != nullptr) {
+      status = maintain_indexes_on_insert(ctx_, table_oid_, *schema, tuple, rid);
+      if (!status.ok()) {
+        status_ = status;
+        break;
+      }
     }
 
     rows_inserted_++;

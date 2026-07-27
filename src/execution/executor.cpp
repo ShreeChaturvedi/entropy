@@ -12,8 +12,13 @@
 #include <span>
 #include <vector>
 
+#include "catalog/catalog.hpp"
+#include "catalog/schema.hpp"
 #include "execution/executor_context.hpp"
+#include "storage/b_plus_tree_page.hpp" // BPTreeKey
+#include "storage/index.hpp"
 #include "transaction/lock_manager.hpp"
+#include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
 #include "transaction/version_store.hpp"
 
@@ -151,6 +156,111 @@ void txn_log_delete(const ExecutorContext *ctx, oid_t table_oid, RID rid,
     (void)ctx->txn_mgr->log_delete(ctx->txn, table_oid, rid,
                                    tuple_bytes(before));
   }
+}
+
+namespace {
+
+[[nodiscard]] BPTreeKey tuple_to_index_key(const Tuple &tuple,
+                                           const Schema &schema,
+                                           column_id_t col) {
+  TupleValue key_val = tuple.get_value(schema, col);
+  if (key_val.is_integer()) {
+    return static_cast<BPTreeKey>(key_val.as_integer());
+  }
+  if (key_val.is_bigint()) {
+    return key_val.as_bigint();
+  }
+  return 0;
+}
+
+void record_index_insert(const ExecutorContext *ctx, oid_t table_oid,
+                         oid_t index_oid, BPTreeKey key, RID rid) {
+  if (transactional(ctx) && ctx->txn != nullptr) {
+    ctx->txn->add_write_record(
+        WriteRecord::make_index_insert(table_oid, index_oid, key, rid));
+  }
+}
+
+void record_index_delete(const ExecutorContext *ctx, oid_t table_oid,
+                         oid_t index_oid, BPTreeKey key, RID rid) {
+  if (transactional(ctx) && ctx->txn != nullptr) {
+    ctx->txn->add_write_record(
+        WriteRecord::make_index_delete(table_oid, index_oid, key, rid));
+  }
+}
+
+} // namespace
+
+Status maintain_indexes_on_insert(const ExecutorContext *ctx, oid_t table_oid,
+                                  const Schema &schema, const Tuple &tuple,
+                                  RID rid) {
+  if (ctx == nullptr || ctx->catalog == nullptr || table_oid == INVALID_OID) {
+    return Status::Ok();
+  }
+  for (IndexInfo *info : ctx->catalog->get_table_indexes(table_oid)) {
+    if (info == nullptr || !info->index) {
+      continue;
+    }
+    BPTreeKey key = tuple_to_index_key(tuple, schema, info->key_column);
+    Status st = info->index->insert(key, rid);
+    if (!st.ok()) {
+      return st;
+    }
+    record_index_insert(ctx, table_oid, info->oid, key, rid);
+  }
+  return Status::Ok();
+}
+
+Status maintain_indexes_on_delete(const ExecutorContext *ctx, oid_t table_oid,
+                                  const Schema &schema, const Tuple &tuple,
+                                  RID rid) {
+  if (ctx == nullptr || ctx->catalog == nullptr || table_oid == INVALID_OID) {
+    return Status::Ok();
+  }
+  for (IndexInfo *info : ctx->catalog->get_table_indexes(table_oid)) {
+    if (info == nullptr || !info->index) {
+      continue;
+    }
+    BPTreeKey key = tuple_to_index_key(tuple, schema, info->key_column);
+    Status st = info->index->remove(key, rid);
+    if (!st.ok()) {
+      return st;
+    }
+    record_index_delete(ctx, table_oid, info->oid, key, rid);
+  }
+  return Status::Ok();
+}
+
+Status maintain_indexes_on_update(const ExecutorContext *ctx, oid_t table_oid,
+                                  const Schema &schema,
+                                  const Tuple &old_tuple, RID old_rid,
+                                  const Tuple &new_tuple, RID new_rid) {
+  if (ctx == nullptr || ctx->catalog == nullptr || table_oid == INVALID_OID) {
+    return Status::Ok();
+  }
+  for (IndexInfo *info : ctx->catalog->get_table_indexes(table_oid)) {
+    if (info == nullptr || !info->index) {
+      continue;
+    }
+    BPTreeKey old_key =
+        tuple_to_index_key(old_tuple, schema, info->key_column);
+    BPTreeKey new_key =
+        tuple_to_index_key(new_tuple, schema, info->key_column);
+    if (old_key == new_key && old_rid == new_rid) {
+      continue;
+    }
+    Status st = info->index->remove(old_key, old_rid);
+    if (!st.ok()) {
+      return st;
+    }
+    record_index_delete(ctx, table_oid, info->oid, old_key, old_rid);
+    st = info->index->insert(new_key, new_rid);
+    if (!st.ok()) {
+      return st;
+    }
+    record_index_insert(ctx, table_oid, info->oid, new_key, new_rid);
+  }
+  return Status::Ok();
 }
 
 } // namespace entropy

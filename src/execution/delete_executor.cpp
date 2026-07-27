@@ -7,6 +7,9 @@
 
 #include <vector>
 
+#include "catalog/catalog.hpp"
+#include "execution/executor_context.hpp"
+
 namespace entropy {
 
 void DeleteExecutor::init() {
@@ -34,6 +37,14 @@ std::optional<Tuple> DeleteExecutor::next() {
   // checkpoint (F3). Null without a transaction context (executor unit tests).
   std::shared_mutex *barrier = txn_checkpoint_barrier(ctx_);
 
+  const Schema *schema = nullptr;
+  if (ctx_ != nullptr && ctx_->catalog != nullptr &&
+      table_oid_ != INVALID_OID) {
+    if (const TableInfo *info = ctx_->catalog->get_table(table_oid_)) {
+      schema = &info->schema;
+    }
+  }
+
   for (const auto &tuple : to_delete) {
     RID rid = tuple.rid();
 
@@ -53,6 +64,14 @@ std::optional<Tuple> DeleteExecutor::next() {
     if (!status.ok()) {
       status_ = status;
       break;
+    }
+
+    if (schema != nullptr) {
+      status = maintain_indexes_on_delete(ctx_, table_oid_, *schema, tuple, rid);
+      if (!status.ok()) {
+        status_ = status;
+        break;
+      }
     }
     rows_deleted_++;
   }

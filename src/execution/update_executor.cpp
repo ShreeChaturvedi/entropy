@@ -7,6 +7,9 @@
 
 #include <vector>
 
+#include "catalog/catalog.hpp"
+#include "execution/executor_context.hpp"
+
 namespace entropy {
 
 namespace {
@@ -113,6 +116,14 @@ std::optional<Tuple> UpdateExecutor::next() {
         barrier);
     if (status.ok()) {
       // In-place update: one UPDATE record at the original RID.
+      if (schema_ != nullptr) {
+        status = maintain_indexes_on_update(ctx_, table_oid_, *schema_, tuple,
+                                            rid, new_tuple, rid);
+        if (!status.ok()) {
+          status_ = status;
+          break;
+        }
+      }
       rows_updated_++;
       continue;
     }
@@ -156,6 +167,14 @@ std::optional<Tuple> UpdateExecutor::next() {
     if (!status.ok()) {
       status_ = status;
       break;
+    }
+    if (schema_ != nullptr) {
+      status = maintain_indexes_on_update(ctx_, table_oid_, *schema_, tuple, rid,
+                                          new_tuple, new_rid);
+      if (!status.ok()) {
+        status_ = status;
+        break;
+      }
     }
     rows_updated_++;
   }
