@@ -49,16 +49,13 @@ IndexScanExecutor::IndexScanExecutor(ExecutorContext *ctx, Index *index,
 // ─────────────────────────────────────────────────────────────────────────────
 
 void IndexScanExecutor::init() {
-  point_lookup_done_ = false;
-  point_lookup_rid_ = std::nullopt;
+  point_lookup_rids_.clear();
+  point_lookup_idx_ = 0;
 
   switch (scan_type_) {
   case IndexScanType::POINT_LOOKUP: {
-    // O(log n) point lookup
-    auto rid = index_->find(start_key_);
-    if (rid.has_value()) {
-      point_lookup_rid_ = rid;
-    }
+    // All RIDs for the key (unique: 0 or 1; non-unique: every match).
+    point_lookup_rids_ = index_->find_all(start_key_);
     break;
   }
 
@@ -103,12 +100,13 @@ std::optional<Tuple> IndexScanExecutor::fetch_visible(RID rid) {
 std::optional<Tuple> IndexScanExecutor::next() {
   switch (scan_type_) {
   case IndexScanType::POINT_LOOKUP: {
-    // Point lookup returns at most one tuple
-    if (point_lookup_done_ || !point_lookup_rid_.has_value()) {
-      return std::nullopt;
+    while (point_lookup_idx_ < point_lookup_rids_.size()) {
+      RID rid = point_lookup_rids_[point_lookup_idx_++];
+      if (std::optional<Tuple> visible = fetch_visible(rid); visible) {
+        return visible;
+      }
     }
-    point_lookup_done_ = true;
-    return fetch_visible(*point_lookup_rid_);
+    return std::nullopt;
   }
 
   case IndexScanType::RANGE_SCAN: {

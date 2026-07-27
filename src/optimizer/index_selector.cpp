@@ -180,19 +180,23 @@ IndexSelector::select_access_method(oid_t table_oid,
     return result;
   }
 
-  // Check for point lookup (column = constant)
+  // Check for point lookup (column = constant). Non-unique indexes still use
+  // POINT_LOOKUP; the executor yields every matching RID via find_all.
   column_id_t column;
   BPTreeKey key;
   if (extract_point_lookup(predicate, &column, &key)) {
     auto index_oid = find_index(table_oid, column);
     if (index_oid.has_value()) {
-      // Calculate index cost
+      auto *index_info = catalog_->get_index_by_oid(*index_oid);
+      // Estimate matches: unique → 1 row; non-unique → low-N heuristic.
+      const size_t match_est =
+          (index_info != nullptr && index_info->is_unique) ? 1u : 3u;
       double seek_cost =
           std::log2(static_cast<double>(std::max<size_t>(1, rows))) *
           CostModel::RANDOM_PAGE_COST;
-      // One random heap fetch per matching tuple (here, a single row).
       double fetch_cost =
-          CostModel::RANDOM_PAGE_COST + CostModel::INDEX_TUPLE_COST;
+          static_cast<double>(match_est) *
+          (CostModel::RANDOM_PAGE_COST + CostModel::INDEX_TUPLE_COST);
       result.index_cost = seek_cost + fetch_cost;
 
       // Compare costs

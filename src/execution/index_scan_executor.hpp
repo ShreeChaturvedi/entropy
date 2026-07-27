@@ -23,6 +23,7 @@
  */
 
 #include <optional>
+#include <vector>
 
 #include "execution/executor.hpp"
 #include "storage/index.hpp"
@@ -107,9 +108,9 @@ private:
   IndexIterator iterator_;
   IndexIterator end_iterator_;
 
-  // For point lookup (may have duplicates if non-unique index)
-  std::optional<RID> point_lookup_rid_;
-  bool point_lookup_done_ = false;
+  // Point lookup: all matching RIDs (size 0 or 1 for unique indexes)
+  std::vector<RID> point_lookup_rids_;
+  size_t point_lookup_idx_ = 0;
 };
 
 } // namespace entropy
