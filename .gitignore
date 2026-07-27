@@ -66,3 +66,8 @@ third_party/*/
 # Git worktrees
 .worktrees/
 build-integ/
+
+# Local agent/CI build trees
+build-*/
+build-gate/
+build-ws3/

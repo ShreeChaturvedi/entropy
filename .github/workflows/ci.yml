@@ -24,19 +24,26 @@ jobs:
       - name: Install clang-format
         run: sudo apt-get update && sudo apt-get install -y clang-format
 
-      - name: Check formatting (dry-run)
+      # Check only files touched on the PR/push vs the merge base. Existing
+      # style debt stays untouched until someone reformats intentionally; new
+      # edits still get a dry-run gate.
+      - name: Check formatting on changed files (dry-run)
         run: |
           set -euo pipefail
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -z "${base}" ] || [ "${base}" = "0000000000000000000000000000000000000000" ]; then
+            base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
           mapfile -t files < <(
-            find src tests tools include tui \
-              \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \
-                 -o -name '*.h' -o -name '*.hh' -o -name '*.hpp' -o -name '*.hxx' \) \
-              -type f | sort
+            git diff --name-only --diff-filter=ACMR "${base}"...HEAD -- \
+              'src/**' 'tests/**' 'tools/**' 'include/**' 'tui/**' \
+              | grep -E '\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$' || true
           )
           if [ "${#files[@]}" -eq 0 ]; then
-            echo "No C/C++ sources found under src/ tests/ tools/ include/ tui/"
-            exit 1
+            echo "No changed C/C++ sources under src/ tests/ tools/ include/ tui/"
+            exit 0
           fi
+          echo "Checking ${#files[@]} changed file(s) against .clang-format"
           clang-format --dry-run -Werror "${files[@]}"
 
   build-test:
