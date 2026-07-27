@@ -88,6 +88,7 @@ public:
    * @brief Delete a key → RID mapping (Index interface)
    *
    * For unique trees the RID is ignored when a single entry exists for @p key.
+   * For non-unique trees, removes the specific (key, rid) pair.
    */
   [[nodiscard]] Status remove(KeyType key, const RID &rid) override;
 
@@ -308,6 +309,14 @@ private:
    * @brief Assign a new root page id and notify the root-change callback
    */
   void change_root(page_id_t new_root_id);
+
+  /**
+   * @brief Remove first matching key, or a specific (key, rid) when match_rid
+   *
+   * Caller for the Index interface: unique trees use match_rid=false; non-unique
+   * pair removal uses match_rid=true.
+   */
+  [[nodiscard]] Status remove_impl(KeyType key, bool match_rid, const RID &rid);
 
   /**
    * @brief Collect the ids of every intact page reachable from the root

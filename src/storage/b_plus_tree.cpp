@@ -317,6 +317,15 @@ Page* BPlusTree::descend_to_leaf_read(KeyType key) {
 }
 
 std::optional<BPlusTree::ValueType> BPlusTree::find(KeyType key) {
+    if (!unique_) {
+        // Equal keys may span leaves; return the first RID of the full run.
+        auto all = find_all(key);
+        if (all.empty()) {
+            return std::nullopt;
+        }
+        return all.front();
+    }
+
     Page* leaf_page = descend_to_leaf_read(key);
     if (leaf_page == nullptr) {
         return std::nullopt;
@@ -332,11 +341,104 @@ std::optional<BPlusTree::ValueType> BPlusTree::find(KeyType key) {
 }
 
 std::vector<RID> BPlusTree::find_all(KeyType key) {
-    // Unique trees store at most one RID per key. Multi-match lands in WS2.
     std::vector<RID> out;
-    if (auto rid = find(key); rid.has_value()) {
-        out.push_back(*rid);
+
+    Page* leaf_page = descend_to_leaf_read(key);
+    if (leaf_page == nullptr) {
+        return out;
     }
+
+    // Internal separators route key >= sep to the right child, so a split that
+    // leaves equal keys on both sides of a separator sends point descent to the
+    // right leaf. Walk left while the previous leaf still holds @p key so the
+    // full equal-key run is visible (non-unique indexes).
+    //
+    // Deadlock freedom: never latch a left sibling while holding a right leaf.
+    // Release the current leaf first, then latch the previous one (readers and
+    // the writer only chain rightward when holding two leaf latches).
+    while (true) {
+        BPTreeLeafPage leaf(leaf_page);
+        page_id_t prev_id = leaf.prev_leaf_id();
+        if (prev_id == INVALID_PAGE_ID) {
+            break;
+        }
+        // Peek whether prev might hold equals without latching it yet: we only
+        // know prev_id. Unlatch current, then latch prev.
+        page_id_t cur_id = leaf_page->page_id();
+        leaf_page->runlatch();
+        buffer_pool_->unpin_page(cur_id, false);
+        leaf_page = nullptr;
+
+        Page* prev_page = buffer_pool_->fetch_page(prev_id);
+        if (prev_page == nullptr) {
+            // Lost the chain; restart from key descent.
+            leaf_page = descend_to_leaf_read(key);
+            break;
+        }
+        prev_page->rlatch();
+        BPTreeLeafPage prev(prev_page);
+        if (!(prev.num_keys() > 0 && prev.key_at(prev.num_keys() - 1) == key)) {
+            // Prev has no equals — re-latch the original right leaf via next.
+            page_id_t next_id = prev.next_leaf_id();
+            prev_page->runlatch();
+            buffer_pool_->unpin_page(prev_id, false);
+            if (next_id == INVALID_PAGE_ID) {
+                leaf_page = descend_to_leaf_read(key);
+            } else {
+                Page* right = buffer_pool_->fetch_page(next_id);
+                if (right == nullptr) {
+                    leaf_page = descend_to_leaf_read(key);
+                } else {
+                    right->rlatch();
+                    leaf_page = right;
+                }
+            }
+            break;
+        }
+        leaf_page = prev_page;
+    }
+
+    if (leaf_page == nullptr) {
+        return out;
+    }
+
+    // Scan right across the contiguous equal-key run.
+    bool done = false;
+    while (leaf_page != nullptr && !done) {
+        BPTreeLeafPage leaf(leaf_page);
+        const uint32_t n = leaf.num_keys();
+        for (uint32_t i = 0; i < n; ++i) {
+            KeyType k = leaf.key_at(i);
+            if (k < key) {
+                continue;
+            }
+            if (k > key) {
+                done = true;
+                break;
+            }
+            out.push_back(leaf.value_at(i));
+        }
+
+        page_id_t cur_id = leaf_page->page_id();
+        page_id_t next_id = leaf.next_leaf_id();
+        if (done || next_id == INVALID_PAGE_ID) {
+            leaf_page->runlatch();
+            buffer_pool_->unpin_page(cur_id, false);
+            break;
+        }
+
+        Page* next_page = buffer_pool_->fetch_page(next_id);
+        if (next_page == nullptr) {
+            leaf_page->runlatch();
+            buffer_pool_->unpin_page(cur_id, false);
+            break;
+        }
+        next_page->rlatch();
+        leaf_page->runlatch();
+        buffer_pool_->unpin_page(cur_id, false);
+        leaf_page = next_page;
+    }
+
     return out;
 }
 
@@ -443,11 +545,12 @@ Status BPlusTree::insert(KeyType key, const ValueType& value) {
     }
 
     BPTreeLeafPage leaf(cur);
-    if (leaf.find(key).has_value()) {
+    if (unique_ && leaf.find(key).has_value()) {
         return Status::AlreadyExists("Key already exists");
     }
+    const bool allow_dup = !unique_;
     if (!leaf.is_full()) {
-        leaf.insert(key, value);
+        leaf.insert(key, value, allow_dup);
         return Status::Ok();  // ws releases the (single) latched leaf
     }
 
@@ -475,9 +578,9 @@ Status BPlusTree::insert(KeyType key, const ValueType& value) {
     }
 
     if (key < split_key) {
-        leaf.insert(key, value);
+        leaf.insert(key, value, allow_dup);
     } else {
-        new_leaf.insert(key, value);
+        new_leaf.insert(key, value, allow_dup);
     }
 
     return insert_into_parents(ws, path, split_key, new_leaf_id);
@@ -621,13 +724,17 @@ void BPlusTree::drain_deferred_free() {
     deferred_free_ = std::move(still_refused);
 }
 
-Status BPlusTree::remove(KeyType key, const RID & /*rid*/) {
-    // Unique path: a single entry per key, so RID is ignored. Non-unique
-    // multi-match removal is deferred to WS2.
-    return remove(key);
+Status BPlusTree::remove(KeyType key, const RID &rid) {
+    if (unique_) {
+        // Unique trees store one RID per key; ignore a RID mismatch.
+        return remove(key);
+    }
+    return remove_impl(key, /*match_rid=*/true, rid);
 }
 
 Status BPlusTree::remove(KeyType key) {
+    // Unique / key-only path: original latch-crabbing remove (writers release
+    // safe ancestors; full path retained only when underflow is possible).
     std::lock_guard<std::mutex> wlock(write_mutex_);
     drain_deferred_free();
 
@@ -635,14 +742,11 @@ Status BPlusTree::remove(KeyType key) {
         return Status::NotFound("Key not found");
     }
 
-    // Crab down with write latches, shedding ancestors once a child cannot
-    // underflow (has more than min_size, so it stays >= min_size after a merge
-    // removes one key/child).
     WriteSet ws(buffer_pool_.get());
     std::vector<page_id_t> path;
 
     page_id_t cur_id = root_page_id();
-    Page* cur = ws.acquire(cur_id);
+    Page *cur = ws.acquire(cur_id);
     if (cur == nullptr) {
         return Status::IOError("Failed to fetch root page");
     }
@@ -671,7 +775,6 @@ Status BPlusTree::remove(KeyType key) {
     }
 
     if (leaf.is_root()) {
-        // Root leaf: dropping the last key empties the whole tree.
         if (leaf.is_empty()) {
             page_id_t leaf_id = leaf.page_id();
             free_page_or_defer(ws, leaf_id);
@@ -684,8 +787,105 @@ Status BPlusTree::remove(KeyType key) {
         return Status::Ok();
     }
 
-    // Underflow implies the leaf was not "safe" at descent, so its parent is
-    // still in `path` (path.size() >= 2).
+    return handle_leaf_underflow(ws, path);
+}
+
+Status BPlusTree::remove_impl(KeyType key, bool match_rid, const RID &rid) {
+    // Non-unique (key, rid) removal: equal keys may span leaves after a split.
+    std::lock_guard<std::mutex> wlock(write_mutex_);
+    drain_deferred_free();
+
+    if (root_page_id() == INVALID_PAGE_ID) {
+        return Status::NotFound("Key not found");
+    }
+
+    WriteSet ws(buffer_pool_.get());
+
+    // Locate a leaf in the equal-key run via key routing (rightmost candidate).
+    page_id_t leaf_id = root_page_id();
+    Page *page = ws.acquire(leaf_id);
+    if (page == nullptr) {
+        return Status::IOError("Failed to fetch root page");
+    }
+    while (!BPTreePage(page).is_leaf()) {
+        BPTreeInternalPage internal(page);
+        leaf_id = internal.child_at(internal.find_child_index(key));
+        page = ws.acquire(leaf_id);
+        if (page == nullptr) {
+            return Status::IOError("Failed to fetch child page");
+        }
+    }
+
+    bool removed = false;
+    while (true) {
+        BPTreeLeafPage leaf(page);
+        removed = match_rid ? leaf.remove(key, rid) : leaf.remove(key);
+        if (removed) {
+            break;
+        }
+        if (!match_rid) {
+            break;
+        }
+        page_id_t prev_id = leaf.prev_leaf_id();
+        if (prev_id == INVALID_PAGE_ID) {
+            break;
+        }
+        // Never hold a right leaf while latching left (left→right latch order).
+        ws.release(leaf_id);
+        Page *prev = ws.acquire(prev_id);
+        if (prev == nullptr) {
+            return Status::IOError("Failed to fetch previous leaf");
+        }
+        BPTreeLeafPage prev_leaf(prev);
+        if (prev_leaf.num_keys() == 0 ||
+            prev_leaf.key_at(prev_leaf.num_keys() - 1) < key) {
+            break;
+        }
+        page = prev;
+        leaf_id = prev_id;
+    }
+
+    if (!removed) {
+        return Status::NotFound("Key not found");
+    }
+
+    BPTreeLeafPage leaf(page);
+    if (leaf.is_root()) {
+        if (leaf.is_empty()) {
+            free_page_or_defer(ws, leaf_id);
+            change_root(INVALID_PAGE_ID);
+        }
+        return Status::Ok();
+    }
+
+    if (!leaf.is_underflow()) {
+        return Status::Ok();
+    }
+
+    // parent_page_id is writer-only under write_mutex_. Collect the chain with
+    // pins only, then write-latch root→leaf (never child-before-parent).
+    ws.release_all();
+    std::vector<page_id_t> bottom_up;
+    page_id_t pid = leaf_id;
+    while (pid != INVALID_PAGE_ID) {
+        bottom_up.push_back(pid);
+        Page *pg = buffer_pool_->fetch_page(pid);
+        if (pg == nullptr) {
+            return Status::IOError("Failed to rebuild path for underflow");
+        }
+        page_id_t par = BPTreePage(pg).parent_page_id();
+        buffer_pool_->unpin_page(pid, false);
+        if (par == INVALID_PAGE_ID) {
+            break;
+        }
+        pid = par;
+    }
+    std::vector<page_id_t> path(bottom_up.rbegin(), bottom_up.rend());
+    for (page_id_t id : path) {
+        if (ws.acquire(id) == nullptr) {
+            return Status::IOError("Failed to latch underflow path");
+        }
+    }
     return handle_leaf_underflow(ws, path);
 }
 
