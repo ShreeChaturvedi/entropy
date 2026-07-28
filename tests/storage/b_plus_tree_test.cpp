@@ -1040,8 +1040,11 @@ TEST_F(ConcurrentBPlusTreeTest, ConcurrentSmallFanoutChurn) {
     go.store(true, std::memory_order_release);
     for (auto& th : threads) th.join();
     const auto elapsed = std::chrono::steady_clock::now() - start;
+    // Bound is "no deadlock", not a perf budget. Parallel ctest on shared CI
+    // hosts (macOS especially) can push wall time just over 120s with zero
+    // correctness failures (macOS CI: 123s). Keep a generous ceiling.
     EXPECT_LT(
-        std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(), 120);
+        std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(), 300);
     EXPECT_EQ(bad.load(), 0);
 
     // Stable block fully intact; every churn key removed.

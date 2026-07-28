@@ -71,3 +71,6 @@ build-integ/
 build-*/
 build-gate/
 build-ws3/
+
+# Local agent tooling (workflows, scripts, plans)
+.grok/
