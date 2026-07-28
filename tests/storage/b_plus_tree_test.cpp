@@ -133,6 +133,54 @@ TEST_F(BPlusTreeTest, InsertDuplicate) {
     EXPECT_EQ(status.code(), StatusCode::kAlreadyExists);
 }
 
+// Non-unique indexes store multiple RIDs per key; find_all returns all of them
+// and remove(key, rid) targets a specific pair.
+TEST_F(BPlusTreeTest, NonUniqueDuplicateKeysAndFindAll) {
+    BPlusTree tree(buffer_pool_, INVALID_PAGE_ID, /*unique=*/false);
+
+    EXPECT_TRUE(tree.insert(7, RID(1, 0)).ok());
+    EXPECT_TRUE(tree.insert(7, RID(1, 1)).ok());
+    EXPECT_TRUE(tree.insert(7, RID(2, 0)).ok());
+    EXPECT_TRUE(tree.insert(3, RID(3, 0)).ok());
+
+    auto all = tree.find_all(7);
+    ASSERT_EQ(all.size(), 3u);
+    std::sort(all.begin(), all.end());
+    EXPECT_EQ(all[0], RID(1, 0));
+    EXPECT_EQ(all[1], RID(1, 1));
+    EXPECT_EQ(all[2], RID(2, 0));
+
+    EXPECT_EQ(tree.find_all(3).size(), 1u);
+    EXPECT_TRUE(tree.find_all(99).empty());
+
+    // Remove one of three; the others remain.
+    ASSERT_TRUE(tree.remove(7, RID(1, 1)).ok());
+    all = tree.find_all(7);
+    ASSERT_EQ(all.size(), 2u);
+    std::sort(all.begin(), all.end());
+    EXPECT_EQ(all[0], RID(1, 0));
+    EXPECT_EQ(all[1], RID(2, 0));
+}
+
+// Many equal keys force leaf splits; find_all must still see the full run.
+TEST_F(BPlusTreeTest, NonUniqueManyEqualsAcrossSplits) {
+    BPlusTree tree(buffer_pool_, INVALID_PAGE_ID, /*leaf_max*/ 4,
+                   /*internal_max*/ 4, /*unique=*/false);
+
+    constexpr int kN = 40;
+    for (int i = 0; i < kN; ++i) {
+        ASSERT_TRUE(tree.insert(1, RID(i, 0)).ok()) << i;
+    }
+    auto all = tree.find_all(1);
+    EXPECT_EQ(all.size(), static_cast<size_t>(kN));
+
+    for (int i = 0; i < kN; ++i) {
+        ASSERT_TRUE(tree.remove(1, RID(i, 0)).ok()) << i;
+    }
+    EXPECT_TRUE(tree.find_all(1).empty());
+    EXPECT_TRUE(tree.is_empty());
+}
+
 TEST_F(BPlusTreeTest, FindNonExistent) {
     BPlusTree tree(buffer_pool_);
 
@@ -992,8 +1040,11 @@ TEST_F(ConcurrentBPlusTreeTest, ConcurrentSmallFanoutChurn) {
     go.store(true, std::memory_order_release);
     for (auto& th : threads) th.join();
     const auto elapsed = std::chrono::steady_clock::now() - start;
+    // Bound is "no deadlock", not a perf budget. Parallel ctest on shared CI
+    // hosts (macOS especially) can push wall time just over 120s with zero
+    // correctness failures (macOS CI: 123s). Keep a generous ceiling.
     EXPECT_LT(
-        std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(), 120);
+        std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(), 300);
     EXPECT_EQ(bad.load(), 0);
 
     // Stable block fully intact; every churn key removed.

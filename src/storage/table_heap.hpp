@@ -30,6 +30,7 @@
 #include "entropy/status.hpp"
 #include "storage/buffer_pool.hpp"
 #include "storage/table_page.hpp"
+#include "storage/table_store.hpp"
 #include "storage/tuple.hpp"
 
 namespace entropy {
@@ -43,7 +44,7 @@ class TableIterator;
  * Provides CRUD operations on tuples stored in a heap file.
  * The heap file is organized as a linked list of pages.
  */
-class TableHeap {
+class TableHeap : public TableStore {
 public:
   /**
    * @brief Construct a new table heap
@@ -59,7 +60,7 @@ public:
   TableHeap(std::shared_ptr<BufferPoolManager> buffer_pool,
             page_id_t first_page_id);
 
-  ~TableHeap() = default;
+  ~TableHeap() override = default;
 
   // ─────────────────────────────────────────────────────────────────────────
   // Tuple Operations
@@ -95,7 +96,7 @@ public:
   insert_tuple(const Tuple &tuple, RID *rid,
                const std::function<Status(RID)> &before_publish = nullptr,
                std::shared_mutex *checkpoint_barrier = nullptr,
-               const SlotReservedFn &slot_reserved = nullptr);
+               const SlotReservedFn &slot_reserved = nullptr) override;
 
   /**
    * @brief Delete a tuple from the table
@@ -110,7 +111,7 @@ public:
    */
   [[nodiscard]] Status
   delete_tuple(const RID &rid, const std::function<void()> &on_logged = nullptr,
-               std::shared_mutex *checkpoint_barrier = nullptr);
+               std::shared_mutex *checkpoint_barrier = nullptr) override;
 
   /**
    * @brief Restore a previously deleted tuple at its original RID
@@ -121,7 +122,8 @@ public:
    * @param tuple Tuple data to restore
    * @return Status::Ok() on success
    */
-  [[nodiscard]] Status restore_tuple(const RID &rid, const Tuple &tuple);
+  [[nodiscard]] Status restore_tuple(const RID &rid,
+                                     const Tuple &tuple) override;
 
   /**
    * @brief Update a tuple in the table
@@ -138,7 +140,7 @@ public:
    * but the caller won't know the new location.
    */
   [[nodiscard]] Status update_tuple(const Tuple &tuple, const RID &rid,
-                                    RID *new_rid = nullptr);
+                                    RID *new_rid = nullptr) override;
 
   /**
    * @brief Update a tuple only if the new bytes fit at its current location
@@ -160,7 +162,7 @@ public:
   [[nodiscard]] Status
   update_tuple_in_place(const Tuple &tuple, const RID &rid,
                         const std::function<void()> &on_logged = nullptr,
-                        std::shared_mutex *checkpoint_barrier = nullptr);
+                        std::shared_mutex *checkpoint_barrier = nullptr) override;
 
   /**
    * @brief Get a tuple by RID
@@ -168,7 +170,7 @@ public:
    * @param[out] tuple Retrieved tuple
    * @return Status::Ok() on success, Status::NotFound() if RID invalid
    */
-  [[nodiscard]] Status get_tuple(const RID &rid, Tuple *tuple);
+  [[nodiscard]] Status get_tuple(const RID &rid, Tuple *tuple) override;
 
   // ─────────────────────────────────────────────────────────────────────────
   // Iteration
@@ -203,7 +205,7 @@ public:
    * @return Status::Ok() on success (including when a first page already
    *         exists), an error otherwise.
    */
-  [[nodiscard]] Status ensure_first_page();
+  [[nodiscard]] Status ensure_first_page() override;
 
   /**
    * @brief Deallocate every page owned by the heap
@@ -218,7 +220,7 @@ public:
    *        stay allocated; the caller frees the ids later, once it is crash-safe
    *        to reuse them. DROP TABLE defers this past its checkpoint (F2).
    */
-  [[nodiscard]] Status reclaim_all_pages(bool deallocate_disk = true);
+  [[nodiscard]] Status reclaim_all_pages(bool deallocate_disk = true) override;
 
   /**
    * @brief Collect the ids of every page currently owned by the heap
@@ -227,7 +229,7 @@ public:
    * these pages before the pages are reclaimed for reuse (hence a set: its
    * sole consumer does membership tests).
    */
-  [[nodiscard]] std::unordered_set<page_id_t> page_ids() const;
+  [[nodiscard]] std::unordered_set<page_id_t> page_ids() const override;
 
   // ─────────────────────────────────────────────────────────────────────────
   // Accessors
@@ -236,21 +238,21 @@ public:
   /**
    * @brief Get the first page ID in the heap
    */
-  [[nodiscard]] page_id_t first_page_id() const noexcept {
+  [[nodiscard]] page_id_t first_page_id() const noexcept override {
     return first_page_id_;
   }
 
   /**
    * @brief Check if the table is empty
    */
-  [[nodiscard]] bool is_empty() const noexcept {
+  [[nodiscard]] bool is_empty() const noexcept override {
     return first_page_id_ == INVALID_PAGE_ID;
   }
 
   /**
    * @brief Get the buffer pool manager
    */
-  [[nodiscard]] std::shared_ptr<BufferPoolManager> buffer_pool() const {
+  [[nodiscard]] std::shared_ptr<BufferPoolManager> buffer_pool() const override {
     return buffer_pool_;
   }
 

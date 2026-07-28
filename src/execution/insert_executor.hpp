@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "execution/executor.hpp"
-#include "storage/table_heap.hpp"
+#include "storage/table_store.hpp"
 
 namespace entropy {
 
@@ -25,7 +25,7 @@ public:
    * @param table_oid Table OID, used for row locking / WAL logging when a
    *        transaction context is present (INVALID_OID for context-less use)
    */
-  InsertExecutor(ExecutorContext *ctx, std::shared_ptr<TableHeap> table_heap,
+  InsertExecutor(ExecutorContext *ctx, std::shared_ptr<TableStore> table_heap,
                  std::vector<Tuple> tuples, oid_t table_oid = INVALID_OID)
       : Executor(ctx), table_heap_(std::move(table_heap)),
         tuples_(std::move(tuples)), table_oid_(table_oid) {}
@@ -55,7 +55,7 @@ public:
   [[nodiscard]] Status status() const { return status_; }
 
 private:
-  std::shared_ptr<TableHeap> table_heap_;
+  std::shared_ptr<TableStore> table_heap_;
   std::vector<Tuple> tuples_;
   oid_t table_oid_ = INVALID_OID;
   size_t current_idx_ = 0;

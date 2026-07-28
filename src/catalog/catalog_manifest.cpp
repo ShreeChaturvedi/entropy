@@ -31,8 +31,13 @@ namespace {
 
 // On-disk format identifier and version. Bump the version if the layout below
 // changes in an incompatible way.
+//
+// v1: tables + indexes without is_unique
+// v2: each index entry ends with is_unique (u8). Load still accepts v1 and
+//     defaults is_unique=true for old files.
 constexpr char kMagic[4] = {'E', 'C', 'A', 'T'};
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;
+constexpr uint32_t kMinSupportedVersion = 1;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Little-ish serialization helpers (native byte order; single-machine format)
@@ -123,6 +128,7 @@ std::vector<char> CatalogManifest::serialize() const {
     put_u16(b, idx.key_column);
     put_i32(b, idx.root_page_id);
     put_str(b, idx.name);
+    put_u8(b, idx.is_unique ? 1 : 0); // v2
   }
 
   return b;
@@ -146,7 +152,8 @@ Status CatalogManifest::deserialize(const std::vector<char> &bytes,
   if (!r.get_u32(&version)) {
     return Status::Corruption("Truncated catalog manifest header");
   }
-  if (version != kVersion) {
+  // Accept v1 (pre-is_unique) and current kVersion; reject anything else.
+  if (version < kMinSupportedVersion || version > kVersion) {
     return Status::Corruption("Unsupported catalog manifest version");
   }
 
@@ -198,6 +205,16 @@ Status CatalogManifest::deserialize(const std::vector<char> &bytes,
         !r.get_u16(&idx.key_column) || !r.get_i32(&idx.root_page_id) ||
         !r.get_str(&idx.name)) {
       return Status::Corruption("Truncated catalog manifest index entry");
+    }
+    // v1 manifests omit is_unique; default true preserves unique-key behavior.
+    if (version >= 2) {
+      uint8_t unique = 1;
+      if (!r.get_u8(&unique)) {
+        return Status::Corruption("Truncated catalog manifest index is_unique");
+      }
+      idx.is_unique = unique != 0;
+    } else {
+      idx.is_unique = true;
     }
     m.indexes.push_back(std::move(idx));
   }

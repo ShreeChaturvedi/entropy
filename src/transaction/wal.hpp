@@ -75,6 +75,20 @@ public:
     /// Current number of bytes held by the stream.
     [[nodiscard]] virtual uint64_t size() const = 0;
 
+    /**
+     * @brief Discard durable bytes strictly before @p offset
+     *
+     * After success, size() reflects the new length and read_all() starts at
+     * the former @p offset. Contract:
+     * - @p offset must be <= size(); otherwise InvalidArgument
+     * - offset 0 is a no-op
+     * - offset == size() empties the stream
+     *
+     * On failure the store must remain consistent (prior contents intact, or
+     * fully replaced by a successful rewrite).
+     */
+    [[nodiscard]] virtual Status truncate_prefix(uint64_t offset) = 0;
+
     /// Install a callback used instead of the real durable sync (tests only).
     virtual void set_sync_hook_for_testing(std::function<Status()> hook) = 0;
 };
@@ -98,6 +112,7 @@ public:
     [[nodiscard]] Status sync() override;
     [[nodiscard]] std::vector<char> read_all() override;
     [[nodiscard]] uint64_t size() const override { return size_; }
+    [[nodiscard]] Status truncate_prefix(uint64_t offset) override;
     void set_sync_hook_for_testing(std::function<Status()> hook) override;
 
     /// Path of the backing file.
@@ -176,6 +191,19 @@ public:
      * @return Status indicating success or failure
      */
     [[nodiscard]] Status flush_to_lsn(lsn_t lsn);
+
+    /**
+     * @brief Discard durable log records with LSN strictly less than @p truncate_lsn
+     *
+     * Flushes any buffered records first, then scans the store to map the LSN
+     * cutoff to a byte offset (LSNs are sequential counters, not file offsets)
+     * and truncates the underlying LogStore prefix. Records with LSN >=
+     * truncate_lsn keep their original LSNs. INVALID_LSN / 0 is a no-op.
+     * Truncation never advances past the durable watermark (flush first).
+     *
+     * @return Status indicating success or failure
+     */
+    [[nodiscard]] Status truncate_before(lsn_t truncate_lsn);
 
     /**
      * @brief Install a sync hook used instead of fsync (tests only)

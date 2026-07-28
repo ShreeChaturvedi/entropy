@@ -663,21 +663,30 @@ public:
   /**
    * @brief Insert a key-value pair
    *
-   * @return true if successful, false if full or duplicate
+   * @param allow_duplicates When false (default), reject an existing key.
+   *        When true, insert after any equal keys already in this leaf.
+   * @return true if successful, false if full or (unique) duplicate
    */
-  bool insert(BPTreeKey key, const BPTreeValue &value) {
+  bool insert(BPTreeKey key, const BPTreeValue &value,
+              bool allow_duplicates = false) {
     if (is_full())
       return false;
 
     bool found;
     uint32_t idx = find_key_index(key, &found);
 
-    // Don't allow duplicates
-    if (found)
+    if (found && !allow_duplicates)
       return false;
 
-    // Shift to make room
+    // Append after the equal-key run so equal keys stay contiguous.
     uint32_t n = num_keys();
+    if (found && allow_duplicates) {
+      while (idx < n && key_at(idx) == key) {
+        ++idx;
+      }
+    }
+
+    // Shift to make room
     for (uint32_t i = n; i > idx; --i) {
       set_key_at(i, key_at(i - 1));
       set_value_at(i, value_at(i - 1));
@@ -692,7 +701,7 @@ public:
   }
 
   /**
-   * @brief Remove a key
+   * @brief Remove the first entry with @p key
    *
    * @return true if key was found and removed
    */
@@ -703,15 +712,49 @@ public:
     if (!found)
       return false;
 
-    // Shift to fill gap
-    uint32_t n = num_keys();
-    for (uint32_t i = idx; i < n - 1; ++i) {
+    remove_at(idx);
+    return true;
+  }
+
+  /**
+   * @brief Remove the entry with @p key and matching @p value (RID)
+   *
+   * Scans the equal-key run for an exact RID match. Used by non-unique indexes.
+   * @return true if a matching pair was removed
+   */
+  bool remove(BPTreeKey key, const BPTreeValue &value) {
+    bool found;
+    uint32_t idx = find_key_index(key, &found);
+    if (!found) {
+      return false;
+    }
+    // Binary search may land mid-run; walk left to the first equal key.
+    while (idx > 0 && key_at(idx - 1) == key) {
+      --idx;
+    }
+    const uint32_t n = num_keys();
+    for (uint32_t i = idx; i < n && key_at(i) == key; ++i) {
+      if (value_at(i) == value) {
+        remove_at(i);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * @brief Remove the entry at @p index (shifts remaining entries left)
+   */
+  void remove_at(uint32_t index) {
+    const uint32_t n = num_keys();
+    if (index >= n) {
+      return;
+    }
+    for (uint32_t i = index; i < n - 1; ++i) {
       set_key_at(i, key_at(i + 1));
       set_value_at(i, value_at(i + 1));
     }
-
     decrement_num_keys();
-    return true;
   }
 
   // ─────────────────────────────────────────────────────────────────────────

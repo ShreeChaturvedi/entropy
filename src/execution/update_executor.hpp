@@ -10,7 +10,7 @@
 
 #include "execution/executor.hpp"
 #include "parser/expression.hpp"
-#include "storage/table_heap.hpp"
+#include "storage/table_store.hpp"
 
 namespace entropy {
 
@@ -35,7 +35,7 @@ public:
    * @param values Expressions to evaluate for new values
    */
   UpdateExecutor(ExecutorContext *ctx, std::unique_ptr<Executor> child,
-                 std::shared_ptr<TableHeap> table_heap, const Schema *schema,
+                 std::shared_ptr<TableStore> table_heap, const Schema *schema,
                  std::vector<size_t> column_indices,
                  std::vector<std::unique_ptr<Expression>> values,
                  oid_t table_oid = INVALID_OID)
@@ -67,7 +67,7 @@ public:
 
 private:
   std::unique_ptr<Executor> child_;
-  std::shared_ptr<TableHeap> table_heap_;
+  std::shared_ptr<TableStore> table_heap_;
   const Schema *schema_;
   std::vector<size_t> column_indices_;
   std::vector<std::unique_ptr<Expression>> values_;

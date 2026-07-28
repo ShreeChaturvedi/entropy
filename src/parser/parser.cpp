@@ -144,6 +144,19 @@ std::unique_ptr<Statement> Parser::parse_statement() {
     if (check(TokenType::TABLE)) {
       return parse_create_table();
     }
+    // CREATE [UNIQUE] INDEX
+    if (check(TokenType::UNIQUE)) {
+      advance();
+      if (!check(TokenType::INDEX)) {
+        set_error("Expected INDEX after CREATE UNIQUE");
+        return nullptr;
+      }
+      auto stmt = parse_create_index();
+      if (stmt) {
+        stmt->is_unique = true;
+      }
+      return stmt;
+    }
     if (check(TokenType::INDEX)) {
       return parse_create_index();
     }

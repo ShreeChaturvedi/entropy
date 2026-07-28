@@ -12,6 +12,7 @@
 
 #include "catalog/catalog.hpp"
 #include "entropy/entropy.hpp"
+#include "storage/index.hpp"
 #include "test_utils.hpp"
 
 namespace entropy {
@@ -697,6 +698,121 @@ TEST_F(DatabaseTest, OptimizerChoosesIndexVsSeqScan) {
   ASSERT_TRUE(row.ok()) << row.status().to_string();
   ASSERT_EQ(row.row_count(), 1u);
   EXPECT_EQ(row.rows()[0]["id"].as_int32(), 5);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WS2: secondary-index maintenance, non-unique scans, CREATE/DROP INDEX
+// ─────────────────────────────────────────────────────────────────────────────
+
+// After INSERT/UPDATE/DELETE the secondary index must track heap state.
+TEST_F(DatabaseTest, SecondaryIndexMaintainedOnDml) {
+  Database db(temp_file_->string());
+  ASSERT_TRUE(db.execute("CREATE TABLE t (id INTEGER, v INTEGER)").ok());
+  ASSERT_TRUE(db.execute("CREATE INDEX idx_id ON t (id)").ok());
+
+  ASSERT_TRUE(db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").ok());
+
+  auto *idx = db.catalog_for_testing()->get_index("idx_id");
+  ASSERT_NE(idx, nullptr);
+  EXPECT_EQ(idx->index->find_all(1).size(), 1u);
+  EXPECT_EQ(idx->index->find_all(2).size(), 1u);
+  EXPECT_EQ(idx->index->find_all(99).size(), 0u);
+
+  ASSERT_TRUE(db.execute("UPDATE t SET id = 9 WHERE id = 2").ok());
+  EXPECT_EQ(idx->index->find_all(2).size(), 0u);
+  EXPECT_EQ(idx->index->find_all(9).size(), 1u);
+
+  ASSERT_TRUE(db.execute("DELETE FROM t WHERE id = 1").ok());
+  EXPECT_EQ(idx->index->find_all(1).size(), 0u);
+
+  // Index-backed SELECT must see the surviving rows only.
+  auto r = db.execute("SELECT id FROM t WHERE id = 9");
+  ASSERT_TRUE(r.ok()) << r.status().to_string();
+  ASSERT_EQ(r.row_count(), 1u);
+  EXPECT_EQ(r.rows()[0]["id"].as_int32(), 9);
+}
+
+// Non-unique equality returns every matching row through the index path.
+TEST_F(DatabaseTest, NonUniqueEqualityReturnsAllMatches) {
+  Database db(temp_file_->string());
+  ASSERT_TRUE(db.execute("CREATE TABLE t (k INTEGER, v INTEGER)").ok());
+  // Enough rows that a selective equality prefers the index over seq scan.
+  for (int base = 0; base < 500; base += 100) {
+    std::string sql = "INSERT INTO t VALUES ";
+    for (int i = base; i < base + 100; ++i) {
+      if (i != base) {
+        sql += ", ";
+      }
+      // k=7 for three deliberate rows; otherwise unique-ish values.
+      int k = (i == 10 || i == 20 || i == 30) ? 7 : (1000 + i);
+      sql += "(" + std::to_string(k) + ", " + std::to_string(i) + ")";
+    }
+    ASSERT_TRUE(db.execute(sql).ok());
+  }
+  ASSERT_TRUE(db.execute("CREATE INDEX idx_k ON t (k)").ok());
+
+  auto *idx = db.catalog_for_testing()->get_index("idx_k");
+  ASSERT_NE(idx, nullptr);
+  EXPECT_FALSE(idx->is_unique);
+  EXPECT_EQ(idx->index->find_all(7).size(), 3u);
+
+  auto r = db.execute("SELECT v FROM t WHERE k = 7");
+  ASSERT_TRUE(r.ok()) << r.status().to_string();
+  ASSERT_EQ(r.row_count(), 3u);
+  std::vector<int> vs;
+  for (const auto &row : r.rows()) {
+    vs.push_back(row["v"].as_int32());
+  }
+  std::sort(vs.begin(), vs.end());
+  EXPECT_EQ(vs, (std::vector<int>{10, 20, 30}));
+}
+
+// CREATE UNIQUE INDEX fails on duplicate keys; plain CREATE INDEX does not.
+TEST_F(DatabaseTest, CreateUniqueIndexRejectsDuplicates) {
+  Database db(temp_file_->string());
+  ASSERT_TRUE(db.execute("CREATE TABLE t (id INTEGER)").ok());
+  ASSERT_TRUE(db.execute("INSERT INTO t VALUES (1), (1)").ok());
+
+  auto uniq = db.execute("CREATE UNIQUE INDEX idx_u ON t (id)");
+  EXPECT_FALSE(uniq.ok());
+  EXPECT_EQ(db.catalog_for_testing()->get_index("idx_u"), nullptr);
+
+  auto plain = db.execute("CREATE INDEX idx_n ON t (id)");
+  ASSERT_TRUE(plain.ok()) << plain.status().to_string();
+  auto *idx = db.catalog_for_testing()->get_index("idx_n");
+  ASSERT_NE(idx, nullptr);
+  EXPECT_EQ(idx->index->find_all(1).size(), 2u);
+}
+
+TEST_F(DatabaseTest, CreateAndDropIndexSql) {
+  Database db(temp_file_->string());
+  ASSERT_TRUE(db.execute("CREATE TABLE t (id INTEGER)").ok());
+  ASSERT_TRUE(db.execute("CREATE INDEX idx_id ON t (id)").ok());
+  ASSERT_NE(db.catalog_for_testing()->get_index("idx_id"), nullptr);
+
+  ASSERT_TRUE(db.execute("DROP INDEX idx_id").ok());
+  EXPECT_EQ(db.catalog_for_testing()->get_index("idx_id"), nullptr);
+}
+
+// Abort must undo secondary-index inserts along with the heap insert.
+TEST_F(DatabaseTest, AbortUndoesIndexInsert) {
+  Database db(temp_file_->string());
+  ASSERT_TRUE(db.execute("CREATE TABLE t (id INTEGER)").ok());
+  ASSERT_TRUE(db.execute("CREATE INDEX idx_id ON t (id)").ok());
+  ASSERT_TRUE(db.execute("INSERT INTO t VALUES (1)").ok());
+
+  ASSERT_TRUE(db.begin_transaction().ok());
+  ASSERT_TRUE(db.execute("INSERT INTO t VALUES (2)").ok());
+  auto *idx = db.catalog_for_testing()->get_index("idx_id");
+  ASSERT_NE(idx, nullptr);
+  EXPECT_EQ(idx->index->find_all(2).size(), 1u);
+  ASSERT_TRUE(db.rollback().ok());
+
+  EXPECT_EQ(idx->index->find_all(2).size(), 0u);
+  auto r = db.execute("SELECT id FROM t");
+  ASSERT_TRUE(r.ok()) << r.status().to_string();
+  ASSERT_EQ(r.row_count(), 1u);
+  EXPECT_EQ(r.rows()[0]["id"].as_int32(), 1);
 }
 
 } // namespace

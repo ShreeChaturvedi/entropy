@@ -24,7 +24,7 @@ namespace entropy {
 // Forward declarations
 class BufferPoolManager;
 class TableHeap;
-class BPlusTree;
+class Index;
 struct CatalogManifest;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -54,17 +54,18 @@ struct TableInfo {
  * @brief Complete information about an index
  */
 struct IndexInfo {
-  oid_t oid;                        ///< Unique index identifier
-  std::string name;                 ///< Index name
-  oid_t table_oid;                  ///< Table this index belongs to
-  column_id_t key_column;           ///< Column being indexed
-  std::shared_ptr<BPlusTree> index; ///< B+ tree index structure
+  oid_t oid;                    ///< Unique index identifier
+  std::string name;             ///< Index name
+  oid_t table_oid;              ///< Table this index belongs to
+  column_id_t key_column;       ///< Column being indexed
+  std::shared_ptr<Index> index; ///< Index structure (BPlusTree today)
+  bool is_unique = true; ///< Unique-key enforcement (default: unique for compat)
 
   IndexInfo() = default;
   IndexInfo(oid_t id, std::string n, oid_t tbl, column_id_t col,
-            std::shared_ptr<BPlusTree> idx)
+            std::shared_ptr<Index> idx, bool unique = true)
       : oid(id), name(std::move(n)), table_oid(tbl), key_column(col),
-        index(std::move(idx)) {}
+        index(std::move(idx)), is_unique(unique) {}
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -142,11 +143,20 @@ public:
    * @param index_name Name of the index
    * @param table_name Table to index
    * @param column_name Column to index
-   * @return Status::Ok() on success
+   * @param is_unique When true, reject duplicate keys during build and DML.
+   *        Default false (SQL CREATE INDEX is non-unique).
+   * @return Status::Ok() on success; AlreadyExists if a unique index would
+   *         drop/reject duplicate heap keys during build
    */
   [[nodiscard]] Status create_index(const std::string &index_name,
                                     const std::string &table_name,
-                                    const std::string &column_name);
+                                    const std::string &column_name,
+                                    bool is_unique = false);
+
+  /**
+   * @brief Drop an index by name and reclaim its pages
+   */
+  [[nodiscard]] Status drop_index(const std::string &index_name);
 
   /**
    * @brief Look up an index, returning a stable owning handle

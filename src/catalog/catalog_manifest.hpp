@@ -43,6 +43,8 @@ struct ManifestIndex {
   oid_t table_oid = INVALID_OID;
   column_id_t key_column = 0;
   page_id_t root_page_id = INVALID_PAGE_ID;
+  /// Unique-key enforcement. Present in manifest v2+; v1 loaders default true.
+  bool is_unique = true;
 };
 
 /**

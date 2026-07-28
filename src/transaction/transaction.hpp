@@ -66,10 +66,23 @@ enum class IsolationLevel : uint8_t {
 // Write Set Entry - tracks modifications for undo
 // ─────────────────────────────────────────────────────────────────────────────
 
-enum class WriteType : uint8_t { INSERT = 0, DELETE = 1, UPDATE = 2 };
+enum class WriteType : uint8_t {
+    INSERT = 0,
+    DELETE = 1,
+    UPDATE = 2,
+    /// Secondary-index insert (abort undo = remove key→rid)
+    INDEX_INSERT = 3,
+    /// Secondary-index delete (abort undo = re-insert key→rid)
+    INDEX_DELETE = 4
+};
 
 /**
  * @brief Tracks a single write operation for undo during rollback
+ *
+ * Heap ops use table_oid + rid (+ old_data for DELETE/UPDATE).
+ * Index ops use index_oid + index_key + rid; table_oid is the owning table.
+ * Index mutations are abort-safe via the write set only (indexes are not
+ * page-LSN redone; recovery rebuilds damaged index roots from the heap).
  */
 struct WriteRecord {
     WriteType type;
@@ -79,12 +92,30 @@ struct WriteRecord {
     // For INSERT: empty (undo = delete)
     // For DELETE: stores deleted tuple data for undo
     std::vector<char> old_data;
+    oid_t index_oid = INVALID_OID; ///< For INDEX_INSERT / INDEX_DELETE
+    int64_t index_key = 0;         ///< BPTreeKey for index write-set entries
 
     WriteRecord(WriteType t, oid_t tbl, RID r)
         : type(t), table_oid(tbl), rid(r) {}
 
     WriteRecord(WriteType t, oid_t tbl, RID r, std::vector<char> data)
         : type(t), table_oid(tbl), rid(r), old_data(std::move(data)) {}
+
+    static WriteRecord make_index_insert(oid_t table_oid, oid_t index_oid,
+                                         int64_t key, RID rid) {
+        WriteRecord wr(WriteType::INDEX_INSERT, table_oid, rid);
+        wr.index_oid = index_oid;
+        wr.index_key = key;
+        return wr;
+    }
+
+    static WriteRecord make_index_delete(oid_t table_oid, oid_t index_oid,
+                                         int64_t key, RID rid) {
+        WriteRecord wr(WriteType::INDEX_DELETE, table_oid, rid);
+        wr.index_oid = index_oid;
+        wr.index_key = key;
+        return wr;
+    }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

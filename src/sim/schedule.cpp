@@ -26,6 +26,7 @@
 
 #include "sim/schedule.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <random>
@@ -155,9 +156,43 @@ RunResult run_schedule(uint64_t seed, const Schedule &schedule) {
       };
     }
     RandomWorkload workload(schedule.abort_ppk, schedule.inflight_ops);
-    result.ops = workload.run(ctx, wl_rng, oracle, schedule.num_txns,
-                              schedule.leave_in_flight);
-    result.aborts = workload.aborts();
+    // Optional mid-run checkpoint: phase 1 always commits cleanly (truncation
+    // needs an empty active set), then create_checkpoint reclaims the WAL
+    // prefix; phase 2 resumes with the schedule's leave_in_flight setting.
+    // Checkpoint/sync consume no fault PRNG draws (draw_fate only at crash;
+    // disabled transient faults draw nothing), so the seed's fault stream is
+    // layout-independent of this knob.
+    auto run_phase = [&](size_t n, bool leave_open) {
+      if (n == 0) {
+        return;
+      }
+      result.ops +=
+          workload.run(ctx, wl_rng, oracle, n, leave_open);
+      result.aborts += workload.aborts();
+    };
+    if (schedule.checkpoint_after_txns > 0) {
+      const size_t phase1 =
+          std::min(schedule.checkpoint_after_txns, schedule.num_txns);
+      const size_t phase2 = schedule.num_txns - phase1;
+      run_phase(phase1, /*leave_open=*/false);
+
+      RecoveryManager checkpointer(pool, wal, sim_disk);
+      Status ckpt = checkpointer.create_checkpoint(
+          /*active_txn_ids=*/{}, &tm->checkpoint_barrier());
+      if (!ckpt.ok()) {
+        result.recovery_ok = false;
+        result.invariants_failed.emplace_back("checkpoint_failed");
+      }
+      // Make flushed pre-anchor pages crash-durable before the reclaimed WAL
+      // can no longer redo them.
+      if (schedule.sync_after_checkpoint) {
+        sim_disk->sync();
+      }
+
+      run_phase(phase2, schedule.leave_in_flight);
+    } else {
+      run_phase(schedule.num_txns, schedule.leave_in_flight);
+    }
 
     // Steal: push dirty (committed and/or loser) pages to disk, unsynced.
     if (schedule.flush_pages_before_crash) {
@@ -374,6 +409,28 @@ std::optional<Schedule> make_schedule(const std::string &name) {
     s.must_fire = {FaultKind::kTornPageWrite};
     return s;
   }
+  if (name == "crash_after_wal_truncate") {
+    // Truncation-correctness schedule: phase 1 fills the WAL, a durable
+    // checkpoint with no active transactions reclaims the pre-anchor prefix
+    // (truncate_before), the data image is fsynced so those pages remain after
+    // reclaim, phase 2 commits more work, then pages are stolen unsynced and
+    // lost at the crash. Recovery must locate the checkpoint on the truncated
+    // log, redo only post-checkpoint records, and still satisfy the oracle
+    // (pre-checkpoint rows survive on the synced disk; post-checkpoint rows
+    // come back from the remaining WAL). Faults are not the subject here, but
+    // must_fire pins LostPageWrite so the sweep cannot go green without a real
+    // steal+loss forcing post-truncate redo. Disabled WAL-tail faults stay at
+    // their defaults and still draw once at crash (draw_fate always one draw);
+    // no mid-run path draws from the fault streams.
+    s.crash_point = "after_checkpoint_truncates_wal";
+    s.num_txns = 16;
+    s.checkpoint_after_txns = 8;
+    s.sync_after_checkpoint = true;
+    s.leave_in_flight = false;
+    s.flush_pages_before_crash = true;
+    s.must_fire = {FaultKind::kLostPageWrite};
+    return s;
+  }
   if (name == "skip_recovery") {
     // Negative control: identical to lost_page_write_after_commit but recovery
     // is skipped, so committed rows that live only in the WAL are missing. The
@@ -399,6 +456,7 @@ std::vector<std::string> schedule_names() {
       "mixed",
       "live_abort_repro",
       "torn_page_write",
+      "crash_after_wal_truncate",
   };
 }
 

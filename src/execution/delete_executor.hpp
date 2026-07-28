@@ -9,7 +9,7 @@
 
 #include "execution/executor.hpp"
 #include "parser/expression.hpp"
-#include "storage/table_heap.hpp"
+#include "storage/table_store.hpp"
 
 namespace entropy {
 
@@ -27,7 +27,7 @@ public:
    * @param table_heap Table to delete from
    */
   DeleteExecutor(ExecutorContext *ctx, std::unique_ptr<Executor> child,
-                 std::shared_ptr<TableHeap> table_heap,
+                 std::shared_ptr<TableStore> table_heap,
                  oid_t table_oid = INVALID_OID)
       : Executor(ctx), child_(std::move(child)),
         table_heap_(std::move(table_heap)), table_oid_(table_oid) {}
@@ -55,7 +55,7 @@ public:
 
 private:
   std::unique_ptr<Executor> child_;
-  std::shared_ptr<TableHeap> table_heap_;
+  std::shared_ptr<TableStore> table_heap_;
   oid_t table_oid_ = INVALID_OID;
   size_t rows_deleted_ = 0;
   bool done_ = false;

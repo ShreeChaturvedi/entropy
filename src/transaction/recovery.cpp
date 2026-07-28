@@ -168,7 +168,34 @@ Status RecoveryManager::create_checkpoint(
     return Status::IOError("Failed to append CHECKPOINT record");
   }
 
-  return wal_->flush();
+  Status durable = wal_->flush();
+  if (!durable.ok()) {
+    return durable;
+  }
+
+  // Reclaim WAL space for records no longer required for recovery.
+  // Safe when:
+  // - begin_lsn is a real redo anchor (pages flushed; pre-anchor effects durable)
+  // - no active transactions (undo does not need pre-anchor loser trails)
+  // Truncation is best-effort after a durable checkpoint: a failure is logged
+  // but does not undo the checkpoint promise. truncate_before flushes first and
+  // only discards durable records with LSN < begin_lsn, keeping the CHECKPOINT
+  // (whose LSN equals begin_lsn) and everything after it.
+  if (begin_lsn != INVALID_LSN && active_txn_ids.empty()) {
+    Status trunc = wal_->truncate_before(begin_lsn);
+    if (!trunc.ok()) {
+      LOG_WARN("WAL truncation after checkpoint failed (checkpoint is durable): {}",
+               trunc.message());
+    } else {
+      LOG_INFO("WAL truncated after checkpoint (begin_lsn={})", begin_lsn);
+    }
+  } else if (!active_txn_ids.empty()) {
+    // Active losers may still need pre-anchor records for undo; skip reclaim.
+    LOG_DEBUG("Skipping WAL truncation: {} active transaction(s) at checkpoint",
+              active_txn_ids.size());
+  }
+
+  return Status::Ok();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

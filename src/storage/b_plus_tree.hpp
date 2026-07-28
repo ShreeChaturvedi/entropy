@@ -26,6 +26,7 @@
 #include "entropy/status.hpp"
 #include "storage/b_plus_tree_page.hpp"
 #include "storage/buffer_pool.hpp"
+#include "storage/index.hpp"
 
 namespace entropy {
 
@@ -45,7 +46,7 @@ class WriteSet;
  * - Insertions: O(log n) amortized
  * - Deletions: O(log n) amortized
  */
-class BPlusTree {
+class BPlusTree : public Index {
 public:
   using KeyType = BPTreeKey;
   using ValueType = BPTreeValue;
@@ -54,9 +55,11 @@ public:
    * @brief Construct a new B+ Tree
    * @param buffer_pool Buffer pool manager for page access
    * @param root_page_id Existing root page ID, or INVALID_PAGE_ID for new tree
+   * @param unique When true (default), reject duplicate keys on insert
    */
   explicit BPlusTree(std::shared_ptr<BufferPoolManager> buffer_pool,
-                     page_id_t root_page_id = INVALID_PAGE_ID);
+                     page_id_t root_page_id = INVALID_PAGE_ID,
+                     bool unique = true);
 
   /**
    * @brief Construct a B+ Tree with explicit node capacities
@@ -65,12 +68,12 @@ public:
    */
   BPlusTree(std::shared_ptr<BufferPoolManager> buffer_pool,
             page_id_t root_page_id, uint32_t leaf_max_size,
-            uint32_t internal_max_size);
+            uint32_t internal_max_size, bool unique = true);
 
-  ~BPlusTree() = default;
+  ~BPlusTree() override = default;
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Core Operations
+  // Core Operations (Index interface + convenience overloads)
   // ─────────────────────────────────────────────────────────────────────────
 
   /**
@@ -79,10 +82,18 @@ public:
    * @param value The value (RID) associated with the key
    * @return Status::Ok() on success, error on failure or duplicate key
    */
-  [[nodiscard]] Status insert(KeyType key, const ValueType &value);
+  [[nodiscard]] Status insert(KeyType key, const ValueType &value) override;
 
   /**
-   * @brief Delete a key from the tree
+   * @brief Delete a key → RID mapping (Index interface)
+   *
+   * For unique trees the RID is ignored when a single entry exists for @p key.
+   * For non-unique trees, removes the specific (key, rid) pair.
+   */
+  [[nodiscard]] Status remove(KeyType key, const RID &rid) override;
+
+  /**
+   * @brief Delete a key from the tree (convenience; unique-key path)
    * @param key The key to delete
    * @return Status::Ok() on success, Status::NotFound() if key doesn't exist
    */
@@ -93,7 +104,14 @@ public:
    * @param key The key to search for
    * @return The value if found, nullopt otherwise
    */
-  [[nodiscard]] std::optional<ValueType> find(KeyType key);
+  [[nodiscard]] std::optional<ValueType> find(KeyType key) override;
+
+  /**
+   * @brief All RIDs for @p key (0 or 1 entries until non-unique support)
+   */
+  [[nodiscard]] std::vector<RID> find_all(KeyType key) override;
+
+  [[nodiscard]] bool is_unique() const override { return unique_; }
 
   /**
    * @brief Get all key-value pairs in a range [start_key, end_key]
@@ -136,23 +154,38 @@ public:
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Iteration
+  // Iteration (Index interface; wraps BPlusTreeIterator)
   // ─────────────────────────────────────────────────────────────────────────
 
   /**
    * @brief Get iterator to first element >= key
    */
-  [[nodiscard]] BPlusTreeIterator lower_bound(KeyType key);
+  [[nodiscard]] IndexIterator lower_bound(KeyType key) override;
 
   /**
    * @brief Get iterator to the beginning (smallest key)
    */
-  [[nodiscard]] BPlusTreeIterator begin();
+  [[nodiscard]] IndexIterator begin() override;
 
   /**
    * @brief Get iterator to the end
    */
-  [[nodiscard]] BPlusTreeIterator end();
+  [[nodiscard]] IndexIterator end() override;
+
+  /**
+   * @brief Concrete iterator to first element >= key (tests / internal)
+   */
+  [[nodiscard]] BPlusTreeIterator lower_bound_leaf(KeyType key);
+
+  /**
+   * @brief Concrete iterator to the beginning
+   */
+  [[nodiscard]] BPlusTreeIterator begin_leaf();
+
+  /**
+   * @brief Concrete past-the-end iterator
+   */
+  [[nodiscard]] BPlusTreeIterator end_leaf();
 
   // ─────────────────────────────────────────────────────────────────────────
   // Accessors
@@ -278,6 +311,14 @@ private:
   void change_root(page_id_t new_root_id);
 
   /**
+   * @brief Remove first matching key, or a specific (key, rid) when match_rid
+   *
+   * Caller for the Index interface: unique trees use match_rid=false; non-unique
+   * pair removal uses match_rid=true.
+   */
+  [[nodiscard]] Status remove_impl(KeyType key, bool match_rid, const RID &rid);
+
+  /**
    * @brief Collect the ids of every intact page reachable from the root
    *
    * Cycle- and corruption-tolerant: uses a visited set and skips pages that
@@ -305,6 +346,9 @@ private:
   // Maximum sizes for nodes (computed once)
   uint32_t leaf_max_size_;
   uint32_t internal_max_size_;
+
+  /// Unique-key enforcement (default true preserves existing tests / catalog)
+  bool unique_ = true;
 };
 
 /**

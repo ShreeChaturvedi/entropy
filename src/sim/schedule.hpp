@@ -48,6 +48,16 @@ struct Schedule {
   /// same run also arms WAL-sync failures (which otherwise, correctly, blocks
   /// every steal because no page may precede its log to disk).
   bool steal_committed_at_inflight_begin = false;
+  /// After this many completed transactions, take a durable checkpoint with an
+  /// empty active-txn set so RecoveryManager reclaims the WAL prefix
+  /// (truncate_before). 0 disables the mid-run checkpoint. Phase 1 never leaves
+  /// a transaction in flight (truncation requires no active losers).
+  size_t checkpoint_after_txns = 0;
+  /// After the mid-run checkpoint, fsync the data image. Required for
+  /// truncation-correctness schedules: pre-anchor pages are already flushed by
+  /// create_checkpoint, but without an fsync the sim crash would still lose them
+  /// and recovery cannot redo them once the WAL prefix is gone.
+  bool sync_after_checkpoint = false;
 
   // ── Anti-vacuity contract, asserted by the schedule sweep test ────────────
   /// Every fault kind listed here must fire at least once across the sweep's

@@ -10,16 +10,18 @@
 
 #include "catalog/catalog_manifest.hpp"
 #include "storage/b_plus_tree.hpp"
+#include "storage/index.hpp"
 #include "storage/table_heap.hpp"
 #include "storage/tuple.hpp"
 
 namespace entropy {
 namespace {
 
-/// Insert one entry per heap tuple into @p tree, keyed by column @p col_idx.
+/// Insert one entry per heap tuple into @p index, keyed by column @p col_idx.
 /// Used by create_index and to rebuild an index whose root page was lost.
-void build_index_from_heap(const TableInfo &table, uint32_t col_idx,
-                           BPlusTree &tree) {
+/// Propagates insert failures (unique-key conflicts must not be dropped).
+Status build_index_from_heap(const TableInfo &table, uint32_t col_idx,
+                             Index &index) {
   for (auto it = table.table_heap->begin(); it != table.table_heap->end();
        ++it) {
     Tuple tuple = *it;
@@ -31,8 +33,17 @@ void build_index_from_heap(const TableInfo &table, uint32_t col_idx,
     } else if (key_val.is_bigint()) {
       key = key_val.as_bigint();
     }
-    (void)tree.insert(key, it.rid());
+    Status st = index.insert(key, it.rid());
+    if (!st.ok()) {
+      return st;
+    }
   }
+  return Status::Ok();
+}
+
+/// BPlusTree-only helpers used for root callbacks / page reclaim.
+std::shared_ptr<BPlusTree> as_bplus_tree(const std::shared_ptr<Index> &index) {
+  return std::dynamic_pointer_cast<BPlusTree>(index);
 }
 
 } // namespace
@@ -48,8 +59,8 @@ Catalog::~Catalog() {
   // Detach root-change listeners: an IndexInfo handle may outlive the
   // catalog, and its tree must not call back into a destroyed object.
   for (auto &[oid, info] : indexes_) {
-    if (info->index) {
-      info->index->set_root_change_callback(nullptr);
+    if (auto tree = as_bplus_tree(info->index)) {
+      tree->set_root_change_callback(nullptr);
     }
   }
 }
@@ -102,18 +113,20 @@ void Catalog::load_from_manifest() {
       }
     }
 
-    auto tree = std::make_shared<BPlusTree>(buffer_pool_, root);
+    auto tree =
+        std::make_shared<BPlusTree>(buffer_pool_, root, idx.is_unique);
     if (rebuild) {
       auto table_it = tables_.find(idx.table_oid);
       if (table_it != tables_.end() && table_it->second->table_heap) {
         // No listener is registered yet, so the rebuild inserts do not
         // persist per root change; the next DDL or root change will.
-        build_index_from_heap(*table_it->second, idx.key_column, *tree);
+        (void)build_index_from_heap(*table_it->second, idx.key_column, *tree);
       }
     }
 
     auto info = std::make_shared<IndexInfo>(idx.oid, idx.name, idx.table_oid,
-                                            idx.key_column, std::move(tree));
+                                            idx.key_column, std::move(tree),
+                                            idx.is_unique);
     register_root_listener(info);
     index_names_[idx.name] = idx.oid;
     indexes_[idx.oid] = std::move(info);
@@ -144,8 +157,11 @@ CatalogManifest Catalog::snapshot() const {
     idx.name = info->name;
     idx.table_oid = info->table_oid;
     idx.key_column = info->key_column;
-    idx.root_page_id =
-        info->index ? info->index->root_page_id() : INVALID_PAGE_ID;
+    idx.is_unique = info->is_unique;
+    idx.root_page_id = INVALID_PAGE_ID;
+    if (auto tree = as_bplus_tree(info->index)) {
+      idx.root_page_id = tree->root_page_id();
+    }
     manifest.indexes.push_back(std::move(idx));
   }
 
@@ -168,14 +184,18 @@ void Catalog::register_root_listener(const std::shared_ptr<IndexInfo> &info) {
   // registered only after create_index's build completes, and
   // BPlusTree::reclaim_all_pages bypasses the callback.
   //
+  // Root-change / flush APIs are BPlusTree-only; cast when registering.
+  auto tree = as_bplus_tree(info->index);
+  if (!tree) {
+    return;
+  }
   // The raw tree pointer is safe: the callback is owned by that same tree.
-  info->index->set_root_change_callback([this,
-                                         tree = info->index.get()](page_id_t) {
+  tree->set_root_change_callback([this, tree_ptr = tree.get()](page_id_t) {
     // Durability order: the pages the new root reaches must be on disk
     // before the manifest referencing it is fsync'd (flush_page works on the
     // pages the in-flight mutation still holds pinned). On flush failure,
     // keep the old manifest — its root is still intact on disk.
-    if (!tree->flush_all_pages().ok()) {
+    if (!tree_ptr->flush_all_pages().ok()) {
       return;
     }
     std::unique_lock lock(mutex_);
@@ -323,11 +343,11 @@ Status Catalog::drop_table(const std::string &table_name,
     (void)info->table_heap->reclaim_all_pages(deallocate_heap_pages);
   }
   for (auto &idx : dropped_indexes) {
-    if (idx->index) {
+    if (auto tree = as_bplus_tree(idx->index)) {
       // Detach the listener first: a surviving handle must not rewrite the
       // manifest for an index that no longer exists.
-      idx->index->set_root_change_callback(nullptr);
-      (void)idx->index->reclaim_all_pages();
+      tree->set_root_change_callback(nullptr);
+      (void)tree->reclaim_all_pages();
     }
   }
 
@@ -394,7 +414,7 @@ std::vector<std::string> Catalog::get_table_names() const {
 
 Status Catalog::create_index(const std::string &index_name,
                              const std::string &table_name,
-                             const std::string &column_name) {
+                             const std::string &column_name, bool is_unique) {
   std::unique_lock lock(mutex_);
 
   // Check if index already exists.
@@ -414,8 +434,9 @@ Status Catalog::create_index(const std::string &index_name,
     return Status::NotFound("Column not found: " + column_name);
   }
 
-  // Create B+ tree index.
-  auto index = std::make_shared<BPlusTree>(buffer_pool_);
+  // Create B+ tree with the requested uniqueness policy.
+  auto index =
+      std::make_shared<BPlusTree>(buffer_pool_, INVALID_PAGE_ID, is_unique);
 
   // Allocate new OID.
   oid_t oid = next_oid_++;
@@ -423,10 +444,17 @@ Status Catalog::create_index(const std::string &index_name,
   // Create IndexInfo.
   auto info = std::make_shared<IndexInfo>(
       oid, index_name, table_info->oid, static_cast<column_id_t>(col_idx),
-      index);
+      index, is_unique);
 
-  // Build index from existing data.
-  build_index_from_heap(*table_info, static_cast<uint32_t>(col_idx), *index);
+  // Build index from existing data. Unique indexes fail on duplicate keys
+  // rather than silently dropping heap rows.
+  Status built =
+      build_index_from_heap(*table_info, static_cast<uint32_t>(col_idx), *index);
+  if (!built.ok()) {
+    (void)index->reclaim_all_pages();
+    next_oid_--;
+    return built;
+  }
 
   // Durability order: flush the freshly built tree pages before persisting
   // the manifest that references the tree's root, and roll back if any page
@@ -455,6 +483,39 @@ Status Catalog::create_index(const std::string &index_name,
   // Register only after the build: root changes during the build would call
   // back into the lock this thread already holds.
   register_root_listener(info);
+
+  return Status::Ok();
+}
+
+Status Catalog::drop_index(const std::string &index_name) {
+  std::unique_lock lock(mutex_);
+
+  auto name_it = index_names_.find(index_name);
+  if (name_it == index_names_.end()) {
+    return Status::NotFound("Index not found: " + index_name);
+  }
+
+  oid_t oid = name_it->second;
+  std::shared_ptr<IndexInfo> info = find_index(oid);
+
+  indexes_.erase(oid);
+  index_names_.erase(name_it);
+
+  Status persisted = persist();
+  if (!persisted.ok()) {
+    if (info) {
+      index_names_[index_name] = oid;
+      indexes_[oid] = info;
+    }
+    return persisted;
+  }
+
+  if (info) {
+    if (auto tree = as_bplus_tree(info->index)) {
+      tree->set_root_change_callback(nullptr);
+      (void)tree->reclaim_all_pages();
+    }
+  }
 
   return Status::Ok();
 }

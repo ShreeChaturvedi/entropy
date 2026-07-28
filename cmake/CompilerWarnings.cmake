@@ -32,8 +32,8 @@ function(entropy_set_compiler_warnings)
             )
         endif()
 
-        # Treat warnings as errors in CI
-        if(DEFINED ENV{CI})
+        # Treat warnings as errors in CI or when ENTROPY_WERROR is ON
+        if(ENTROPY_WERROR OR DEFINED ENV{CI})
             add_compile_options(-Werror)
 
             # GCC's -Wmaybe-uninitialized emits well-known false positives when a
@@ -72,8 +72,8 @@ function(entropy_set_compiler_warnings)
             /w14928   # illegal copy-initialization; more than one user-defined conversion has been implicitly applied
         )
 
-        # Treat warnings as errors in CI
-        if(DEFINED ENV{CI})
+        # Treat warnings as errors in CI or when ENTROPY_WERROR is ON
+        if(ENTROPY_WERROR OR DEFINED ENV{CI})
             add_compile_options(/WX)
         endif()
     endif()

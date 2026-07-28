@@ -8,6 +8,44 @@ on:
   pull_request:
 
 jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # clang-format dry-run against the engine/tooling trees. Installs the tool in
+  # the job so a missing host package never silently skips the check. Does not
+  # reformat the tree; style debt is paid intentionally, not by CI.
+  # ───────────────────────────────────────────────────────────────────────────
+  format-check:
+    name: clang-format
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
+
+      # Check only files touched on the PR/push vs the merge base. Existing
+      # style debt stays untouched until someone reformats intentionally; new
+      # edits still get a dry-run gate.
+      - name: Check formatting on changed files (dry-run)
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -z "${base}" ] || [ "${base}" = "0000000000000000000000000000000000000000" ]; then
+            base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
+          mapfile -t files < <(
+            git diff --name-only --diff-filter=ACMR "${base}"...HEAD -- \
+              'src/**' 'tests/**' 'tools/**' 'include/**' 'tui/**' \
+              | grep -E '\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$' || true
+          )
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No changed C/C++ sources under src/ tests/ tools/ include/ tui/"
+            exit 0
+          fi
+          echo "Checking ${#files[@]} changed file(s) against .clang-format"
+          clang-format --dry-run -Werror "${files[@]}"
+
   build-test:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -20,18 +58,13 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Configure
-        run: >-
-          cmake -S . -B build
-          -DENTROPY_BUILD_TESTS=ON
-          -DENTROPY_BUILD_BENCHMARKS=OFF
-          -DENTROPY_BUILD_EXAMPLES=ON
-          -DCMAKE_BUILD_TYPE=Release
+        run: cmake --preset ci
 
       - name: Build
-        run: cmake --build build --config Release
+        run: cmake --build --preset ci --config Release --parallel
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure -C Release
+        run: ctest --test-dir build/ci --output-on-failure -C Release
 
   # ───────────────────────────────────────────────────────────────────────────
   # Terminal UI (ENTROPY_BUILD_TUI=ON). The TUI is OFF by default, so the

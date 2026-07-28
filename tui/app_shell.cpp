@@ -33,20 +33,35 @@ enum View : int { kBoot = 0, kDashboard = 1, kConsole = 2 };
 /// Build the fixed-demo-data element for a named screen. Returns nullptr for an
 /// unknown name. @p galaxy_phase is forwarded to the boot galaxy's sweep;
 /// @p demo_step, when >= 0, selects a frame of the dashboard/console replay.
+///
+/// When the element is produced by Component::Render(), FTXUI Reflect nodes
+/// hold references into that component's state (selection boxes, etc.). The
+/// Component must outlive Render(screen, element). Callers that need a live
+/// Component store it in @p hold_component; pure Element paths leave it empty.
 [[nodiscard]] Element BuildScreenElement(const std::string &which,
                                          const DataSet &data,
                                          const std::string &version,
-                                         double galaxy_phase, int demo_step) {
+                                         double galaxy_phase, int demo_step,
+                                         Component *hold_component) {
   if (which == "boot") {
     return BootScreen(data, /*selected_index=*/0, version, galaxy_phase);
   }
   if (which == "dashboard") {
-    return demo_step >= 0 ? RenderDashboardDemoFrame(data, demo_step)
-                          : MakeDashboardScreen(data)->Render();
+    if (demo_step >= 0) {
+      return RenderDashboardDemoFrame(data, demo_step);
+    }
+    // Keep the screen Component alive for the full capture Render. A temporary
+    // MakeDashboardScreen(...)->Render() frees Reflect Box& targets before the
+    // element tree is painted (heap-use-after-free in ftxui::Reflect::SetBox).
+    *hold_component = MakeDashboardScreen(data);
+    return (*hold_component)->Render();
   }
   if (which == "console") {
-    return demo_step >= 0 ? RenderConsoleDemoFrame(demo_step)
-                          : MakeQueryConsoleScreen()->Render();
+    if (demo_step >= 0) {
+      return RenderConsoleDemoFrame(demo_step);
+    }
+    *hold_component = MakeQueryConsoleScreen();
+    return (*hold_component)->Render();
   }
   return nullptr;
 }
@@ -191,8 +206,11 @@ int CaptureFrame(const std::string &which, int cols, int rows,
   const DataSet data = LoadDemoData();
   const std::string version = entropy::version();
 
-  Element doc =
-      BuildScreenElement(which, data, version, galaxy_phase, demo_step);
+  // hold keeps any Component whose Render() tree still references its state
+  // (see BuildScreenElement). Destroyed only after Screen::ToString.
+  Component hold;
+  Element doc = BuildScreenElement(which, data, version, galaxy_phase,
+                                   demo_step, &hold);
   if (!doc) {
     std::cerr << "entropy-tui: unknown screen '" << which
               << "' (expected boot | dashboard | console)\n";

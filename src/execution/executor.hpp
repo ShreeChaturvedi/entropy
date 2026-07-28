@@ -10,6 +10,8 @@
 #include <optional>
 #include <shared_mutex>
 
+#include "catalog/schema.hpp"
+#include "common/types.hpp"
 #include "entropy/status.hpp"
 #include "storage/tuple.hpp"
 
@@ -126,6 +128,35 @@ void txn_log_update(const ExecutorContext *ctx, oid_t table_oid, RID rid,
 /// Called after the heap mutation succeeded.
 void txn_log_delete(const ExecutorContext *ctx, oid_t table_oid, RID rid,
                     const Tuple &before);
+
+/**
+ * @brief Maintain secondary indexes after a heap INSERT
+ *
+ * Inserts (key, rid) into every index on @p table_oid. Records INDEX_INSERT
+ * write-set entries for abort undo when a transaction is active.
+ */
+[[nodiscard]] Status maintain_indexes_on_insert(const ExecutorContext *ctx,
+                                                oid_t table_oid,
+                                                const Schema &schema,
+                                                const Tuple &tuple, RID rid);
+
+/**
+ * @brief Maintain secondary indexes after a heap DELETE
+ */
+[[nodiscard]] Status maintain_indexes_on_delete(const ExecutorContext *ctx,
+                                                oid_t table_oid,
+                                                const Schema &schema,
+                                                const Tuple &tuple, RID rid);
+
+/**
+ * @brief Maintain secondary indexes after a heap UPDATE (in-place or relocate)
+ *
+ * Removes old (key, old_rid) and inserts (new_key, new_rid) for each index
+ * when the key or RID changed.
+ */
+[[nodiscard]] Status maintain_indexes_on_update(
+    const ExecutorContext *ctx, oid_t table_oid, const Schema &schema,
+    const Tuple &old_tuple, RID old_rid, const Tuple &new_tuple, RID new_rid);
 
 /**
  * @brief Base class for all executors

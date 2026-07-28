@@ -50,7 +50,9 @@
 #include "parser/statement.hpp"
 #include "storage/buffer_pool.hpp"
 #include "storage/disk_manager.hpp"
+#include "storage/index.hpp"
 #include "storage/table_heap.hpp"
+#include "storage/table_store.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/mvcc.hpp"
 #include "transaction/recovery.hpp"
@@ -463,9 +465,15 @@ public:
     // Abort undo resolves table oids through the catalog. The shared_ptr
     // keeps the TableInfo (and its heap) alive across a concurrent drop.
     txn_manager_->set_table_resolver(
-        [catalog = catalog_](oid_t table_oid) -> TableHeap * {
+        [catalog = catalog_](oid_t table_oid) -> TableStore * {
           auto info = catalog->get_table_shared(table_oid);
           return info ? info->table_heap.get() : nullptr;
+        });
+    // Abort undo for INDEX_INSERT / INDEX_DELETE write-set entries.
+    txn_manager_->set_index_resolver(
+        [catalog = catalog_](oid_t index_oid) -> Index * {
+          auto info = catalog->get_index_shared(index_oid);
+          return info ? info->index.get() : nullptr;
         });
 
     // Initialize optimizer components
@@ -503,6 +511,12 @@ public:
           dynamic_cast<CreateTableStatement *>(stmt.get()));
     case StatementType::DROP_TABLE:
       return execute_drop_table(dynamic_cast<DropTableStatement *>(stmt.get()));
+    case StatementType::CREATE_INDEX:
+      return execute_create_index(
+          dynamic_cast<CreateIndexStatement *>(stmt.get()));
+    case StatementType::DROP_INDEX:
+      return execute_drop_index(
+          dynamic_cast<DropIndexStatement *>(stmt.get()));
     case StatementType::EXPLAIN:
       return execute_explain(dynamic_cast<ExplainStatement *>(stmt.get()));
     case StatementType::SELECT:
@@ -1245,6 +1259,37 @@ public:
       statistics_->on_table_created(table_info->oid);
     }
     return Result(size_t(0)); // 0 rows affected
+  }
+
+  Result execute_create_index(CreateIndexStatement *stmt) {
+    if (stmt == nullptr) {
+      return Result(Status::InvalidArgument("Invalid CREATE INDEX statement"));
+    }
+    // Catalog indexes a single column today.
+    if (stmt->columns.size() != 1) {
+      return Result(Status::NotSupported(
+          "Only single-column indexes are supported"));
+    }
+    Status status = catalog_->create_index(stmt->index_name, stmt->table_name,
+                                           stmt->columns[0], stmt->is_unique);
+    if (!status.ok()) {
+      return Result(status);
+    }
+    return Result(size_t(0));
+  }
+
+  Result execute_drop_index(DropIndexStatement *stmt) {
+    if (stmt == nullptr) {
+      return Result(Status::InvalidArgument("Invalid DROP INDEX statement"));
+    }
+    Status status = catalog_->drop_index(stmt->index_name);
+    if (!status.ok()) {
+      if (stmt->if_exists && status.code() == StatusCode::kNotFound) {
+        return Result(size_t(0));
+      }
+      return Result(status);
+    }
+    return Result(size_t(0));
   }
 
   Result execute_drop_table(DropTableStatement *stmt) {

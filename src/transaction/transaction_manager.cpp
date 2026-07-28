@@ -11,8 +11,10 @@
 
 #include "common/logger.hpp"
 #include "storage/buffer_pool.hpp"
+#include "storage/index.hpp"
 #include "storage/page.hpp"
 #include "storage/table_heap.hpp"
+#include "storage/table_store.hpp"
 #include "storage/tuple.hpp"
 #include "transaction/lock_manager.hpp"
 #include "transaction/log_record.hpp"
@@ -247,13 +249,46 @@ void TransactionManager::abort(Transaction* txn) {
 }
 
 void TransactionManager::undo_write_record(const WriteRecord& record) {
+    // Index write-set entries undo against the Index, not the table heap.
+    if (record.type == WriteType::INDEX_INSERT ||
+        record.type == WriteType::INDEX_DELETE) {
+        if (!index_resolver_) {
+            LOG_WARN("Abort undo skipped for index {}: no index resolver",
+                     record.index_oid);
+            return;
+        }
+        Index *index = index_resolver_(record.index_oid);
+        if (index == nullptr) {
+            LOG_WARN("Abort undo skipped: index {} not found", record.index_oid);
+            return;
+        }
+        if (record.type == WriteType::INDEX_INSERT) {
+            // Undo index insert = remove the (key, rid) pair.
+            Status status = index->remove(record.index_key, record.rid);
+            if (!status.ok()) {
+                LOG_WARN("Abort undo INDEX_INSERT failed key={} rid=({},{}): {}",
+                         record.index_key, record.rid.page_id, record.rid.slot_id,
+                         status.message());
+            }
+        } else {
+            // Undo index delete = re-insert the (key, rid) pair.
+            Status status = index->insert(record.index_key, record.rid);
+            if (!status.ok()) {
+                LOG_WARN("Abort undo INDEX_DELETE failed key={} rid=({},{}): {}",
+                         record.index_key, record.rid.page_id, record.rid.slot_id,
+                         status.message());
+            }
+        }
+        return;
+    }
+
     if (!table_resolver_) {
         LOG_WARN("Abort undo skipped for table {}: no table resolver configured",
                  record.table_oid);
         return;
     }
 
-    TableHeap* heap = table_resolver_(record.table_oid);
+    TableStore* heap = table_resolver_(record.table_oid);
     if (heap == nullptr) {
         LOG_WARN("Abort undo skipped: table {} not found", record.table_oid);
         return;
@@ -306,6 +341,9 @@ void TransactionManager::undo_write_record(const WriteRecord& record) {
             }
             break;
         }
+        case WriteType::INDEX_INSERT:
+        case WriteType::INDEX_DELETE:
+            break; // handled above
     }
 }
 
@@ -325,6 +363,13 @@ void TransactionManager::log_compensation(Transaction* txn,
     // never revisits such a transaction (its ABORT record is already durable, so
     // it is not a loser), which is exactly why the compensation must live in the
     // log rather than only in the page the crash may drop (#75/#81).
+    // Indexes are not page-LSN redone; abort write-set undo is enough for
+    // uncommitted index entries. Skip compensation WAL for INDEX_* records.
+    if (record.type == WriteType::INDEX_INSERT ||
+        record.type == WriteType::INDEX_DELETE) {
+        return;
+    }
+
     LogRecord clr;
     switch (record.type) {
         case WriteType::INSERT:
@@ -348,6 +393,9 @@ void TransactionManager::log_compensation(Transaction* txn,
                                          record.table_oid, record.rid,
                                          /*old_data=*/{}, record.old_data);
             break;
+        case WriteType::INDEX_INSERT:
+        case WriteType::INDEX_DELETE:
+            return;
     }
 
     lsn_t lsn = wal_manager_->append_log(clr);

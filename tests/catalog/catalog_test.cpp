@@ -8,6 +8,7 @@
 
 #include "catalog/catalog.hpp"
 #include "storage/buffer_pool.hpp"
+#include "storage/index.hpp"
 #include "storage/table_heap.hpp"
 #include "storage/tuple.hpp"
 #include "test_utils.hpp"
@@ -182,6 +183,59 @@ TEST_F(CatalogTest, GetIndexByOid) {
   EXPECT_EQ(catalog_->get_index_by_oid(age->oid), age);
 
   EXPECT_EQ(catalog_->get_index_by_oid(9999), nullptr);
+}
+
+// Unique create_index must fail when the heap already has duplicate keys —
+// never silently drop rows from the index build.
+TEST_F(CatalogTest, CreateUniqueIndexRejectsDuplicateHeapKeys) {
+  Schema schema({Column("id", TypeId::INTEGER), Column("v", TypeId::INTEGER)});
+  ASSERT_TRUE(catalog_->create_table("t", schema).ok());
+  auto *table = catalog_->get_table("t");
+  ASSERT_NE(table, nullptr);
+
+  // Two rows with the same id.
+  for (int slot = 0; slot < 2; ++slot) {
+    Tuple t({TupleValue(int32_t{5}), TupleValue(int32_t{slot})}, schema);
+    RID rid;
+    ASSERT_TRUE(table->table_heap->insert_tuple(t, &rid).ok());
+  }
+
+  auto status = catalog_->create_index("idx_id", "t", "id", /*is_unique=*/true);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.code(), StatusCode::kAlreadyExists);
+  EXPECT_EQ(catalog_->get_index("idx_id"), nullptr);
+}
+
+// Non-unique create_index must ingest every heap row, including duplicate keys.
+TEST_F(CatalogTest, CreateNonUniqueIndexIngestsDuplicateKeys) {
+  Schema schema({Column("id", TypeId::INTEGER), Column("v", TypeId::INTEGER)});
+  ASSERT_TRUE(catalog_->create_table("t", schema).ok());
+  auto *table = catalog_->get_table("t");
+  ASSERT_NE(table, nullptr);
+
+  for (int slot = 0; slot < 3; ++slot) {
+    Tuple t({TupleValue(int32_t{5}), TupleValue(int32_t{slot})}, schema);
+    RID rid;
+    ASSERT_TRUE(table->table_heap->insert_tuple(t, &rid).ok());
+  }
+
+  ASSERT_TRUE(
+      catalog_->create_index("idx_id", "t", "id", /*is_unique=*/false).ok());
+  IndexInfo *idx = catalog_->get_index("idx_id");
+  ASSERT_NE(idx, nullptr);
+  EXPECT_FALSE(idx->is_unique);
+  EXPECT_EQ(idx->index->find_all(5).size(), 3u);
+}
+
+TEST_F(CatalogTest, DropIndexRemovesMetadataAndLookup) {
+  Schema schema({Column("id", TypeId::INTEGER)});
+  ASSERT_TRUE(catalog_->create_table("t", schema).ok());
+  ASSERT_TRUE(catalog_->create_index("idx_id", "t", "id").ok());
+  ASSERT_NE(catalog_->get_index("idx_id"), nullptr);
+
+  ASSERT_TRUE(catalog_->drop_index("idx_id").ok());
+  EXPECT_EQ(catalog_->get_index("idx_id"), nullptr);
+  EXPECT_FALSE(catalog_->drop_index("idx_id").ok());
 }
 
 } // namespace

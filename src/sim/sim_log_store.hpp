@@ -38,6 +38,7 @@ public:
   [[nodiscard]] Status sync() override;
   [[nodiscard]] std::vector<char> read_all() override;
   [[nodiscard]] uint64_t size() const override;
+  [[nodiscard]] Status truncate_prefix(uint64_t offset) override;
   void set_sync_hook_for_testing(std::function<Status()> hook) override;
 
   // ── Harness control ──────────────────────────────────────────────────────

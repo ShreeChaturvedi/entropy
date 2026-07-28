@@ -25,6 +25,7 @@ enum class TokenType {
   DROP,
   TABLE,
   INDEX,
+  UNIQUE,
   PRIMARY,
   KEY,
 
