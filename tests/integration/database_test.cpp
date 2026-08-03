@@ -709,6 +709,38 @@ TEST_F(DatabaseTest, ExplainJoinWalksPlanNodeTree) {
     EXPECT_TRUE(saw_cost) << "EXPLAIN join plan missing optimizer costs";
 }
 
+// #102: DECIMAL columns must serialize on INSERT and come back via SELECT.
+// Parser already accepts DECIMAL; this covers the storage/API path.
+TEST_F(DatabaseTest, DecimalCreateInsertSelectRoundTrip) {
+    Database db(temp_file_->string());
+    ASSERT_TRUE(db.execute("CREATE TABLE prices (id INTEGER, amount DECIMAL(10, 2))").ok());
+
+    // Integer and floating literals both land in the DECIMAL column.
+    ASSERT_TRUE(db.execute("INSERT INTO prices VALUES (1, 19.99)").ok());
+    ASSERT_TRUE(db.execute("INSERT INTO prices VALUES (2, 42)").ok());
+    ASSERT_TRUE(db.execute("INSERT INTO prices VALUES (3, 0.5)").ok());
+
+    auto result = db.execute("SELECT id, amount FROM prices ORDER BY id");
+    ASSERT_TRUE(result.ok()) << result.status().to_string();
+    ASSERT_EQ(result.row_count(), 3u);
+
+    EXPECT_EQ(result.rows()[0]["id"].as_int32(), 1);
+    EXPECT_DOUBLE_EQ(result.rows()[0]["amount"].as_double(), 19.99);
+
+    EXPECT_EQ(result.rows()[1]["id"].as_int32(), 2);
+    EXPECT_DOUBLE_EQ(result.rows()[1]["amount"].as_double(), 42.0);
+
+    EXPECT_EQ(result.rows()[2]["id"].as_int32(), 3);
+    EXPECT_DOUBLE_EQ(result.rows()[2]["amount"].as_double(), 0.5);
+
+    // UPDATE must also accept a DECIMAL target.
+    ASSERT_TRUE(db.execute("UPDATE prices SET amount = 100.25 WHERE id = 2").ok());
+    auto after = db.execute("SELECT amount FROM prices WHERE id = 2");
+    ASSERT_TRUE(after.ok()) << after.status().to_string();
+    ASSERT_EQ(after.row_count(), 1u);
+    EXPECT_DOUBLE_EQ(after.rows()[0]["amount"].as_double(), 100.25);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // WS2: secondary-index maintenance, non-unique scans, CREATE/DROP INDEX
 // ─────────────────────────────────────────────────────────────────────────────

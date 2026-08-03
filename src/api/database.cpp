@@ -1611,6 +1611,12 @@ public:
                 return TupleValue(static_cast<int16_t>(val));
             case TypeId::INTEGER:
                 return TupleValue(static_cast<int32_t>(val));
+            case TypeId::FLOAT:
+                return TupleValue(static_cast<float>(val));
+            case TypeId::DOUBLE:
+            case TypeId::DECIMAL:
+                // DECIMAL is stored in-memory as double (16-byte on-disk slot).
+                return TupleValue(static_cast<double>(val));
             case TypeId::BIGINT:
             default:
                 return TupleValue(val);
@@ -1620,6 +1626,8 @@ public:
             if (target_type == TypeId::FLOAT) {
                 return TupleValue(static_cast<float>(val));
             }
+            // DOUBLE and DECIMAL (and any other numeric target that reached here via
+            // the binder's numeric-family check) keep the double payload.
             return TupleValue(val);
         } else if (std::holds_alternative<std::string>(pv)) {
             return TupleValue(std::get<std::string>(pv));

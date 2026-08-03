@@ -157,8 +157,10 @@ TEST(TupleValueSerializeTest, BooleanRoundTrip) {
     EXPECT_EQ(bytes_true.size(), 1);
     EXPECT_EQ(bytes_false.size(), 1);
 
-    TupleValue restored_true = TupleValue::from_bytes(TypeId::BOOLEAN, bytes_true.data(), bytes_true.size());
-    TupleValue restored_false = TupleValue::from_bytes(TypeId::BOOLEAN, bytes_false.data(), bytes_false.size());
+    TupleValue restored_true =
+        TupleValue::from_bytes(TypeId::BOOLEAN, bytes_true.data(), bytes_true.size());
+    TupleValue restored_false =
+        TupleValue::from_bytes(TypeId::BOOLEAN, bytes_false.data(), bytes_false.size());
 
     EXPECT_TRUE(restored_true.as_bool());
     EXPECT_FALSE(restored_false.as_bool());
@@ -224,6 +226,35 @@ TEST(TupleValueSerializeTest, DoubleRoundTrip) {
     EXPECT_DOUBLE_EQ(restored.as_double(), 123.456789012345);
 }
 
+// DECIMAL occupies a fixed 16-byte on-disk slot (double payload + reserved
+// padding). Round-trip must preserve the numeric value and the slot width.
+TEST(TupleValueSerializeTest, DecimalRoundTrip) {
+    TupleValue original(12345.6789);
+    auto bytes = original.to_bytes(TypeId::DECIMAL);
+
+    EXPECT_EQ(bytes.size(), 16u);
+    // Reserved half of the slot stays zero so a future scale field can land
+    // without breaking readers that only look at the double payload.
+    for (size_t i = 8; i < 16; ++i) {
+        EXPECT_EQ(bytes[i], 0) << "reserved byte " << i;
+    }
+
+    TupleValue restored = TupleValue::from_bytes(TypeId::DECIMAL, bytes.data(), bytes.size());
+    EXPECT_TRUE(restored.is_double());
+    EXPECT_DOUBLE_EQ(restored.as_double(), 12345.6789);
+}
+
+// Integer literals written into a DECIMAL column must still serialize (the
+// INSERT path stores them as double; this covers a direct int payload too).
+TEST(TupleValueSerializeTest, DecimalFromIntegerPayload) {
+    // int32_t constructor (42 is already int on this platform).
+    TupleValue original(42);
+    auto bytes = original.to_bytes(TypeId::DECIMAL);
+    EXPECT_EQ(bytes.size(), 16u);
+    TupleValue restored = TupleValue::from_bytes(TypeId::DECIMAL, bytes.data(), bytes.size());
+    EXPECT_DOUBLE_EQ(restored.as_double(), 42.0);
+}
+
 TEST(TupleValueSerializeTest, VarcharRoundTrip) {
     TupleValue original(std::string("Hello, Database!"));
     auto bytes = original.to_bytes(TypeId::VARCHAR);
@@ -241,11 +272,10 @@ TEST(TupleValueSerializeTest, VarcharRoundTrip) {
 // serialization must throw loudly instead of truncating the recorded length
 // (which would desync it from the bytes written and corrupt the tuple).
 TEST(TupleValueSerializeTest, VarcharExceedingUint16Throws) {
-    std::string too_long(
-        static_cast<size_t>(std::numeric_limits<uint16_t>::max()) + 1, 'x');
+    std::string too_long(static_cast<size_t>(std::numeric_limits<uint16_t>::max()) + 1, 'x');
     TupleValue val(too_long);
-    EXPECT_THROW({ [[maybe_unused]] auto bytes = val.to_bytes(TypeId::VARCHAR); },
-                 std::length_error);
+    EXPECT_THROW(
+        { [[maybe_unused]] auto bytes = val.to_bytes(TypeId::VARCHAR); }, std::length_error);
 }
 
 TEST(TupleValueSerializeTest, VarcharAtUint16MaxRoundTrip) {
@@ -256,8 +286,7 @@ TEST(TupleValueSerializeTest, VarcharAtUint16MaxRoundTrip) {
     ASSERT_NO_THROW(bytes = val.to_bytes(TypeId::VARCHAR));
     ASSERT_EQ(bytes.size(), 2u + max_len.size());
 
-    TupleValue restored = TupleValue::from_bytes(
-        TypeId::VARCHAR, bytes.data() + 2, max_len.size());
+    TupleValue restored = TupleValue::from_bytes(TypeId::VARCHAR, bytes.data() + 2, max_len.size());
     EXPECT_EQ(restored.as_string(), max_len);
 }
 
@@ -276,25 +305,21 @@ class TupleTest : public ::testing::Test {
 protected:
     void SetUp() override {
         // Create a simple schema: id (INTEGER), name (VARCHAR), active (BOOLEAN)
-        std::vector<Column> columns = {
-            Column("id", TypeId::INTEGER),
-            Column("name", TypeId::VARCHAR, 100),
-            Column("active", TypeId::BOOLEAN)
-        };
+        std::vector<Column> columns = {Column("id", TypeId::INTEGER),
+                                       Column("name", TypeId::VARCHAR, 100),
+                                       Column("active", TypeId::BOOLEAN)};
         simple_schema_ = Schema(std::move(columns));
 
         // Create a more complex schema with various types
-        std::vector<Column> complex_columns = {
-            Column("col_bool", TypeId::BOOLEAN),
-            Column("col_tiny", TypeId::TINYINT),
-            Column("col_small", TypeId::SMALLINT),
-            Column("col_int", TypeId::INTEGER),
-            Column("col_big", TypeId::BIGINT),
-            Column("col_float", TypeId::FLOAT),
-            Column("col_double", TypeId::DOUBLE),
-            Column("col_varchar1", TypeId::VARCHAR, 50),
-            Column("col_varchar2", TypeId::VARCHAR, 100)
-        };
+        std::vector<Column> complex_columns = {Column("col_bool", TypeId::BOOLEAN),
+                                               Column("col_tiny", TypeId::TINYINT),
+                                               Column("col_small", TypeId::SMALLINT),
+                                               Column("col_int", TypeId::INTEGER),
+                                               Column("col_big", TypeId::BIGINT),
+                                               Column("col_float", TypeId::FLOAT),
+                                               Column("col_double", TypeId::DOUBLE),
+                                               Column("col_varchar1", TypeId::VARCHAR, 50),
+                                               Column("col_varchar2", TypeId::VARCHAR, 100)};
         complex_schema_ = Schema(std::move(complex_columns));
     }
 
@@ -303,11 +328,8 @@ protected:
 };
 
 TEST_F(TupleTest, CreateFromValues) {
-    std::vector<TupleValue> values = {
-        TupleValue(42),
-        TupleValue(std::string("Alice")),
-        TupleValue(true)
-    };
+    std::vector<TupleValue> values = {TupleValue(42), TupleValue(std::string("Alice")),
+                                      TupleValue(true)};
 
     Tuple tuple(values, simple_schema_);
 
@@ -316,12 +338,28 @@ TEST_F(TupleTest, CreateFromValues) {
     EXPECT_GT(tuple.size(), 0);
 }
 
-TEST_F(TupleTest, GetValueInteger) {
-    std::vector<TupleValue> values = {
-        TupleValue(42),
-        TupleValue(std::string("Alice")),
-        TupleValue(true)
+// Full-tuple round trip for a DECIMAL column (fixed 16-byte slot in the
+// fixed-size region of the on-disk layout).
+TEST_F(TupleTest, DecimalColumnRoundTrip) {
+    std::vector<Column> cols = {
+        Column("id", TypeId::INTEGER),
+        Column("amount", TypeId::DECIMAL),
     };
+    Schema schema(std::move(cols));
+
+    std::vector<TupleValue> values = {
+        TupleValue(7),
+        TupleValue(99.95),
+    };
+    Tuple tuple(values, schema);
+
+    EXPECT_EQ(tuple.get_value(schema, 0).as_integer(), 7);
+    EXPECT_DOUBLE_EQ(tuple.get_value(schema, 1).as_double(), 99.95);
+}
+
+TEST_F(TupleTest, GetValueInteger) {
+    std::vector<TupleValue> values = {TupleValue(42), TupleValue(std::string("Alice")),
+                                      TupleValue(true)};
 
     Tuple tuple(values, simple_schema_);
 
@@ -332,11 +370,8 @@ TEST_F(TupleTest, GetValueInteger) {
 }
 
 TEST_F(TupleTest, GetValueVarchar) {
-    std::vector<TupleValue> values = {
-        TupleValue(42),
-        TupleValue(std::string("Alice")),
-        TupleValue(true)
-    };
+    std::vector<TupleValue> values = {TupleValue(42), TupleValue(std::string("Alice")),
+                                      TupleValue(true)};
 
     Tuple tuple(values, simple_schema_);
 
@@ -347,11 +382,8 @@ TEST_F(TupleTest, GetValueVarchar) {
 }
 
 TEST_F(TupleTest, GetValueBoolean) {
-    std::vector<TupleValue> values = {
-        TupleValue(42),
-        TupleValue(std::string("Alice")),
-        TupleValue(true)
-    };
+    std::vector<TupleValue> values = {TupleValue(42), TupleValue(std::string("Alice")),
+                                      TupleValue(true)};
 
     Tuple tuple(values, simple_schema_);
 
@@ -362,25 +394,19 @@ TEST_F(TupleTest, GetValueBoolean) {
 }
 
 TEST_F(TupleTest, GetValueOutOfRange) {
-    std::vector<TupleValue> values = {
-        TupleValue(42),
-        TupleValue(std::string("Alice")),
-        TupleValue(true)
-    };
+    std::vector<TupleValue> values = {TupleValue(42), TupleValue(std::string("Alice")),
+                                      TupleValue(true)};
 
     Tuple tuple(values, simple_schema_);
 
-    EXPECT_THROW({
-        [[maybe_unused]] auto value = tuple.get_value(simple_schema_, 10);
-    }, std::out_of_range);
+    EXPECT_THROW(
+        { [[maybe_unused]] auto value = tuple.get_value(simple_schema_, 10); }, std::out_of_range);
 }
 
 TEST_F(TupleTest, NullValue) {
-    std::vector<TupleValue> values = {
-        TupleValue(42),
-        TupleValue::null(),  // null name
-        TupleValue(true)
-    };
+    std::vector<TupleValue> values = {TupleValue(42),
+                                      TupleValue::null(), // null name
+                                      TupleValue(true)};
 
     Tuple tuple(values, simple_schema_);
 
@@ -393,11 +419,7 @@ TEST_F(TupleTest, NullValue) {
 }
 
 TEST_F(TupleTest, AllNullValues) {
-    std::vector<TupleValue> values = {
-        TupleValue::null(),
-        TupleValue::null(),
-        TupleValue::null()
-    };
+    std::vector<TupleValue> values = {TupleValue::null(), TupleValue::null(), TupleValue::null()};
 
     Tuple tuple(values, simple_schema_);
 
@@ -408,15 +430,15 @@ TEST_F(TupleTest, AllNullValues) {
 
 TEST_F(TupleTest, ComplexSchema) {
     std::vector<TupleValue> values = {
-        TupleValue(true),                       // col_bool
-        TupleValue(static_cast<int8_t>(42)),    // col_tiny
-        TupleValue(static_cast<int16_t>(1234)), // col_small
-        TupleValue(123456),                     // col_int
+        TupleValue(true),                               // col_bool
+        TupleValue(static_cast<int8_t>(42)),            // col_tiny
+        TupleValue(static_cast<int16_t>(1234)),         // col_small
+        TupleValue(123456),                             // col_int
         TupleValue(static_cast<int64_t>(9876543210LL)), // col_big
-        TupleValue(3.14f),                      // col_float
-        TupleValue(2.71828),                    // col_double
-        TupleValue(std::string("Hello")),       // col_varchar1
-        TupleValue(std::string("World"))        // col_varchar2
+        TupleValue(3.14f),                              // col_float
+        TupleValue(2.71828),                            // col_double
+        TupleValue(std::string("Hello")),               // col_varchar1
+        TupleValue(std::string("World"))                // col_varchar2
     };
 
     Tuple tuple(values, complex_schema_);
@@ -434,15 +456,15 @@ TEST_F(TupleTest, ComplexSchema) {
 
 TEST_F(TupleTest, MixedNullAndValues) {
     std::vector<TupleValue> values = {
-        TupleValue(true),                       // col_bool
-        TupleValue::null(),                     // col_tiny (null)
-        TupleValue(static_cast<int16_t>(1234)), // col_small
-        TupleValue::null(),                     // col_int (null)
+        TupleValue(true),                               // col_bool
+        TupleValue::null(),                             // col_tiny (null)
+        TupleValue(static_cast<int16_t>(1234)),         // col_small
+        TupleValue::null(),                             // col_int (null)
         TupleValue(static_cast<int64_t>(9876543210LL)), // col_big
-        TupleValue::null(),                     // col_float (null)
-        TupleValue(2.71828),                    // col_double
-        TupleValue::null(),                     // col_varchar1 (null)
-        TupleValue(std::string("World"))        // col_varchar2
+        TupleValue::null(),                             // col_float (null)
+        TupleValue(2.71828),                            // col_double
+        TupleValue::null(),                             // col_varchar1 (null)
+        TupleValue(std::string("World"))                // col_varchar2
     };
 
     Tuple tuple(values, complex_schema_);
@@ -466,11 +488,8 @@ TEST_F(TupleTest, MixedNullAndValues) {
 }
 
 TEST_F(TupleTest, RIDAssignment) {
-    std::vector<TupleValue> values = {
-        TupleValue(42),
-        TupleValue(std::string("Alice")),
-        TupleValue(true)
-    };
+    std::vector<TupleValue> values = {TupleValue(42), TupleValue(std::string("Alice")),
+                                      TupleValue(true)};
 
     Tuple tuple(values, simple_schema_);
 
@@ -515,11 +534,8 @@ TEST_F(TupleTest, NullBitmapSize) {
 
 TEST_F(TupleTest, ConstructFromRawData) {
     // Create a tuple normally
-    std::vector<TupleValue> values = {
-        TupleValue(42),
-        TupleValue(std::string("Alice")),
-        TupleValue(true)
-    };
+    std::vector<TupleValue> values = {TupleValue(42), TupleValue(std::string("Alice")),
+                                      TupleValue(true)};
     Tuple original(values, simple_schema_);
 
     // Create from raw data
@@ -546,11 +562,8 @@ TEST_F(TupleTest, EmptyTuple) {
 }
 
 TEST_F(TupleTest, DataSpan) {
-    std::vector<TupleValue> values = {
-        TupleValue(42),
-        TupleValue(std::string("Alice")),
-        TupleValue(true)
-    };
+    std::vector<TupleValue> values = {TupleValue(42), TupleValue(std::string("Alice")),
+                                      TupleValue(true)};
     Tuple tuple(values, simple_schema_);
 
     auto span = tuple.as_span();
@@ -562,11 +575,7 @@ TEST_F(TupleTest, LongVarchar) {
     // Test with a longer string
     std::string long_str(200, 'X');
 
-    std::vector<TupleValue> values = {
-        TupleValue(42),
-        TupleValue(long_str),
-        TupleValue(true)
-    };
+    std::vector<TupleValue> values = {TupleValue(42), TupleValue(long_str), TupleValue(true)};
 
     Tuple tuple(values, simple_schema_);
 
@@ -576,11 +585,8 @@ TEST_F(TupleTest, LongVarchar) {
 }
 
 TEST_F(TupleTest, EmptyVarchar) {
-    std::vector<TupleValue> values = {
-        TupleValue(42),
-        TupleValue(std::string("")),
-        TupleValue(true)
-    };
+    std::vector<TupleValue> values = {TupleValue(42), TupleValue(std::string("")),
+                                      TupleValue(true)};
 
     Tuple tuple(values, simple_schema_);
 
@@ -590,17 +596,15 @@ TEST_F(TupleTest, EmptyVarchar) {
 }
 
 TEST_F(TupleTest, MultipleVarcharColumns) {
-    std::vector<TupleValue> values = {
-        TupleValue(true),
-        TupleValue(static_cast<int8_t>(42)),
-        TupleValue(static_cast<int16_t>(1234)),
-        TupleValue(123456),
-        TupleValue(static_cast<int64_t>(9876543210LL)),
-        TupleValue(3.14f),
-        TupleValue(2.71828),
-        TupleValue(std::string("First String")),
-        TupleValue(std::string("Second String"))
-    };
+    std::vector<TupleValue> values = {TupleValue(true),
+                                      TupleValue(static_cast<int8_t>(42)),
+                                      TupleValue(static_cast<int16_t>(1234)),
+                                      TupleValue(123456),
+                                      TupleValue(static_cast<int64_t>(9876543210LL)),
+                                      TupleValue(3.14f),
+                                      TupleValue(2.71828),
+                                      TupleValue(std::string("First String")),
+                                      TupleValue(std::string("Second String"))};
 
     Tuple tuple(values, complex_schema_);
 
@@ -675,8 +679,7 @@ TEST(TupleEdgeCaseTest, ManyNullColumns) {
     for (uint32_t i = 0; i < 16; ++i) {
         if (i % 2 == 0) {
             EXPECT_FALSE(tuple.is_null(i)) << "Column " << i << " should not be null";
-            EXPECT_EQ(tuple.get_value(schema, i).as_integer(),
-                      static_cast<int32_t>(i));
+            EXPECT_EQ(tuple.get_value(schema, i).as_integer(), static_cast<int32_t>(i));
         } else {
             EXPECT_TRUE(tuple.is_null(i)) << "Column " << i << " should be null";
         }
@@ -684,18 +687,13 @@ TEST(TupleEdgeCaseTest, ManyNullColumns) {
 }
 
 TEST(TupleEdgeCaseTest, SpecialFloatValues) {
-    std::vector<Column> columns = {
-        Column("inf", TypeId::DOUBLE),
-        Column("neg_inf", TypeId::DOUBLE),
-        Column("zero", TypeId::DOUBLE)
-    };
+    std::vector<Column> columns = {Column("inf", TypeId::DOUBLE), Column("neg_inf", TypeId::DOUBLE),
+                                   Column("zero", TypeId::DOUBLE)};
     Schema schema(columns);
 
-    std::vector<TupleValue> values = {
-        TupleValue(std::numeric_limits<double>::infinity()),
-        TupleValue(-std::numeric_limits<double>::infinity()),
-        TupleValue(0.0)
-    };
+    std::vector<TupleValue> values = {TupleValue(std::numeric_limits<double>::infinity()),
+                                      TupleValue(-std::numeric_limits<double>::infinity()),
+                                      TupleValue(0.0)};
 
     Tuple tuple(values, schema);
 
@@ -705,5 +703,5 @@ TEST(TupleEdgeCaseTest, SpecialFloatValues) {
     EXPECT_DOUBLE_EQ(tuple.get_value(schema, 2).as_double(), 0.0);
 }
 
-}  // namespace
-}  // namespace entropy
+} // namespace
+} // namespace entropy
