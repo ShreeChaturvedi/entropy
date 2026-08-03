@@ -19,56 +19,74 @@ namespace entropy {
 // TupleValue Implementation
 // ─────────────────────────────────────────────────────────────────────────────
 
-TupleValue TupleValue::from_bytes(TypeId type, const char* data, size_t length) {
+TupleValue TupleValue::from_bytes(TypeId type, const char *data, size_t length) {
     switch (type) {
-        case TypeId::BOOLEAN: {
-            if (length < 1) return TupleValue::null();
-            bool val = (*data != 0);
-            return TupleValue(val);
-        }
-        case TypeId::TINYINT: {
-            if (length < 1) return TupleValue::null();
-            int8_t val;
-            std::memcpy(&val, data, sizeof(val));
-            return TupleValue(val);
-        }
-        case TypeId::SMALLINT: {
-            if (length < 2) return TupleValue::null();
-            int16_t val;
-            std::memcpy(&val, data, sizeof(val));
-            return TupleValue(val);
-        }
-        case TypeId::INTEGER: {
-            if (length < 4) return TupleValue::null();
-            int32_t val;
-            std::memcpy(&val, data, sizeof(val));
-            return TupleValue(val);
-        }
-        case TypeId::BIGINT:
-        case TypeId::TIMESTAMP: {
-            if (length < 8) return TupleValue::null();
-            int64_t val;
-            std::memcpy(&val, data, sizeof(val));
-            return TupleValue(val);
-        }
-        case TypeId::FLOAT: {
-            if (length < 4) return TupleValue::null();
-            float val;
-            std::memcpy(&val, data, sizeof(val));
-            return TupleValue(val);
-        }
-        case TypeId::DOUBLE: {
-            if (length < 8) return TupleValue::null();
-            double val;
-            std::memcpy(&val, data, sizeof(val));
-            return TupleValue(val);
-        }
-        case TypeId::VARCHAR: {
-            // Length is the actual string length (not including length prefix)
-            return TupleValue(std::string(data, length));
-        }
-        default:
+    case TypeId::BOOLEAN: {
+        if (length < 1)
             return TupleValue::null();
+        bool val = (*data != 0);
+        return TupleValue(val);
+    }
+    case TypeId::TINYINT: {
+        if (length < 1)
+            return TupleValue::null();
+        int8_t val;
+        std::memcpy(&val, data, sizeof(val));
+        return TupleValue(val);
+    }
+    case TypeId::SMALLINT: {
+        if (length < 2)
+            return TupleValue::null();
+        int16_t val;
+        std::memcpy(&val, data, sizeof(val));
+        return TupleValue(val);
+    }
+    case TypeId::INTEGER: {
+        if (length < 4)
+            return TupleValue::null();
+        int32_t val;
+        std::memcpy(&val, data, sizeof(val));
+        return TupleValue(val);
+    }
+    case TypeId::BIGINT:
+    case TypeId::TIMESTAMP: {
+        if (length < 8)
+            return TupleValue::null();
+        int64_t val;
+        std::memcpy(&val, data, sizeof(val));
+        return TupleValue(val);
+    }
+    case TypeId::FLOAT: {
+        if (length < 4)
+            return TupleValue::null();
+        float val;
+        std::memcpy(&val, data, sizeof(val));
+        return TupleValue(val);
+    }
+    case TypeId::DOUBLE: {
+        if (length < 8)
+            return TupleValue::null();
+        double val;
+        std::memcpy(&val, data, sizeof(val));
+        return TupleValue(val);
+    }
+    case TypeId::DECIMAL: {
+        // On-disk layout is 16 bytes (type_size(DECIMAL)): an IEEE-754
+        // double in the first 8 bytes, remaining bytes reserved for a
+        // future fixed-point scale/precision encoding. In-memory values
+        // ride the double arm of the TupleValue variant.
+        if (length < 16)
+            return TupleValue::null();
+        double val;
+        std::memcpy(&val, data, sizeof(val));
+        return TupleValue(val);
+    }
+    case TypeId::VARCHAR: {
+        // Length is the actual string length (not including length prefix)
+        return TupleValue(std::string(data, length));
+    }
+    default:
+        return TupleValue::null();
     }
 }
 
@@ -81,77 +99,100 @@ std::vector<char> TupleValue::to_bytes(TypeId type) const {
     }
 
     switch (type) {
-        case TypeId::BOOLEAN: {
-            result.resize(1);
-            result[0] = as_bool() ? 1 : 0;
+    case TypeId::BOOLEAN: {
+        result.resize(1);
+        result[0] = as_bool() ? 1 : 0;
+        break;
+    }
+    case TypeId::TINYINT: {
+        result.resize(1);
+        int8_t val = as_tinyint();
+        std::memcpy(result.data(), &val, sizeof(val));
+        break;
+    }
+    case TypeId::SMALLINT: {
+        result.resize(2);
+        int16_t val = as_smallint();
+        std::memcpy(result.data(), &val, sizeof(val));
+        break;
+    }
+    case TypeId::INTEGER: {
+        result.resize(4);
+        int32_t val = as_integer();
+        std::memcpy(result.data(), &val, sizeof(val));
+        break;
+    }
+    case TypeId::BIGINT:
+    case TypeId::TIMESTAMP: {
+        result.resize(8);
+        int64_t val = as_bigint();
+        std::memcpy(result.data(), &val, sizeof(val));
+        break;
+    }
+    case TypeId::FLOAT: {
+        result.resize(4);
+        float val = as_float();
+        std::memcpy(result.data(), &val, sizeof(val));
+        break;
+    }
+    case TypeId::DOUBLE: {
+        result.resize(8);
+        double val = as_double();
+        std::memcpy(result.data(), &val, sizeof(val));
+        break;
+    }
+    case TypeId::DECIMAL: {
+        // 16-byte fixed slot: double payload + reserved zero padding.
+        // Accept any numeric in-memory form so callers that insert an
+        // integer literal into a DECIMAL column still serialize cleanly.
+        double val = 0.0;
+        if (is_double()) {
+            val = as_double();
+        } else if (is_float()) {
+            val = static_cast<double>(as_float());
+        } else if (is_bigint()) {
+            val = static_cast<double>(as_bigint());
+        } else if (is_integer()) {
+            val = static_cast<double>(as_integer());
+        } else if (is_smallint()) {
+            val = static_cast<double>(as_smallint());
+        } else if (is_tinyint()) {
+            val = static_cast<double>(as_tinyint());
+        } else {
             break;
         }
-        case TypeId::TINYINT: {
-            result.resize(1);
-            int8_t val = as_tinyint();
-            std::memcpy(result.data(), &val, sizeof(val));
-            break;
+        result.assign(16, 0);
+        std::memcpy(result.data(), &val, sizeof(val));
+        break;
+    }
+    case TypeId::VARCHAR: {
+        const std::string &str = as_string();
+        // The on-disk tuple format records a VARCHAR's byte length in a
+        // 2-byte little-endian prefix, so a string longer than 65535 bytes
+        // cannot be represented: truncating to uint16_t would desync the
+        // recorded length from the bytes actually written and silently
+        // corrupt the tuple. Reject it loudly instead. (Higher layers cap
+        // VARCHAR well below this via config::kMaxVarcharLength; this is the
+        // hard limit the format itself can honor.)
+        if (str.size() > std::numeric_limits<uint16_t>::max()) {
+            throw std::length_error("VARCHAR value of " + std::to_string(str.size()) +
+                                    " bytes exceeds the 65535-byte on-disk length limit");
         }
-        case TypeId::SMALLINT: {
-            result.resize(2);
-            int16_t val = as_smallint();
-            std::memcpy(result.data(), &val, sizeof(val));
-            break;
+        const uint16_t len = static_cast<uint16_t>(str.size());
+        // Layout: 2-byte little-endian length prefix followed by the raw
+        // bytes. Writing the prefix byte-wise (rather than memcpy over
+        // result.data()) avoids a spurious -Wnull-dereference on GCC and is
+        // explicit about endianness.
+        result.resize(sizeof(len) + str.size());
+        result[0] = static_cast<char>(len & 0xFFu);
+        result[1] = static_cast<char>((len >> 8) & 0xFFu);
+        if (!str.empty()) {
+            std::memcpy(result.data() + sizeof(len), str.data(), str.size());
         }
-        case TypeId::INTEGER: {
-            result.resize(4);
-            int32_t val = as_integer();
-            std::memcpy(result.data(), &val, sizeof(val));
-            break;
-        }
-        case TypeId::BIGINT:
-        case TypeId::TIMESTAMP: {
-            result.resize(8);
-            int64_t val = as_bigint();
-            std::memcpy(result.data(), &val, sizeof(val));
-            break;
-        }
-        case TypeId::FLOAT: {
-            result.resize(4);
-            float val = as_float();
-            std::memcpy(result.data(), &val, sizeof(val));
-            break;
-        }
-        case TypeId::DOUBLE: {
-            result.resize(8);
-            double val = as_double();
-            std::memcpy(result.data(), &val, sizeof(val));
-            break;
-        }
-        case TypeId::VARCHAR: {
-            const std::string& str = as_string();
-            // The on-disk tuple format records a VARCHAR's byte length in a
-            // 2-byte little-endian prefix, so a string longer than 65535 bytes
-            // cannot be represented: truncating to uint16_t would desync the
-            // recorded length from the bytes actually written and silently
-            // corrupt the tuple. Reject it loudly instead. (Higher layers cap
-            // VARCHAR well below this via config::kMaxVarcharLength; this is the
-            // hard limit the format itself can honor.)
-            if (str.size() > std::numeric_limits<uint16_t>::max()) {
-                throw std::length_error(
-                    "VARCHAR value of " + std::to_string(str.size()) +
-                    " bytes exceeds the 65535-byte on-disk length limit");
-            }
-            const uint16_t len = static_cast<uint16_t>(str.size());
-            // Layout: 2-byte little-endian length prefix followed by the raw
-            // bytes. Writing the prefix byte-wise (rather than memcpy over
-            // result.data()) avoids a spurious -Wnull-dereference on GCC and is
-            // explicit about endianness.
-            result.resize(sizeof(len) + str.size());
-            result[0] = static_cast<char>(len & 0xFFu);
-            result[1] = static_cast<char>((len >> 8) & 0xFFu);
-            if (!str.empty()) {
-                std::memcpy(result.data() + sizeof(len), str.data(), str.size());
-            }
-            break;
-        }
-        default:
-            break;
+        break;
+    }
+    default:
+        break;
     }
 
     return result;
@@ -161,10 +202,9 @@ std::vector<char> TupleValue::to_bytes(TypeId type) const {
 // Tuple Implementation
 // ─────────────────────────────────────────────────────────────────────────────
 
-Tuple::Tuple(std::vector<char> data, RID rid)
-    : data_(std::move(data)), rid_(rid) {}
+Tuple::Tuple(std::vector<char> data, RID rid) : data_(std::move(data)), rid_(rid) {}
 
-Tuple::Tuple(const std::vector<TupleValue>& values, const Schema& schema) {
+Tuple::Tuple(const std::vector<TupleValue> &values, const Schema &schema) {
     // Calculate total size
     uint32_t total_size = serialized_size(values, schema);
     data_.resize(total_size);
@@ -180,8 +220,8 @@ Tuple::Tuple(const std::vector<TupleValue>& values, const Schema& schema) {
 
     // First pass: write fixed-size columns and set null bits
     for (uint32_t i = 0; i < num_cols; ++i) {
-        const Column& col = schema.column(i);
-        const TupleValue& val = values[i];
+        const Column &col = schema.column(i);
+        const TupleValue &val = values[i];
 
         if (val.is_null()) {
             set_null_bit(i, true);
@@ -201,8 +241,8 @@ Tuple::Tuple(const std::vector<TupleValue>& values, const Schema& schema) {
 
     // Second pass: write variable-length columns
     for (uint32_t i = 0; i < num_cols; ++i) {
-        const Column& col = schema.column(i);
-        const TupleValue& val = values[i];
+        const Column &col = schema.column(i);
+        const TupleValue &val = values[i];
 
         if (is_variable_length(col.type())) {
             if (val.is_null()) {
@@ -220,7 +260,7 @@ Tuple::Tuple(const std::vector<TupleValue>& values, const Schema& schema) {
     }
 }
 
-TupleValue Tuple::get_value(const Schema& schema, uint32_t col_idx) const {
+TupleValue Tuple::get_value(const Schema &schema, uint32_t col_idx) const {
     if (col_idx >= schema.column_count()) {
         throw std::out_of_range("Column index out of range");
     }
@@ -230,7 +270,7 @@ TupleValue Tuple::get_value(const Schema& schema, uint32_t col_idx) const {
         return TupleValue::null();
     }
 
-    const Column& col = schema.column(col_idx);
+    const Column &col = schema.column(col_idx);
     uint32_t offset = get_column_offset(schema, col_idx);
 
     if (is_variable_length(col.type())) {
@@ -261,14 +301,13 @@ bool Tuple::is_null(uint32_t col_idx) const {
     return (data_[byte_idx] & (1 << bit_idx)) != 0;
 }
 
-uint32_t Tuple::serialized_size(const std::vector<TupleValue>& values,
-                                 const Schema& schema) {
+uint32_t Tuple::serialized_size(const std::vector<TupleValue> &values, const Schema &schema) {
     uint32_t num_cols = static_cast<uint32_t>(schema.column_count());
     uint32_t size = null_bitmap_size(num_cols);
 
     for (uint32_t i = 0; i < num_cols; ++i) {
-        const Column& col = schema.column(i);
-        const TupleValue& val = values[i];
+        const Column &col = schema.column(i);
+        const TupleValue &val = values[i];
 
         if (is_variable_length(col.type())) {
             // Length prefix (2 bytes) + data
@@ -285,13 +324,13 @@ uint32_t Tuple::serialized_size(const std::vector<TupleValue>& values,
     return size;
 }
 
-uint32_t Tuple::get_column_offset(const Schema& schema, uint32_t col_idx) const {
+uint32_t Tuple::get_column_offset(const Schema &schema, uint32_t col_idx) const {
     uint32_t num_cols = static_cast<uint32_t>(schema.column_count());
     uint32_t offset = null_bitmap_size(num_cols);
 
     // Calculate offset for fixed-size columns first
     for (uint32_t i = 0; i < col_idx; ++i) {
-        const Column& col = schema.column(i);
+        const Column &col = schema.column(i);
         if (!is_variable_length(col.type())) {
             offset += static_cast<uint32_t>(type_size(col.type()));
         }
@@ -304,7 +343,7 @@ uint32_t Tuple::get_column_offset(const Schema& schema, uint32_t col_idx) const 
 
     // For variable-length column, continue past all fixed columns
     for (uint32_t i = col_idx; i < num_cols; ++i) {
-        const Column& col = schema.column(i);
+        const Column &col = schema.column(i);
         if (!is_variable_length(col.type())) {
             offset += static_cast<uint32_t>(type_size(col.type()));
         }
@@ -312,7 +351,7 @@ uint32_t Tuple::get_column_offset(const Schema& schema, uint32_t col_idx) const 
 
     // Now scan through variable-length columns before target
     for (uint32_t i = 0; i < col_idx; ++i) {
-        const Column& col = schema.column(i);
+        const Column &col = schema.column(i);
         if (is_variable_length(col.type())) {
             // Read length and skip
             uint16_t len;
@@ -339,4 +378,4 @@ void Tuple::set_null_bit(uint32_t col_idx, bool is_null_val) {
     }
 }
 
-}  // namespace entropy
+} // namespace entropy
