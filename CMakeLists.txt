@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(entropy
     VERSION 0.1.1
-    DESCRIPTION "High-performance relational database engine"
+    DESCRIPTION "From-scratch C++20 relational database engine (learning project)"
     LANGUAGES CXX
 )
 

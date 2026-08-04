@@ -9,7 +9,6 @@
 ---
 
 [![ci](https://github.com/ShreeChaturvedi/entropy/actions/workflows/ci.yml/badge.svg)](https://github.com/ShreeChaturvedi/entropy/actions/workflows/ci.yml)
-[![release](https://img.shields.io/github/v/release/ShreeChaturvedi/entropy?include_prereleases)](https://github.com/ShreeChaturvedi/entropy/releases)
 [![license](https://img.shields.io/github/license/ShreeChaturvedi/entropy)](LICENSE)
 [![c++](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
 
@@ -254,12 +253,9 @@ ctest --preset dev
 
 ## Roadmap
 
-The heap is the authoritative copy and always reflects writes. Sequential scans
-and the transactional engine do not use secondary indexes, so the gaps below do
-not affect them. Secondary indexes are scoped roadmap work:
-
-- Non-unique index equality returns one row, build drops duplicates ([#8]).
-- INSERT, UPDATE, and DELETE do not update secondary indexes ([#11]).
+Open work is tracked in GitHub Issues. Known limits for readers of this tree:
+experimental single-node scope, a simple cost model with no runtime ANALYZE,
+and point selects slower than SQLite on the M2 snapshot above.
 
 ## Documentation
 
@@ -269,6 +265,3 @@ not affect them. Secondary indexes are scoped roadmap work:
 ## License
 
 MIT. See `LICENSE`.
-
-[#8]: https://github.com/ShreeChaturvedi/entropy/issues/8
-[#11]: https://github.com/ShreeChaturvedi/entropy/issues/11
